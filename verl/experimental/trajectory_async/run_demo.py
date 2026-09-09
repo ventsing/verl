@@ -63,6 +63,11 @@ from verl.experimental.trajectory_async.multi_replica_engine import (
     MultiReplicaEngine,
     MultiReplicaEngineConfig,
 )
+from verl.experimental.trajectory_async.relay_tier import (
+    RelayService,
+    RelayTierAdapter,
+    RelayTierConfig,
+)
 from verl.experimental.trajectory_async.repack import RepackConfig, RepackManager
 from verl.experimental.trajectory_async.rollouter import PromptRecord, RollouterConfig, TrajectoryRollouter
 from verl.experimental.trajectory_async.trainer import TrainerConfig, TrajectoryTrainer
@@ -131,8 +136,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--relay-hop-s", type=float, default=0.1, help="per-hop chain broadcast latency")
     p.add_argument("--pcie-pull-s", type=float, default=0.2, help="relay→rollout GPU weight load")
     p.add_argument("--weight-store", choices=["relay", "p2p"], default="relay",
-                   help="'relay': timing mock (chain broadcast); 'p2p': the real multi-version "
-                        "VersionedWeightStore orchestration over a P2P backend (see --p2p-backend)")
+                   help="'relay': timing mock (chain broadcast); 'p2p': the real relay tier "
+                        "(RelayService: master stage + pipelined chain + local pull) over "
+                        "P2P backends (see --p2p-backend, --relay-chunks)")
     p.add_argument("--p2p-backend", choices=["fake", "kimi", "mooncake"], default="fake",
                    help="P2P transport for --weight-store p2p: 'fake' runs the full store "
                         "orchestration on CPU (owner-memory + direct-read semantics); 'kimi'/"
@@ -140,6 +146,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "cluster (torch + RDMA + the engine package) — on a bare machine the "
                         "demo exits with the wiring instructions instead of failing deep in "
                         "the transport")
+    p.add_argument("--relay-chunks", type=int, default=4,
+                   help="model split for the pipelined relay-chain broadcast")
     p.add_argument("--keep-last-versions", type=int, default=2,
                    help="p2p store: how many recent weight versions stay staged (retention)")
     p.add_argument("--weight-mb", type=float, default=8.0, help="p2p store: fake payload size per version")
@@ -212,7 +220,7 @@ async def run_one(
     """
     repack_mode = args.repack if repack is None else repack
     run_label = label if label is not None else mode
-    relay: WeightRelayService | None = None
+    relay: WeightRelayService | RelayTierAdapter | None = None
     manager: RepackManager | None = None
 
     if args.replicas > 1:
@@ -223,27 +231,43 @@ async def run_one(
         # transport — same orchestration as the kimi/mooncake backends);
         # optional active scheduling via trajectory repack.
         if args.weight_store == "p2p":
+            # The REAL tier topology (Laminar §4): one relay node per
+            # replica machine, each wrapping its own P2P backend. Publish
+            # = master stage (the actor stall); distribution is a
+            # background chunk-pipelined chain; replicas pull the local
+            # relay's latest COMPLETE version anytime.
             try:
-                backend = make_p2p_backend(
-                    args.p2p_backend,
-                    stage_latency_s=args.actor_stall_s,  # offload+register ≈ the actor stall
-                    read_latency_s=args.pcie_pull_s,     # direct p2p read
-                )
+                backends = [
+                    make_p2p_backend(
+                        args.p2p_backend,
+                        stage_latency_s=args.actor_stall_s,  # offload+register ≈ the actor stall
+                        read_latency_s=args.pcie_pull_s,     # fallback read latency
+                    )
+                    for _ in range(args.replicas)
+                ]
             except ValueError as e:
                 # kimi/mooncake selected on a machine without a cluster: exit
                 # with the exact wiring instead of failing deep in the transport
                 raise SystemExit(
                     f"--p2p-backend {args.p2p_backend!r}: {e}\n"
-                    "\nOn a real cluster, build the stock engine the way "
-                    "CheckpointEngineManager does, then wrap it:\n"
-                    "  engine = CheckpointEngineRegistry.new(<backend>, bucket_size=...)\n"
-                    "  #   ... prepare() / build_topology() / init_process_group() ...\n"
-                    "  backend = make_p2p_backend(<backend>, engine=engine)\n"
-                    "  store = VersionedWeightStore(backend, keep_last=2)\n"
+                    "\nOn a real cluster, build ONE engine per relay node (the\n"
+                    "way CheckpointEngineManager builds them), then:\n"
+                    "  backends = [make_p2p_backend(<backend>, engine=engine_i)\n"
+                    "              for engine_i in relay_engines]  # one per rollout machine\n"
+                    "  service = RelayService(backends, RelayTierConfig(num_relays=N))\n"
                     "For the CPU demo use --p2p-backend fake."
                 ) from e
-            store = VersionedWeightStore(backend, keep_last=args.keep_last_versions)
-            relay = VersionedStoreRelayAdapter(store, weight_mb=args.weight_mb)
+            service = RelayService(
+                backends,
+                RelayTierConfig(
+                    num_relays=args.replicas,
+                    chunks=args.relay_chunks,
+                    keep_last=args.keep_last_versions,
+                    hop_read_latency_s=args.relay_hop_s,   # chain hop ≈ network
+                    local_read_latency_s=args.pcie_pull_s,  # colocated pull ≈ PCIe
+                ),
+            )
+            relay = RelayTierAdapter(service, weight_mb=args.weight_mb)
         else:
             relay = WeightRelayService(
                 RelayConfig(
@@ -381,10 +405,15 @@ async def run_one(
             await manager.stop()
         if isinstance(engine, MultiReplicaEngine):
             await engine.stop()
+        if isinstance(relay, RelayTierAdapter):
+            # drain background chain distributions before the loop closes
+            await relay.service.wait_for_distribution()
 
     relay_stats = relay.stats.snapshot() if relay is not None else {}
     if isinstance(relay, VersionedStoreRelayAdapter):
         relay_stats.update(relay.store.snapshot())
+    if isinstance(relay, RelayTierAdapter):
+        relay_stats.update(relay.service.snapshot())
 
     return RunResult(
         mode=run_label,
@@ -584,6 +613,14 @@ def print_repack_compare(off: RunResult, on: RunResult) -> bool:
               f"actor stall total={rly.get('relay/actor_stall_total_s', 0):.2f}s, "
               f"pulls={rly.get('relay/pulls', 0)}, chain-wait={rly.get('relay/pull_wait_total_s', 0):.2f}s, "
               f"pcie={rly.get('relay/pcie_total_s', 0):.2f}s")
+        if "relay/chain_completion_s" in rly:
+            chain = rly["relay/chain_completion_s"]
+            print(f"relay tier: {rly.get('relay/num_relays')} nodes x {rly.get('relay/chunks')} chunks, "
+                  f"chain completion mean={chain.get('mean')}s max={chain.get('max')}s "
+                  f"({chain.get('rounds')} rounds), hops={rly.get('relay/hop_reads')} "
+                  f"({rly.get('relay/hop_total_s', 0):.2f}s), "
+                  f"max node lag={rly.get('relay/max_node_lag', 0)} version(s), "
+                  f"local versions={rly.get('relay/local_versions')}")
 
     problems = verify_equivalence(off, on)
     if problems:

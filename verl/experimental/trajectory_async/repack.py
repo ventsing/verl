@@ -48,6 +48,7 @@ import logging
 from dataclasses import dataclass, field
 
 from verl.experimental.trajectory_async.multi_replica_engine import MultiReplicaEngine, ReplicaState
+from verl.experimental.trajectory_async.relay_tier import RepackExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -157,15 +158,20 @@ def best_fit_consolidation(states: list[ReplicaState]) -> list[tuple[int, int]]:
 class RepackManager:
     """Rollout manager loop: monitor replicas, plan, execute migrations.
 
-    One instance drives one :class:`MultiReplicaEngine`. Run it as a task
-    alongside the rollouter and trainer; call :meth:`notify_update` from
-    the trainer's weight-publish path for the immediate post-update
-    trigger.
+    One instance drives one **repack executor** — anything implementing
+    :class:`~verl.experimental.trajectory_async.relay_tier.RepackExecutor`:
+    the demo's :class:`MultiReplicaEngine` (mock transport) or
+    :class:`~verl.experimental.trajectory_async.relay_tier.RolloutRepackExecutor`
+    over real rollout replicas. The algorithm
+    (:func:`best_fit_consolidation` + :class:`ReplicaState` idleness) is
+    executor-agnostic. Run the manager as a task alongside the rollouter
+    and trainer; call :meth:`notify_update` from the trainer's
+    weight-publish path for the immediate post-update trigger.
     """
 
     def __init__(
         self,
-        engine: MultiReplicaEngine,
+        engine: MultiReplicaEngine | RepackExecutor,
         config: RepackConfig | None = None,
         on_plan=None,
     ) -> None:
@@ -254,7 +260,7 @@ class RepackManager:
         self.stats.sources_emptied += result.sources_emptied
         self.stats.requests_moved += result.requests_moved
         self.stats.kv_tokens_moved += result.kv_tokens_moved
-        self.stats.overhead_total_s += self.engine.config.repack_overhead_s
+        self.stats.overhead_total_s += self.engine.repack_overhead_s
         self.stats.rounds.append(
             {
                 "round": self.stats.plans,

@@ -426,12 +426,16 @@ class FakeP2PBackend(P2PWeightBackend):
             raise LookupError(
                 f"{manifest.checkpoint_name} is not staged — registered memory was released"
             )
-        await asyncio.sleep(self.read_latency_s)
+        # per-call latency override: the relay tier distinguishes the
+        # network hop (chain distribution) from the local PCIe pull.
+        # Real backends ignore this — their latency is physical.
+        latency = consumer_ctx.get("read_latency_s", self.read_latency_s)
+        await asyncio.sleep(latency)
         for name, data in payload.items():
             sink(name, data)
         self.stats.reads += 1
-        self.stats.read_total_s += self.read_latency_s
-        return ReadStats(nbytes=manifest.nbytes, tensors=manifest.tensor_count, seconds=self.read_latency_s)
+        self.stats.read_total_s += latency
+        return ReadStats(nbytes=manifest.nbytes, tensors=manifest.tensor_count, seconds=latency)
 
     async def unstage(self, manifest: WeightManifest) -> None:
         self._memory.pop(manifest.checkpoint_name, None)

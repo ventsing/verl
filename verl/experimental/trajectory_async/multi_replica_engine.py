@@ -503,6 +503,11 @@ class MultiReplicaEngine:
     def num_replicas(self) -> int:
         return self.config.num_replicas
 
+    @property
+    def repack_overhead_s(self) -> float:
+        """Per-round migration cost (protocol attribute for RepackManager)."""
+        return self.config.repack_overhead_s
+
     def fleet_kv_util(self) -> float:
         """Fleet-wide KVCache utilization: occupied tokens over the whole
         pool (all replicas × C_max) — the paper's "average KVCache

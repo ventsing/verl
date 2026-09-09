@@ -258,20 +258,28 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
            ; mooncake: stage into a per-version RDMA buffer) — executed via
            the existing generic dispatch
            ``actor_wg.execute_checkpoint_engine("stage_version", version)``;
-        2. construct the :class:`VersionedWeightStore` in the driver over
-           the replicas' engine handles (``make_p2p_backend`` with the
-           kimi/mooncake adapter);
-        3. replicas pull at their batch boundaries
-           (``MultiReplicaEngine._drain_cycle`` is the reference
-           implementation).
+        2. construct the hierarchical :class:`RelayService` in the driver:
+           ONE relay node per rollout machine, each wrapping that machine's
+           engine (``make_p2p_backend`` per node over the kimi/mooncake
+           adapters). ``publish`` applies the trainer-side hooks —
+           ``format_fn`` converts actor-internal params to HF format,
+           ``reshard_fn`` converts to the rollout TP layout — and stages at
+           the master only: that single hop IS the actor stall, the chain
+           distribution to the other relays runs in the background
+           (Laminar §4.2);
+        3. replicas pull at their batch boundaries from their COLOCATED
+           relay (anytime; the local relay's latest complete version) —
+           ``MultiReplicaEngine._drain_cycle`` over
+           ``RelayService.pull`` is the reference implementation.
 
         Raises NotImplementedError until that wiring lands on a cluster.
         """
         raise NotImplementedError(
             "async_training.weight_store.* selects the multi-version pull-based "
-            "weight path; wire the worker-side stage_version + per-replica pulls "
-            "first (verl/experimental/trajectory_async/README.md — Real-engine "
-            "wiring guide)"
+            "weight path; wire the worker-side stage_version + the RelayService "
+            "tier + per-replica pulls first "
+            "(verl/experimental/trajectory_async/README.md — Real-engine wiring "
+            "guide; see relay_tier.py)"
         )
 
     async def fit(self):

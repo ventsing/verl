@@ -60,6 +60,17 @@ from verl.experimental.trajectory_async.types import (
     TrajectorySample,
     TrajectoryStatus,
 )
+from verl.experimental.trajectory_async.relay_tier import (
+    RelayNode,
+    RelayService,
+    RelayTierAdapter,
+    RelayTierConfig,
+    RelayTierStats,
+    RepackExecutor,
+    RolloutRepackExecutor,
+    RolloutReplicaHandle,
+    RunningRequest,
+)
 from verl.experimental.trajectory_async.versioned_weight_store import (
     FakeP2PBackend,
     KimiP2PBackend,
@@ -110,6 +121,15 @@ __all__ = [
     "P2P_BACKENDS",
     "P2PWeightBackend",
     "ReadStats",
+    "RelayNode",
+    "RelayService",
+    "RelayTierAdapter",
+    "RelayTierConfig",
+    "RelayTierStats",
+    "RepackExecutor",
+    "RolloutRepackExecutor",
+    "RolloutReplicaHandle",
+    "RunningRequest",
     "VersionedStoreRelayAdapter",
     "VersionedWeightStore",
     "WeightManifest",
