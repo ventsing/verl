@@ -158,6 +158,28 @@ class _Request:
 
 
 @dataclass
+class MigrationResult:
+    """Outcome of one repack execution round (the KV-denominated report).
+
+    ``requests_moved`` counts trajectories migrated; ``kv_tokens_moved``
+    is the KVCache footprint that traveled with them (running requests
+    only — waiting ones hold no KV yet); ``sources_emptied`` is how many
+    source replicas actually became workless (free to pull fresh weights
+    and re-enter routing), which can be less than planned when the
+    execution-time CanFit re-check rejects part of the work.
+    """
+
+    plan: list[tuple[int, int]]
+    requests_moved: int = 0
+    kv_tokens_moved: int = 0
+    sources_emptied: int = 0
+
+    @property
+    def sources_planned(self) -> int:
+        return len({src for src, _ in self.plan})
+
+
+@dataclass
 class EngineStats:
     requests_submitted: int = 0
     requests_finished: int = 0
@@ -165,6 +187,7 @@ class EngineStats:
     total_tokens_generated: int = 0
     migrations_executed: int = 0
     migration_rounds: int = 0
+    kv_tokens_migrated: int = 0
     replica_drains: int = 0
     weight_pulls: int = 0
     kv_util_sum: float = 0.0
@@ -180,6 +203,7 @@ class EngineStats:
             "engine/total_tokens_generated": self.total_tokens_generated,
             "engine/migration_rounds": self.migration_rounds,
             "engine/migrations_executed": self.migrations_executed,
+            "engine/kv_tokens_migrated": self.kv_tokens_migrated,
             "engine/replica_drains": self.replica_drains,
             "engine/weight_pulls": self.weight_pulls,
             "engine/kv_util_avg": round(avg_util, 4),
@@ -403,19 +427,20 @@ class MultiReplicaEngine:
 
     # -------------------------------------------------------------- migration
 
-    async def migrate(self, plan: list[tuple[int, int]]) -> int:
+    async def migrate(self, plan: list[tuple[int, int]]) -> MigrationResult:
         """Execute a repack plan: move every in-flight request of each
         source replica to its destination replica.
 
         Re-checks CanFit at execution time (destination KVCache headroom
         and roofline batch bound); the same-version constraint is the
         caller's (the manager groups replicas by version). Returns the
-        number of requests moved. Costs ``repack_overhead_s`` per round.
+        round's :class:`MigrationResult` (requests moved, KV tokens
+        moved, sources actually emptied). Costs ``repack_overhead_s``.
         """
         if not plan:
-            return 0
+            return MigrationResult(plan=[])
         await asyncio.sleep(self.config.repack_overhead_s)
-        moved = 0
+        result = MigrationResult(plan=list(plan))
         self.stats.migration_rounds += 1
         for src_id, dst_id in plan:
             src, dst = self._replicas[src_id], self._replicas[dst_id]
@@ -428,13 +453,17 @@ class MultiReplicaEngine:
                 if was_running:
                     dst["running"].append(req)
                     dst["kv_used"] += req.kv
+                    result.kv_tokens_moved += req.kv
                 else:
                     dst["waiting"].append(req)
                 dst["assigned"] += 1
-                moved += 1
+                result.requests_moved += 1
                 self.stats.migrations_executed += 1
+            if not src["running"] and not src["waiting"]:
+                result.sources_emptied += 1
+        self.stats.kv_tokens_migrated += result.kv_tokens_moved
         self._notify_availability()
-        return moved
+        return result
 
     def _can_fit(self, dst: dict, req: _Request) -> bool:
         return (
@@ -473,6 +502,16 @@ class MultiReplicaEngine:
     @property
     def num_replicas(self) -> int:
         return self.config.num_replicas
+
+    def fleet_kv_util(self) -> float:
+        """Fleet-wide KVCache utilization: occupied tokens over the whole
+        pool (all replicas × C_max) — the paper's "average KVCache
+        utilization" denominator. Read by the repack manager before/after
+        each round to measure what active migration actually did."""
+        capacity = self.config.num_replicas * self.config.kv_capacity_tokens
+        if capacity <= 0:
+            return 0.0
+        return sum(rep["kv_used"] for rep in self._replicas) / capacity
 
     def version_mix(self) -> int:
         """Number of distinct versions currently in use across replicas."""

@@ -179,6 +179,19 @@ class TestEndToEndEquivalence(unittest.TestCase):
         # queue fully drained
         self.assertEqual(h.rollouter.queue.total_put, h.trainer.stats.trajectories_consumed)
 
+    def test_leftover_groups_are_counted_not_lost(self):
+        """Complete groups that never fill a mini-batch must be accounted:
+        trained + dropped-stale + leftover == prompted groups."""
+        # 8 prompts, 3 groups per mini-batch -> 2 batches + 2 leftover
+        h = PipelineHarness("trajectory", num_prompts=8, n=4, mini_batch_groups=3).run()
+        stats = h.trainer.stats
+        self.assertEqual(stats.groups_trained, 6)
+        self.assertEqual(stats.groups_leftover, 2)
+        self.assertEqual(
+            stats.groups_trained + stats.groups_dropped_stale + stats.groups_leftover, 8
+        )
+        self.assertEqual(stats.mini_batches, 2)
+
 
 class TestPreprocessPolicies(unittest.TestCase):
     def test_on_group_complete_policy_trains_identical_data(self):

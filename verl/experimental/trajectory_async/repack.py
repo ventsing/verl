@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from verl.experimental.trajectory_async.multi_replica_engine import MultiReplicaEngine, ReplicaState
 
@@ -66,18 +66,28 @@ class RepackStats:
     checks: int = 0
     update_triggers: int = 0
     plans: int = 0
-    sources_released: int = 0
+    sources_released: int = 0  # sources in executed plans (planned)
+    sources_emptied: int = 0  # sources that actually became workless
     requests_moved: int = 0
+    kv_tokens_moved: int = 0  # KVCache footprint that traveled with them
     overhead_total_s: float = 0.0
+    # per-round KV effect of active migration: fleet utilization before
+    # and after each executed round, plus what moved (bounded history)
+    rounds: list[dict] = field(default_factory=list)
 
     def snapshot(self) -> dict[str, float]:
+        delta = [r["kv_util_after"] - r["kv_util_before"] for r in self.rounds]
         return {
             "repack/checks": self.checks,
             "repack/update_triggers": self.update_triggers,
             "repack/plans": self.plans,
             "repack/sources_released": self.sources_released,
+            "repack/sources_emptied": self.sources_emptied,
             "repack/requests_moved": self.requests_moved,
+            "repack/kv_tokens_moved": self.kv_tokens_moved,
             "repack/overhead_total_s": round(self.overhead_total_s, 4),
+            "repack/kv_util_delta_mean": round(sum(delta) / len(delta), 4) if delta else 0.0,
+            "repack/rounds": self.rounds[-64:],
         }
 
 
@@ -205,9 +215,16 @@ class RepackManager:
     # ----------------------------------------------------------------- core
 
     async def repack_once(self) -> list[tuple[int, int]]:
-        """One monitor → group → plan → execute cycle (Figure 8 steps ①-③)."""
+        """One monitor → group → plan → execute cycle (Figure 8 steps ①-③).
+
+        Records the round's KV-denominated effect: fleet KVCache
+        utilization at trigger time vs. after the migration, KV tokens
+        moved, and sources actually emptied (freed to pull fresh weights).
+        """
         self.stats.checks += 1
         states = self.engine.snapshot()
+        kv_util_before = self.engine.fleet_kv_util()
+        idle_before = sum(1 for r in states if not r.has_work)
 
         # step ①: group replicas by their current weight version
         groups: dict[int, list[ReplicaState]] = {}
@@ -230,11 +247,38 @@ class RepackManager:
             return []
 
         # step ③: transfer unfinished trajectories of sources to destinations
-        moved = await self.engine.migrate(plan)
+        result = await self.engine.migrate(plan)
+        after = self.engine.snapshot()
         self.stats.plans += 1
-        self.stats.sources_released += len({src for src, _ in plan})
-        self.stats.requests_moved += moved
+        self.stats.sources_released += result.sources_planned
+        self.stats.sources_emptied += result.sources_emptied
+        self.stats.requests_moved += result.requests_moved
+        self.stats.kv_tokens_moved += result.kv_tokens_moved
         self.stats.overhead_total_s += self.engine.config.repack_overhead_s
+        self.stats.rounds.append(
+            {
+                "round": self.stats.plans,
+                "plan": [list(pair) for pair in plan],
+                "requests_moved": result.requests_moved,
+                "kv_tokens_moved": result.kv_tokens_moved,
+                "sources_emptied": result.sources_emptied,
+                "kv_util_before": round(kv_util_before, 4),
+                "kv_util_after": round(self.engine.fleet_kv_util(), 4),
+                "idle_replicas_before": idle_before,
+                "idle_replicas_after": sum(1 for r in after if not r.has_work),
+            }
+        )
+        logger.info(
+            "repack round %d: moved %d requests (%d KV tokens), emptied %d/%d sources, "
+            "fleet KV util %.3f -> %.3f",
+            self.stats.plans,
+            result.requests_moved,
+            result.kv_tokens_moved,
+            result.sources_emptied,
+            result.sources_planned,
+            kv_util_before,
+            self.engine.fleet_kv_util(),
+        )
         if self.on_plan is not None:
-            self.on_plan(plan, moved)
+            self.on_plan(plan, result.requests_moved)
         return plan

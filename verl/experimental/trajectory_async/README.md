@@ -89,6 +89,9 @@ Components (all under `verl/experimental/trajectory_async/`):
 * Staleness is accounted per trajectory (`model_version` at request start):
   `GroupRecord.staleness/oldest_staleness/version_span` give the exact
   off-policy distance of every update.
+* Complete groups that never fill a mini-batch are **counted**
+  (`trainer/groups_leftover`), never silently lost: trained + stale-dropped
+  + evicted + leftover reconciles with the number of prompted groups.
 
 ## The honest benefit model
 
@@ -162,6 +165,13 @@ operations; saved stragglers raise average staleness (point 1).
 # unit tests (bare CPython is enough; no numpy/ray/torch needed)
 python -m unittest discover -s tests/experimental/trajectory_async -t .
 
+# end-to-end scenarios as runnable scripts (examples/gspo_trainer style,
+# every knob an env var; see examples/trajectory_async/README.md)
+bash examples/trajectory_async/run_repack_ab.sh              # active-migration A/B
+bash examples/trajectory_async/run_failure_isolation.sh      # retry vs all-or-nothing
+bash examples/trajectory_async/run_staleness_control.sh      # freshness bound
+bash examples/trajectory_async/run_weight_store_p2p.sh       # weight plane (fake|kimi|mooncake)
+
 # single-mode run with per-event timeline
 python -m verl.experimental.trajectory_async.run_demo --mode trajectory
 
@@ -234,8 +244,15 @@ interval between consecutive actor update completions —
 `trainer/tokens_per_s`), plus **inherent staleness** per trajectory
 (trainer version at the trajectory's finish time minus the version that
 generated it; Laminar reports typically < 3), avg/peak **KVCache
-utilization**, actor stall total, pull chain-wait, and repack activity
-(checks / plans / sources released / trajectories moved / overhead).
+utilization**, actor stall total, pull chain-wait, and the repack
+activity counters. **Active migration is measured in KV terms**
+(`repack/*`): `requests_moved`, `kv_tokens_moved` (the KVCache footprint
+that traveled), `sources_released` (planned) vs `sources_emptied`
+(actually freed — the execution-time `CanFit` re-check can reject part of
+a plan), and a per-round history `repack/rounds` recording each round's
+plan, what moved, and fleet KVCache utilization **before → after** the
+migration (plus idle-replica count before/after) — the direct causal
+measure of what one repack round did to KV utilization.
 
 Measured with the A/B above (CPU mock, 4 replicas, 48 prompts × 8
 responses, lognormal σ=1 lengths):
@@ -247,6 +264,20 @@ mean throughput (tok/s)                   28964        32986  <- repack wins (+1
 avg KVCache utilization                    0.491       0.593  <- repack wins (+21%)
 mean inherent staleness (versions)         0.388       0.471  <- no-repack wins
 mean group staleness (versions)            1.125       1.312  <- no-repack wins
+```
+
+The scenario script `examples/trajectory_async/run_repack_ab.sh` runs the
+same A/B with tighter straggling (quota 12/replica) and prints the full
+per-round KV effect, e.g.:
+
+```
+wall time (s)                                      72.063         44.451  <- repack wins
+mean throughput (tok/s)                           14824          31210     <- repack wins
+avg KVCache utilization                            0.2821         0.4821  <- repack wins
+repack: 23 rounds, 203 trajectories moved, 228640 KV tokens migrated,
+        22/28 planned sources actually emptied, 11.5s total overhead
+round 3: plan=[[1,3],[0,2]] moved=16 reqs (15872 KV tokens),
+         KV util 0.374 -> 0.454, idle replicas 0 -> 2
 ```
 
 The same shape as the paper's §8 (repack: +26% generation throughput,
@@ -535,7 +566,7 @@ routing manager.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (73 tests; 71 stdlib-only + 2
+`tests/experimental/trajectory_async/` (74 tests; 72 stdlib-only + 2
 torch-gated adapter smokes that skip without torch and run the real
 kimi/mooncake adapter code over stub engines on a full machine):
 

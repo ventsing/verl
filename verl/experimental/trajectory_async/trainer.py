@@ -88,6 +88,7 @@ class TrainerStats:
     trajectories_consumed: int = 0
     groups_trained: int = 0
     groups_dropped_stale: int = 0
+    groups_leftover: int = 0  # complete groups that never filled a mini-batch
     mini_batches: int = 0
     updates: int = 0
     update_busy_time_s: float = 0.0
@@ -118,6 +119,7 @@ class TrainerStats:
             "trainer/trajectories_consumed": self.trajectories_consumed,
             "trainer/groups_trained": self.groups_trained,
             "trainer/groups_dropped_stale": self.groups_dropped_stale,
+            "trainer/groups_leftover": self.groups_leftover,
             "trainer/mini_batches": self.mini_batches,
             "trainer/updates": self.updates,
             "trainer/update_busy_time_s": round(self.update_busy_time_s, 4),
@@ -403,6 +405,7 @@ class TrajectoryTrainer:
 
     def _finalize(self) -> None:
         leftover = self.mini_batcher.drain()
+        self.stats.groups_leftover = len(leftover)
         if leftover:
             logger.warning(
                 "Training finished with %d complete group(s) not forming a full "

@@ -440,7 +440,8 @@ def verify_equivalence(a: RunResult, b: RunResult) -> list[str]:
     return problems
 
 
-def print_compare(group: RunResult, traj: RunResult, group_retry: str) -> None:
+def print_compare(group: RunResult, traj: RunResult, group_retry: str) -> bool:
+    """Print the A/B table; return True iff data equivalence held."""
     print("\n" + "=" * 72)
     print("A/B COMPARISON (identical workload: same lengths, same failures)")
     print("=" * 72)
@@ -477,6 +478,8 @@ def print_compare(group: RunResult, traj: RunResult, group_retry: str) -> None:
     problems = verify_equivalence(group, traj)
     saved_by_trajectory = set(traj.trained_groups) - set(group.trained_groups)
     content_problems = [p for p in problems if not p.startswith("trained group sets differ")]
+    lost_by_trajectory = set(group.trained_groups) - set(traj.trained_groups)
+    ok = not content_problems and not lost_by_trajectory
     if content_problems:
         print("\nDATA EQUIVALENCE: FAILED — same group trained on different data")
         for p in content_problems[:10]:
@@ -487,7 +490,7 @@ def print_compare(group: RunResult, traj: RunResult, group_retry: str) -> None:
         print(f"\nDATA EQUIVALENCE: content OK — shared groups trained on identical data; "
               f"trajectory mode additionally SAVED {len(saved_by_trajectory)} groups that "
               f"the all-or-nothing baseline dropped: {sorted(saved_by_trajectory)[:8]}")
-    elif set(group.trained_groups) - set(traj.trained_groups):
+    elif lost_by_trajectory:
         print("\nDATA EQUIVALENCE: FAILED — trajectory mode lost groups the baseline trained")
     else:
         n = len(set(group.trained_groups) & set(traj.trained_groups))
@@ -512,10 +515,15 @@ def print_compare(group: RunResult, traj: RunResult, group_retry: str) -> None:
         "blocks fast groups behind slow groups' early trajectories (later first batch);\n"
         "'on-group-complete' avoids the speculation entirely."
     )
+    return ok
 
 
-def print_repack_compare(off: RunResult, on: RunResult) -> None:
-    """Laminar-style A/B: same multi-replica workload, repack off vs on."""
+def print_repack_compare(off: RunResult, on: RunResult) -> bool:
+    """Laminar-style A/B: same multi-replica workload, repack off vs on.
+
+    Returns True iff data equivalence held (repack must not change what
+    is trained — only where in-flight trajectories finish).
+    """
     print("\n" + "=" * 72)
     print("REPACK A/B (identical workload: same lengths, same failures, same replicas)")
     print("=" * 72)
@@ -546,8 +554,21 @@ def print_repack_compare(off: RunResult, on: RunResult) -> None:
     print(f"\nrepack activity: checks={rs.get('repack/checks', 0)}, post-update triggers="
           f"{rs.get('repack/update_triggers', 0)}, plans={rs.get('repack/plans', 0)}, "
           f"sources released={rs.get('repack/sources_released', 0)}, "
+          f"sources actually emptied={rs.get('repack/sources_emptied', 0)}, "
           f"trajectories moved={rs.get('repack/requests_moved', 0)}, "
+          f"KV tokens migrated={rs.get('repack/kv_tokens_moved', 0)}, "
           f"overhead={rs.get('repack/overhead_total_s', 0):.2f}s")
+    rounds = rs.get("repack/rounds", [])
+    if rounds:
+        deltas = [r["kv_util_after"] - r["kv_util_before"] for r in rounds]
+        print("per-round KV effect of active migration (fleet KVCache utilization at "
+              "trigger -> after the round):")
+        for r in rounds[-6:]:
+            print(f"  round {r['round']}: plan={r['plan']} moved={r['requests_moved']} reqs "
+                  f"({r['kv_tokens_moved']} KV tokens), emptied {r['sources_emptied']} source(s), "
+                  f"KV util {r['kv_util_before']:.3f} -> {r['kv_util_after']:.3f}, "
+                  f"idle replicas {r['idle_replicas_before']} -> {r['idle_replicas_after']}")
+        print(f"  mean per-round KV util delta: {sum(deltas) / len(deltas):+.4f}")
     rly = on.relay_stats
     if rly:
         print(f"relay service: publishes={rly.get('relay/publishes', 0)}, "
@@ -570,6 +591,7 @@ def print_repack_compare(off: RunResult, on: RunResult) -> None:
         "frees their replicas to pull fresh weights and start on-policy batches — at the\n"
         "cost of one migration round and slightly older trajectories finishing elsewhere."
     )
+    return not problems
 
 
 def main() -> None:
@@ -583,14 +605,16 @@ def main() -> None:
         if not args.quiet:
             print_report(off)
             print_report(on)
-        print_repack_compare(off, on)
+        if not print_repack_compare(off, on):
+            raise SystemExit(1)  # repack must never change what is trained
     elif args.compare:
         group = asyncio.run(run_one(args, "group"))
         traj = asyncio.run(run_one(args, "trajectory"))
         if not args.quiet:
             print_report(group)
             print_report(traj)
-        print_compare(group, traj, group_retry=args.group_retry)
+        if not print_compare(group, traj, group_retry=args.group_retry):
+            raise SystemExit(1)  # delivery granularity must never change data
     else:
         result = asyncio.run(run_one(args, args.mode))
         print_report(result)

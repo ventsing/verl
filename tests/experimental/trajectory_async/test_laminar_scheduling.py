@@ -225,9 +225,15 @@ class TestMultiReplicaEngine(unittest.TestCase):
             self.assertEqual(total, 6)
             moved = await engine.migrate([(0, 1)])
             after = engine.snapshot()
-            self.assertEqual(moved, before[0].num_running + before[0].num_waiting)
+            self.assertEqual(moved.requests_moved, before[0].num_running + before[0].num_waiting)
             self.assertEqual(after[0].num_running + after[0].num_waiting, 0)
             self.assertEqual(after[1].num_running + after[1].num_waiting, 6)
+            # KV-denominated migration accounting: every moved running
+            # request carried its KV footprint; the source was emptied
+            self.assertGreater(moved.kv_tokens_moved, 0)
+            self.assertEqual(moved.sources_emptied, 1)
+            self.assertEqual(moved.sources_planned, 1)
+            self.assertEqual(engine.stats.kv_tokens_migrated, moved.kv_tokens_moved)
             results = await asyncio.gather(*tasks)
             await engine.stop()
             self.assertEqual(len(results), 6)  # all still complete correctly
@@ -246,7 +252,9 @@ class TestMultiReplicaEngine(unittest.TestCase):
             await asyncio.sleep(0.03)
             moved = await engine.migrate([(0, 1)])
             # replica 1 is full (kv at cap or running==B): nothing fits
-            self.assertEqual(moved, 0)
+            self.assertEqual(moved.requests_moved, 0)
+            self.assertEqual(moved.kv_tokens_moved, 0)
+            self.assertEqual(moved.sources_emptied, 0)  # CanFit rejected everything
             await asyncio.gather(*tasks)
             await engine.stop()
 
@@ -374,6 +382,17 @@ class TestRepackManager(unittest.TestCase):
             # at least one migration round happened during the tails
             self.assertGreaterEqual(engine.stats.migration_rounds, 1)
             self.assertGreaterEqual(manager.stats.requests_moved, 1)
+            # the round recorded its KV-denominated effect
+            self.assertGreaterEqual(manager.stats.kv_tokens_moved, 1)
+            self.assertEqual(engine.stats.kv_tokens_migrated, manager.stats.kv_tokens_moved)
+            self.assertGreaterEqual(manager.stats.sources_emptied, 1)
+            snap = manager.stats.snapshot()
+            self.assertGreaterEqual(snap["repack/plans"], 1)
+            for rnd in snap["repack/rounds"]:
+                self.assertIn("kv_util_before", rnd)
+                self.assertIn("kv_util_after", rnd)
+                self.assertGreaterEqual(rnd["idle_replicas_after"], rnd["idle_replicas_before"])
+                self.assertEqual(rnd["requests_moved"] >= 1, True)
 
         asyncio.run(scenario())
 
