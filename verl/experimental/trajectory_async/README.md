@@ -629,6 +629,86 @@ backends (direct reads ≠ per-machine relays at scale); (3) experience
 buffer sampling/eviction strategies; (4) the trajectory-level producer on
 the rollout side.
 
+## Real-path-only status (mocks stripped) + cluster TODO
+
+Strict view for real-machine work: **everything that is a mock counts as
+not implemented.** What survives that filter:
+
+| Component | Real? | State |
+|---|---|---|
+| `GroupAggregator`, `GroupRecord`, `TrajectorySample` | ✅ real logic | pure stdlib, 13 unit tests; usable as-is on a real trainer |
+| `TrajectoryBatchCollector` + `row_from_sample_batch` | ✅ real logic | consumption core of the real trainer; accepts group- AND trajectory-level messages; 8 tests. Runtime behavior on real DataProto rows unverified |
+| `TrajectoryAsyncTrainer(FullyAsyncTrainer)` | ✅ real code, never run | separate deployment (SeparateRayPPOTrainer lineage), `_get_samples_from_queue` overridden; only syntax-checked (no ray/torch on the dev machine); **no launcher script** |
+| `VersionedWeightStore` control plane | ✅ real logic | version registry, retention GC, per-consumer accounting; engine-agnostic |
+| `KimiP2PBackend` / `MooncakeP2PBackend` | ✅ real code, never run | written against the checked-in engine classes; known issues below |
+| `best_fit_consolidation` (Algorithm 1) | ✅ real logic, mock executor | pure function on `ReplicaState`; drives only the mock engine — no real-replica executor |
+| rollout engine, multi-replica engine, weight relay, rollouter, demo trainer, all A/B numbers | 🧪 mock | **treat as not implemented** |
+| trajectory-level producer (rollout side) | ❌ missing | nothing emits one-response-per-message today |
+| experience buffer w/ sampling+eviction | ❌ missing | collector is in-memory FIFO |
+| relay tier (master + per-machine relays, resharding, chain, PCIe pull) | ❌ missing | real backends do direct reads from actor memory |
+| fault tolerance / partial response pool | ❌ missing | — |
+| repack executor on real replicas (KV transfer) | ❌ missing | — |
+
+### Cluster TODO list (ordered)
+
+**P0 — make the real path runnable at all**
+
+1. **Launcher**: mirror `verl/experimental/fully_async_policy/fully_async_main.py`
+   wiring `FullyAsyncRollouter` + MessageQueue + `TrajectoryAsyncTrainer`.
+   With the stock producer this validates the group-level path end to end
+   (collector splits rows, re-aggregates, exact mini-batches, metrics).
+2. **Trajectory-level producer**: in the rollouter/AgentLoopManager path,
+   emit one message per response (1-row DataProto carrying
+   `non_tensor_batch` fields `traj_index`, `model_version`,
+   `rollout_failed`; reward scored per row — mirrors `AgentLoopWorker`'s
+   per-row tasks). This is THE core gap of "trajectory-level" on the real
+   path.
+3. **kimi read side placement**: `KimiP2PBackend.read_into` currently
+   calls `self.engine.parameter_server.receive_tensor` on the
+   constructor's engine (actor-side). Stock semantics: the RECEIVER's
+   engine calls `receive_tensor` with its own `rollout_group`/`ranks`.
+   Fix: take the consumer's engine from `consumer_ctx["engine"]` (as
+   `MooncakeP2PBackend` already does).
+
+**P1 — validate the written code on a real machine**
+
+4. Import chain: `async_trainer.py` under a full install (only
+   `py_compile`'d so far); config keys `async_training.staleness_drop` /
+   `trajectory_group_assembly` accepted by hydra.
+5. `row_from_sample_batch` against real DataProto: `union(position)`
+   slicing semantics, `non_tensor_batch` field types (`.item()` paths).
+6. Adapter smokes: `python -m unittest
+   tests.experimental.trajectory_async.test_adapter_smoke -v`
+   (torch-gated; runs the real kimi/mooncake adapter code over stub
+   engines).
+7. mooncake `unregister_memory` — exact name/semantics vs
+   `batch_register_memory`; verify against the installed
+   mooncake-transfer-engine version.
+8. kimi per-replica process-group topology — stock
+   `build_topology` creates ONE group over actor + all rollout workers;
+   versioned pulls need one group PER REPLICA (or receiver-side
+   `receive_tensor` with per-replica ranks, which item 3 enables).
+9. Concurrent `transfer_sync_read` from several replicas against the
+   actor's registered memory.
+10. Collector behavior under real queue semantics (cloudpickle'd
+    samples, `put_sample(None)` termination) — `_get_samples_from_queue`
+    interaction with `required_samples`/`require_batches` bookkeeping.
+
+**P2 — close the architectural gaps vs the paper**
+
+11. Relay tier: master relay + per-machine relay copies on rollout
+    machines, resharding by rollout TP, chain-pipelined broadcast
+    (mooncake's stock engine has a chain; compose it under
+    `VersionedWeightStore`), PCIe pull from colocated relay.
+12. Experience buffer: pluggable sampling (FIFO today; prioritized /
+    freshness-weighted) + capacity eviction at the collector seam.
+13. Partial response pool + fault tolerance: stream in-progress
+    trajectories centrally; on replica failure redirect to a
+    same-version replica reusing partial progress.
+14. Repack on real replicas: idleness from real KVCache stats,
+    `CanFit(C_max, B)` from the rollout engine, migration as KV
+    transfer; `best_fit_consolidation` is reusable as-is.
+
 ## Test coverage
 
 `tests/experimental/trajectory_async/` (83 tests; 81 stdlib-only + 2
