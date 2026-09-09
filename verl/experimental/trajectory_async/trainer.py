@@ -81,6 +81,11 @@ class TrainerConfig:
     # drop groups whose *oldest* trajectory is staler than this many
     # versions (None disables staleness-based dropping)
     max_staleness_drop: int | None = None
+    # Sync-RL baseline (Laminar Figure 3(a)): when True, mini-batches are
+    # formed as groups complete but NO update runs until the whole batch
+    # finished generating — the trainer waits for the slowest trajectory
+    # before its first update. Used by the demo's sync-vs-async A/B.
+    sync_wait_full_batch: bool = False
 
 
 @dataclass
@@ -190,6 +195,11 @@ class TrajectoryTrainer:
         # exactly the pipeline trajectory-level delivery enables
         self._update_lock = asyncio.Lock()
         self._start_time: float | None = None
+        # sync baseline: formed-but-untrained mini-batches, trained only
+        # after the end-of-stream sentinel (wait for the slowest trajectory)
+        self._sync_hold: list[list[GroupRecord]] | None = (
+            [] if self.config.sync_wait_full_batch else None
+        )
 
     # ------------------------------------------------------------------- run
 
@@ -214,6 +224,13 @@ class TrajectoryTrainer:
         # drain in-flight preprocessing before final aggregation state
         if self._preprocess_tasks:
             await asyncio.gather(*self._preprocess_tasks, return_exceptions=True)
+
+        # sync baseline: the whole batch is generated — now (and only now)
+        # the updates run, back to back, on the held mini-batches
+        if self._sync_hold is not None:
+            held, self._sync_hold = self._sync_hold, None
+            for groups in held:
+                await self._train_batch_locked(groups)
 
         self._finalize()
         self.stats.wall_time_s = time.monotonic() - self._start_time
@@ -276,6 +293,11 @@ class TrajectoryTrainer:
             self.on_group(group)
         batch = self.mini_batcher.add_group(group)
         if batch is not None:
+            if self._sync_hold is not None:
+                # sync baseline: form the batch now, hold it — updates only
+                # start after the whole batch finished generating
+                self._sync_hold.append(batch)
+                return
             await self._train_batch(batch)
 
     # ----------------------------------------------------------------- train

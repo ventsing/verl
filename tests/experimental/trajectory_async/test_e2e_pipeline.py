@@ -193,6 +193,44 @@ class TestEndToEndEquivalence(unittest.TestCase):
         self.assertEqual(stats.mini_batches, 2)
 
 
+class TestSyncBaseline(unittest.TestCase):
+    def test_sync_waits_async_overlaps_same_data(self):
+        """The paper's headline A/B at pipeline scale: sync (updates held
+        until the whole batch generated) vs trajectory-async train on
+        identical data; async's first update starts far earlier."""
+        from verl.experimental.trajectory_async.run_demo import build_arg_parser, run_one
+
+        args = build_arg_parser().parse_args(
+            [
+                "--mode", "trajectory",
+                "--num-prompts", "8", "--n", "4", "--mini-batch-groups", "2",
+                "--seed", "23",
+                "--replicas", "2", "--batch-per-replica", "6",
+                "--decode-rate-tok-s", "2000", "--update-time-s", "0.3",
+            ]
+        )
+        sync = asyncio.run(run_one(args, "group", repack="off", label="sync", sync=True))
+        asy = asyncio.run(run_one(args, "trajectory", repack="off", label="async"))
+
+        # same data — the hard invariant across pipeline shapes
+        self.assertEqual(set(sync.trained_groups), set(asy.trained_groups))
+        for uid in sync.trained_groups:
+            self.assertEqual(sync.trained_groups[uid], asy.trained_groups[uid])
+        self.assertEqual(sync.trainer_stats["trainer/groups_trained"], 8)
+        self.assertEqual(asy.trainer_stats["trainer/groups_trained"], 8)
+        # sync trained only after ALL generation (time-to-first ≈ wall of
+        # the generation phase); async's first update overlaps generation
+        ttfb_s = sync.trainer_stats["trainer/time_to_first_batch_s"]
+        ttfb_a = asy.trainer_stats["trainer/time_to_first_batch_s"]
+        self.assertIsNotNone(ttfb_s)
+        self.assertIsNotNone(ttfb_a)
+        self.assertGreater(ttfb_s, ttfb_a)
+        self.assertGreater(
+            ttfb_s, sync.wall_time_s * 0.5,
+            "sync first update should come late in the run (wait-for-slowest)",
+        )
+
+
 class TestPreprocessPolicies(unittest.TestCase):
     def test_on_group_complete_policy_trains_identical_data(self):
         num_prompts, n, mbg = 8, 4, 2

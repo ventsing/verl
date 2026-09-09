@@ -18,6 +18,7 @@ simulated vs. real.
 
 | script | shows | key metrics | exit code |
 |---|---|---|---|
+| `run_vs_sync.sh` | the paper's headline A/B: synchronous RL (wait for the whole batch, then train) vs trajectory-level async on the same replicas | wall time, time-to-first-update, end-to-end tokens/s, inherent staleness | 0 unless the pipelines train on **different data** (hard invariant) |
 | `run_repack_ab.sh` | active migration (Laminar repack): same workload, repack off vs on | throughput, avg/peak KVCache util, per-round migration KV effect (`repack/rounds`: plan, requests + KV tokens moved, sources emptied, fleet KV util before→after), inherent staleness | 0 unless repack **changes trained data** (hard invariant) |
 | `run_failure_isolation.sh` | trajectory- vs group-level delivery: phase 1 proves data equivalence with no failures; phase 2 shows per-trajectory retry saving groups an all-or-nothing baseline loses | groups trained, groups dropped, wasted attempts | phase 1 enforces equivalence |
 | `run_staleness_control.sh` | freshness control: unbounded vs `--staleness-drop 1` | `trainer/oldest_staleness` max, `groups_dropped_stale` | 0 (measurement) |

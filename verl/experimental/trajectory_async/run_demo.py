@@ -83,6 +83,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mode", choices=["trajectory", "group"], default="trajectory", help="delivery mode to run")
     p.add_argument("--compare", action="store_true", help="run both modes over the same workload and diff")
+    p.add_argument(
+        "--compare-vs-sync",
+        action="store_true",
+        help="the paper's headline A/B: synchronous RL (wait for the whole batch, then "
+        "train) vs the configured async pipeline over the same workload",
+    )
     p.add_argument("--num-prompts", type=int, default=24)
     p.add_argument("--n", type=int, default=8, help="rollout.n — responses per prompt")
     p.add_argument("--mini-batch-groups", type=int, default=4, help="groups per policy update")
@@ -195,12 +201,14 @@ async def run_one(
     mode: str,
     repack: str | None = None,
     label: str | None = None,
+    sync: bool = False,
 ) -> RunResult:
     """One full pipeline run.
 
     ``mode`` is the delivery granularity (group | trajectory); ``repack``
     overrides ``args.repack`` for A/B runs; ``label`` names the result in
-    reports (defaults to ``mode``).
+    reports (defaults to ``mode``); ``sync`` selects the synchronous-RL
+    baseline (no update until the whole batch finished generating).
     """
     repack_mode = args.repack if repack is None else repack
     run_label = label if label is not None else mode
@@ -288,6 +296,7 @@ async def run_one(
             update_time_s=args.update_time_s,
             max_staleness_drop=args.staleness_drop,
             preprocess_policy=args.preprocess_policy,
+            sync_wait_full_batch=sync,
         ),
         preprocess_fn=await make_preprocess_fn(args),
         update_fn=None,  # default: simulated sleep + version advance
@@ -594,9 +603,78 @@ def print_repack_compare(off: RunResult, on: RunResult) -> bool:
     return not problems
 
 
+def print_sync_compare(sync: RunResult, asy: RunResult) -> bool:
+    """The paper's headline A/B: synchronous RL vs trajectory-level async.
+
+    Same workload, same replicas. Sync (Laminar Figure 3(a)): the trainer
+    waits for the slowest trajectory before its first update; async:
+    updates start as soon as the first mini-batch of complete groups
+    assembled (updates overlap remaining generation). Data equivalence is
+    the hard invariant.
+    """
+    print("\n" + "=" * 72)
+    print("SYNC vs TRAJECTORY-ASYNC (identical workload: same lengths, same failures)")
+    print("=" * 72)
+
+    def row(name, a, b, fmt="{:>{w}}", better: str = "lower") -> None:
+        w = 16
+        as_ = fmt.format(a if a is not None else "-", w=w)
+        bs = fmt.format(b if b is not None else "-", w=w)
+        mark = ""
+        if a is not None and b is not None:
+            if better == "lower":
+                mark = "  <- async wins" if b < a else ("  <- sync wins" if a < b else "")
+            else:
+                mark = "  <- async wins" if b > a else ("  <- sync wins" if a > b else "")
+        print(f"{name:<40} {as_} {bs}{mark}")
+
+    ts_s, ts_a = sync.trainer_stats, asy.trainer_stats
+    print(f"{'metric':<40} {'sync':>16} {'async':>16}")
+    row("wall time (s)", sync.wall_time_s, asy.wall_time_s, "{:>{w}.3f}")
+    row("time to first update (s)", ts_s.get("trainer/time_to_first_batch_s"), ts_a.get("trainer/time_to_first_batch_s"), "{:>{w}.3f}")
+    row("groups trained", ts_s.get("trainer/groups_trained"), ts_a.get("trainer/groups_trained"), "{:>{w}d}", "higher")
+    # end-to-end throughput (the paper's headline metric): trained tokens
+    # over wall time — NOT tokens-per-update-interval, whose denominator
+    # degenerates in sync mode (updates run back-to-back after generation)
+    def _e2e(r: RunResult) -> float:
+        return r.trainer_stats.get("trainer/total_trained_tokens", 0) / max(r.wall_time_s, 1e-9)
+
+    row("end-to-end throughput (tok/s)", _e2e(sync), _e2e(asy), "{:>{w}.1f}", "higher")
+    row("mean inherent staleness (versions)", ts_s.get("trainer/inherent_staleness", {}).get("mean"), ts_a.get("trainer/inherent_staleness", {}).get("mean"), "{:>{w}.3f}")
+    row("max intra-group version span", ts_s.get("trainer/version_span", {}).get("max"), ts_a.get("trainer/version_span", {}).get("max"), "{:>{w}.1f}")
+
+    problems = verify_equivalence(sync, asy)
+    if problems:
+        print("\nDATA EQUIVALENCE: FAILED — sync and async must train on the same data")
+        for p in problems[:10]:
+            print("  - " + p)
+        return False
+    n = len(set(sync.trained_groups) & set(asy.trained_groups))
+    print(f"\nDATA EQUIVALENCE: OK — both pipelines trained the same {n} groups on identical data")
+    print(
+        "\nNOTE: sync waits for the slowest trajectory of the batch before its first\n"
+        "update (Laminar Fig. 3(a)); trajectory-async starts updating on complete\n"
+        "groups while the long tail is still generating (Fig. 3(e)) — the paper's\n"
+        "headline speedup mechanism, at the cost of per-trajectory staleness.\n"
+        "(Sync here = one fully-generated batch, then sequential mini-batch updates;\n"
+        "the paper's 5.48x is against full multi-iteration sync training.)"
+    )
+    return True
+
+
 def main() -> None:
     args = build_arg_parser().parse_args()
-    if args.compare_repack:
+    if args.compare_vs_sync:
+        # sync baseline: group delivery, no repack, updates held until the
+        # whole batch finished generating (Laminar Figure 3(a))
+        sync = asyncio.run(run_one(args, "group", repack="off", label="sync", sync=True))
+        asy = asyncio.run(run_one(args, args.mode, label="async"))
+        if not args.quiet:
+            print_report(sync)
+            print_report(asy)
+        if not print_sync_compare(sync, asy):
+            raise SystemExit(1)  # sync vs async must never change trained data
+    elif args.compare_repack:
         if args.replicas < 2:
             print("--compare-repack needs --replicas >= 2 (single replica has nothing to consolidate)")
             raise SystemExit(2)
