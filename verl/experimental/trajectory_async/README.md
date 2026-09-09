@@ -380,6 +380,82 @@ with `--keep-last-versions` (retention) and `--weight-mb` (fake payload
 size) as knobs; `--weight-store relay` (default) keeps the chain-broadcast
 timing model instead.
 
+## Debugging on a real machine
+
+### Which layer needs which dependency
+
+| Layer | Needs | How |
+|---|---|---|
+| L0 orchestration: store, repack, engine, demo, all CPU tests | nothing (stdlib) | `python -m unittest discover -s tests/experimental/trajectory_async -t .` |
+| L1 engine import checks | pip packages only (below) | `python -c ...` snippets |
+| L2 adapter smoke: real kimi/mooncake backend code over stub engines | torch (+ the two packages for the engines they stub) | `python -m unittest tests.experimental.trajectory_async.test_adapter_smoke -v` |
+| L3 real transfers | GPUs + RDMA cluster | deployment wiring + the validation points below |
+
+### Installing the engines
+
+```bash
+# kimi backend — PyPI 'checkpoint-engine' (github MoonshotAI/checkpoint-engine);
+# the [p2p] extra pulls mooncake-transfer-engine>=0.3.5, which is exactly
+# the p2p store KimiP2PBackend wraps
+pip install "checkpoint-engine[p2p]"
+
+# mooncake backend — PyPI 'mooncake-transfer-engine' (github kvcache-ai/Mooncake)
+pip install mooncake-transfer-engine
+```
+
+* ⚠️ **do NOT `pip install mooncake`** — that PyPI name is an unrelated
+  project (a spoken-language tool). The transfer engine is
+  `mooncake-transfer-engine`.
+* Both adapters additionally need torch (checkpoint-engine's floor is
+  2.5.0), and verl's engine classes need ray plus vllm or sglang (kimi's
+  parameter server uses the vllm NCCL backend; mooncake's
+  `StatelessProcessGroup` import falls back to sglang).
+* mooncake transfers need RDMA — verl's engine hardcodes the `"rdma"`
+  protocol. For single-machine debugging without RDMA NICs, soft-RoCE
+  works: `sudo rdma link add rxe0 type rxe netdev <nic>` (then the
+  `device_name` argument selects it).
+* Wheels: mooncake-transfer-engine ships cp310–cp313 manylinux x86_64 /
+  aarch64.
+
+### L1: import checks
+
+```bash
+python -c "from mooncake.engine import TransferEngine; print('mooncake ok')"
+python -c "from checkpoint_engine.ps import ParameterServer; print('kimi ps ok')"
+python - <<'EOF'
+from verl.checkpoint_engine import CheckpointEngineRegistry
+for backend in ("kimi_ckpt_engine", "mooncake"):
+    try:
+        CheckpointEngineRegistry.get(backend)
+        print(backend, "registered")
+    except ValueError as e:
+        print(backend, "MISSING:", e)
+EOF
+```
+
+### L3: what only a cluster can validate
+
+1. **kimi per-replica topology** — `KimiP2PBackend.read_into` passes one
+   replica's own `ranks`/`ranks_group` to `receive_tensor`; the stock
+   manager builds a single group over actor + all rollout workers, so a
+   per-replica variant of `build_topology` must be built and exercised.
+2. **mooncake `unregister_memory`** — the name/semantics of the
+   TransferEngine unregister counterpart to `batch_register_memory`.
+3. **concurrent direct reads** — several replicas issuing
+   `transfer_sync_read` against the actor's registered memory at once.
+
+### Logging and breakpoints
+
+* `VERL_LOGGING_LEVEL=INFO` (or `DEBUG`) — the stock engines' knob;
+  the trajectory_async modules use standard `logging` too.
+* `store.snapshot()` (per-consumer version/lag/bytes),
+  `engine.stats.snapshot()`, `repack.stats.snapshot()` — call at any
+  await point.
+* Useful breakpoints: `VersionedWeightStore.publish` / `.pull`,
+  `KimiP2PBackend.stage` / `.read_into`, `MooncakeP2PBackend.stage` /
+  `.read_into`, `MultiReplicaEngine._drain_cycle` (the pull timing),
+  `RepackManager.repack_once` (the scheduling decision).
+
 ## Real-engine wiring guide
 
 The data plane is engine-agnostic: `TrajectorySample.payload` is opaque and
@@ -459,7 +535,9 @@ routing manager.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (71 tests, stdlib-only):
+`tests/experimental/trajectory_async/` (73 tests; 71 stdlib-only + 2
+torch-gated adapter smokes that skip without torch and run the real
+kimi/mooncake adapter code over stub engines on a full machine):
 
 * aggregator: completion order, duplicates, FAILED-eviction protocol,
   late-arrival guard, buffer limits, record invariants;
@@ -483,4 +561,10 @@ routing manager.
   pinned pulls, concurrent publish/pull interleavings, byte accounting,
   fake-backend registered-memory lifecycle, the demo-engine relay
   contract over the real store orchestration, and the backend-selection
-  factory (dispatch, name normalization, engine requirement errors).
+  factory (dispatch, name normalization, engine requirement errors);
+* adapter smokes (torch-gated, run on a full machine): the real
+  KimiP2PBackend / MooncakeP2PBackend against duck-typed stub engines —
+  register-without-unregister retention, per-version staging buffers,
+  pinned pulls through the stub `receive_tensor` / `transfer_sync_read`,
+  chunk accounting, and eviction unregistering exactly the evicted
+  version.
