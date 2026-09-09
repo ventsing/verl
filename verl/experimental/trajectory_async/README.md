@@ -72,7 +72,45 @@ Components (all under `verl/experimental/trajectory_async/`):
 | `weight_relay.py` | hierarchical parameter service **timing mock** (Laminar §4): actor→master push (the only actor stall), background chain broadcast, per-replica pull-anytime — used by the CPU demo's default `--weight-store relay` |
 | `versioned_weight_store.py` | **real** multi-version, pull-based weight management over P2P checkpoint engines: `VersionedWeightStore` (registry, retention GC, per-consumer state) + `KimiP2PBackend` / `MooncakeP2PBackend` adapters + `FakeP2PBackend` (owner-memory + remote-read semantics with bytes payloads) |
 | `repack.py` | active scheduling (Laminar §5): idleness detection (KVCache ramp-down), Algorithm 1 Best-Fit trajectory consolidation within weight-version groups, periodic + post-update triggers |
+| `group_collector.py` | the consumption core of the REAL trainer, factored stdlib-only: `TrajectoryBatchCollector` accepts both producer granularities (group-level `RolloutSample` and trajectory-level single rows), re-assembles groups, emits exactly-`ppo_mini_batch_size` fresh batches; `row_from_sample_batch` adapts real DataProto rows |
+| `async_trainer.py` | **the real trainer** — `TrajectoryAsyncTrainer(FullyAsyncTrainer)`: separate deployment (inherits `SeparateRayPPOTrainer` semantics: `Role.Actor` training workers, rollout replicas on the rollout side, message-queue intake, `CheckpointEngineManager` weight sync), overriding `_get_samples_from_queue` with group-aware trajectory-level collection + `trajectory_async/*` metrics, and a multi-version pull-based weight extension point |
 | `run_demo.py` | CLI A/B benchmark with data-equivalence verification (`--compare` delivery granularity, `--compare-repack` active scheduling) |
+
+### The real trainer vs. the mock
+
+`trainer.py` + `run_demo.py` simulate the consumption contract on CPU;
+`async_trainer.py` deploys it on the real stack, structured after
+`verl/experimental/fully_async_policy/fully_async_trainer.py`:
+
+```python
+@ray.remote(num_cpus=10)
+class TrajectoryAsyncTrainer(FullyAsyncTrainer):   # SeparateRayPPOTrainer lineage
+    # separate deployment: Role.Actor workers here, rollout replicas on the
+    # rollout side (rollouter + AgentLoopManager), message queue in between.
+
+    async def _get_samples_from_queue(self):
+        # stock: collect by COUNT — one message = one whole prompt group
+        # (rollout.n rows), the slowest response gates every batch.
+        # ours: every message is split into per-trajectory rows and fed to
+        # TrajectoryBatchCollector, which re-assembles GRPO groups and only
+        # emits a batch of ppo_mini_batch_size COMPLETE, FRESH groups — so a
+        # trajectory-level producer (one response per message) drops in,
+        # while the stock group-level producer keeps working unchanged.
+        ...
+    async def _fit_update_weights(self):
+        # default: stock CheckpointEngineManager push (versioned by
+        # global_steps). async_training.weight_store.backend selects the
+        # multi-version pull path (stage-only publish, per-replica pulls
+        # at batch boundaries) — the README wiring guide is the recipe.
+        ...
+```
+
+`TrajectoryBatchCollector` (the part worth testing without a cluster)
+is stdlib-only and covered by `test_group_collector.py`: both producer
+granularities through one path, complete-group-only batches, staleness
+refusal without batch shrinkage, and the reconciliation identity
+`trained + evicted + dropped_stale + leftover + incomplete == groups
+started`.
 
 ## Correctness invariants
 
@@ -566,7 +604,7 @@ routing manager.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (74 tests; 72 stdlib-only + 2
+`tests/experimental/trajectory_async/` (82 tests; 80 stdlib-only + 2
 torch-gated adapter smokes that skip without torch and run the real
 kimi/mooncake adapter code over stub engines on a full machine):
 

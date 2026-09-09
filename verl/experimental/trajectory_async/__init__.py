@@ -20,6 +20,10 @@ design, the honest benefit model, and the real-engine wiring guide.
 """
 
 from verl.experimental.trajectory_async.group_aggregator import GroupAggregator
+from verl.experimental.trajectory_async.group_collector import (
+    TrajectoryBatchCollector,
+    row_from_sample_batch,
+)
 from verl.experimental.trajectory_async.mini_batcher import MiniBatcher
 from verl.experimental.trajectory_async.mock_rollout import (
     MockEngineConfig,

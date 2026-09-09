@@ -1,0 +1,289 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The REAL trainer for trajectory-level async RL — separate deployment.
+
+``run_demo.py`` + ``trainer.py`` are the CPU mock of this contract; this
+module is the deployable trainer, structured after
+``verl/experimental/fully_async_policy/fully_async_trainer.py``:
+
+* **separate deployment** — inherited from :class:`FullyAsyncTrainer`
+  (itself a :class:`SeparateRayPPOTrainer`): training workers are
+  ``Role.Actor`` on the trainer GPUs, rollout replicas live on the rollout
+  side managed by a rollouter, connected through the message queue; weight
+  sync goes through the ``CheckpointEngineManager`` over the replicas.
+* **trajectory-level consumption** — the stock trainer collects samples
+  by COUNT (``required_samples``), where one queue message is a whole
+  prompt group (``rollout.n`` rows). This subclass routes every consumed
+  message through :class:`TrajectoryBatchCollector`, which re-assembles
+  GRPO groups from per-trajectory rows and only emits mini-batches of
+  *complete, fresh* groups:
+  ``ppo_mini_batch_size`` groups per update, exact, under staleness
+  control — so a trajectory-level producer (one response per message)
+  becomes a drop-in, while a group-level producer still works (rows are
+  split and re-aggregated, gaining per-group staleness accounting).
+* **group-granular staleness/refusal accounting** — per-update metrics
+  ``trajectory_async/*``: groups trained / evicted / dropped-stale /
+  leftover / incomplete, staleness + version-span summaries.
+
+Weight versioning: this trainer keeps the stock push-based
+``CheckpointEngineManager.update_weights`` (versioned by
+``global_steps``). The multi-version pull-based store
+(:class:`VersionedWeightStore` with kimi/mooncake backends) attaches at
+``_fit_update_weights`` — enabled with
+``async_training.weight_store.backend`` — where publish goes through the
+versioned store and replicas pull at their batch boundaries (the
+Laminar-style no-lockstep path; cluster validation required, see the
+package README's real-engine wiring guide).
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+
+import ray
+
+from verl.experimental.fully_async_policy.detach_utils import assemble_batch_from_rollout_samples
+from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+from verl.experimental.trajectory_async.group_collector import (
+    TrajectoryBatchCollector,
+    row_from_sample_batch,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@ray.remote(num_cpus=10)
+class TrajectoryAsyncTrainer(FullyAsyncTrainer):
+    """Fully-async PPO trainer with trajectory-level, group-aware consumption.
+
+    Extends :class:`FullyAsyncTrainer` (separate deployment:
+    ``SeparateRayPPOTrainer``) with:
+
+    1. group re-assembly on the trainer side
+       (:class:`TrajectoryBatchCollector`) — accepts both group-level and
+       trajectory-level producers;
+    2. freshness control (``async_training.staleness_drop``) with exact
+       ``ppo_mini_batch_size`` batches;
+    3. the ``trajectory_async/*`` metric family;
+    4. an optional multi-version pull-based weight path
+       (``async_training.weight_store.*``).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        async_cfg = self.config.async_training
+        self.trajectory_staleness_drop = async_cfg.get("staleness_drop", None)
+        self.trajectory_group_assembly = async_cfg.get("trajectory_group_assembly", True)
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+
+        self.trajectory_collector = TrajectoryBatchCollector(
+            mini_batch_groups=self.config.actor_rollout_ref.actor.ppo_mini_batch_size,
+            max_staleness_drop=self.trajectory_staleness_drop,
+            group_size=rollout_n,
+            on_group_complete=self._on_group_complete,
+        )
+        self._terminated = False
+
+    # ------------------------------------------------------------ callbacks
+
+    def _on_group_complete(self, group) -> None:
+        logger.info(
+            "group %s complete (%d trajectories, version span %d, train-ready %.3fs)",
+            group.uid,
+            group.group_size,
+            group.version_span,
+            group.train_ready_latency_s,
+        )
+
+    # ------------------------------------------------------------- intake
+
+    def _feed_collector(self, rollout_sample) -> None:
+        """Route one queue message (either granularity) into the collector.
+
+        Group-level producer: the sample's ``n`` rows share one uid;
+        ``row_from_sample_batch`` reads per-row ``traj_index`` /
+        ``model_version`` / ``rollout_failed`` when the producer set them
+        (trajectory-mode producers do), falling back to positional split.
+        Row payloads ride inside the GroupRecord (``trajectory.payload``)
+        so a completed group re-assembles directly into a DataProto.
+        """
+        batch = rollout_sample.full_batch
+        uid = str(rollout_sample.sample_id)
+        ntb = getattr(batch, "non_tensor_batch", None) or {}
+        if "uid" in ntb and len(ntb["uid"]):
+            uid = str(ntb["uid"][0])
+
+        rows = [row_from_sample_batch(uid, batch, position) for position in range(len(batch))]
+        if len(rows) == 1:
+            row = rows[0]
+            self.trajectory_collector.add_trajectory(
+                uid=uid,
+                traj_index=row["traj_index"],
+                group_size=row["group_size"],
+                model_version=row["model_version"],
+                reward=row["reward"],
+                num_tokens=row["num_tokens"],
+                failed=row["failed"],
+                payload=row["payload"],
+            )
+        else:
+            self.trajectory_collector.add_sample(uid, rows)
+
+    def _assemble_group_batch(self, groups: list):
+        """Concat per-group row payloads (traj_index order) into one
+        gen_batch_output, reusing the stock assembly utilities."""
+        from verl.experimental.fully_async_policy.detach_utils import RolloutSample
+
+        group_samples = []
+        for group in groups:
+            payloads = [t.payload for t in group.trajectories]  # traj_index order
+            payloads = [p for p in payloads if p is not None]
+            if not payloads:
+                continue
+            concat = payloads[0]
+            if len(payloads) > 1:
+                concat = concat.concat(payloads[1:])
+            group_samples.append(
+                RolloutSample(
+                    full_batch=concat,
+                    sample_id=group.uid,
+                    epoch=0,
+                    rollout_status={},
+                )
+            )
+        if not group_samples:
+            return None
+        if self.config.trainer.balance_batch:
+            return assemble_batch_from_rollout_samples(
+                group_samples, self.tokenizer, self.config, self._balance_batch
+            )
+        return assemble_batch_from_rollout_samples(group_samples, self.tokenizer, self.config, None)
+
+    # ------------------------------------------------------------- override
+
+    async def _get_samples_from_queue(self):
+        """Trajectory-level consumption: collect messages until
+        ``ppo_mini_batch_size`` complete, fresh groups are pending, then
+        assemble their rows into one gen_batch_output."""
+        if not self.trajectory_group_assembly:
+            return await super()._get_samples_from_queue()
+
+        consumer_start = time.time()
+        while True:
+            batch_groups = self.trajectory_collector.take_mini_batch(self.current_param_version)
+            if batch_groups is not None:
+                break
+            if self._terminated:
+                # stream ended without enough fresh groups: final accounting
+                self.trajectory_collector.finalize()
+                return None, None
+            sample, queue_len = await self.message_queue_client.get_sample()
+            if sample is None:
+                self._terminated = True
+                continue
+            self._feed_collector(sample)
+
+        batch = self._assemble_group_batch(batch_groups)
+        if batch is None:
+            return None, None
+        total_wait_time = time.time() - consumer_start
+        batch.meta_info["fully_async/total_wait_time"] = total_wait_time
+        self._step_wait_times.append(total_wait_time)
+        self._step_wait_samples.append(len(batch_groups))
+        self._log_trajectory_metrics(batch_groups)
+        return 0, batch
+
+    def _log_trajectory_metrics(self, batch_groups: list) -> None:
+        """Emit the trajectory_async/* metric family for this update."""
+        stats = self.trajectory_collector.stats
+        self.metrics.update(stats.snapshot())
+        # per-batch (not cumulative) summaries
+        spans = [g.version_span for g in batch_groups]
+        if spans:
+            self.metrics["trajectory_async/batch_version_span_mean"] = sum(spans) / len(spans)
+            self.metrics["trajectory_async/batch_version_span_max"] = max(spans)
+        self.metrics["trajectory_async/current_param_version"] = self.current_param_version
+
+    async def _fit_update_weights(self):
+        """Weight sync with a multi-version pull-based extension point.
+
+        Default: the stock push through ``CheckpointEngineManager``
+        (inherited — actor workers ``send_weights`` their shards, replicas
+        receive; versioned by ``global_steps``). Setting
+        ``async_training.weight_store.backend`` selects the Laminar-style
+        pull path (stage-only publish, per-replica pulls at batch
+        boundaries) — see :meth:`_publish_versioned_weights`.
+        """
+        if self.config.async_training.get("weight_store", None) is None:
+            return await super()._fit_update_weights()
+
+        if self.local_trigger_step != 1:
+            return None
+
+        with self._marked_param_sync():
+            await self._publish_versioned_weights(self.current_param_version + 1)
+        return None
+
+    def _marked_param_sync(self):
+        """Timer context matching the stock ``timing_s/param_sync``."""
+        from verl.utils.debug import marked_timer
+
+        return marked_timer("timing_s/param_sync", self.timing_raw)
+
+    async def _publish_versioned_weights(self, version: int) -> None:
+        """Stage the current actor weights as version ``version``.
+
+        Extension point for the multi-version pull-based weight path; NOT
+        wired by default because weight tensors never leave the actor
+        workers in the stock flow — the driver cannot hand them to the
+        store. The deployment recipe (see the package README, Real-engine
+        wiring guide):
+
+        1. add a worker-side engine method ``stage_version(version)`` that
+           registers the actor's CPU shards WITHOUT unregistering (kimi:
+           ``parameter_server.register_checkpoint(f"actor:v{version}", ...)``
+           ; mooncake: stage into a per-version RDMA buffer) — executed via
+           the existing generic dispatch
+           ``actor_wg.execute_checkpoint_engine("stage_version", version)``;
+        2. construct the :class:`VersionedWeightStore` in the driver over
+           the replicas' engine handles (``make_p2p_backend`` with the
+           kimi/mooncake adapter);
+        3. replicas pull at their batch boundaries
+           (``MultiReplicaEngine._drain_cycle`` is the reference
+           implementation).
+
+        Raises NotImplementedError until that wiring lands on a cluster.
+        """
+        raise NotImplementedError(
+            "async_training.weight_store.* selects the multi-version pull-based "
+            "weight path; wire the worker-side stage_version + per-replica pulls "
+            "first (verl/experimental/trajectory_async/README.md — Real-engine "
+            "wiring guide)"
+        )
+
+    async def fit(self):
+        """Training loop; finalizes collector accounting on the way out."""
+        try:
+            return await super().fit()
+        finally:
+            leftover = self.trajectory_collector.finalize()
+            if any(leftover.values()):
+                logger.warning(
+                    "trajectory collector at end of stream: %d leftover complete "
+                    "group(s), %d incomplete group(s)",
+                    leftover["leftover"],
+                    leftover["incomplete"],
+                )
