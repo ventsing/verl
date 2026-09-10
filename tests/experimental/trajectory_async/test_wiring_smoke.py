@@ -127,6 +127,22 @@ class TestP0Wiring(unittest.TestCase):
         for method in ("pull_weights", "running_requests", "remove_request", "admit_request"):
             self.assertTrue(hasattr(RolloutReplicaView, method), f"replica view missing {method}")
 
+    def test_row_retry_wiring(self):
+        """The producer's retry seam: policy function importable, deliver
+        stamps attempts, the trainer passes the budget."""
+        from verl.experimental.trajectory_async.rollout_producer import TrajectoryLevelRollouter
+        from verl.experimental.trajectory_async.row_retry import generate_row_with_retry
+
+        import inspect
+
+        deliver_params = inspect.signature(TrajectoryLevelRollouter._deliver_row).parameters
+        self.assertIn("attempts", deliver_params)
+        set_rc_params = inspect.signature(TrajectoryLevelRollouter.set_relay_controller).parameters
+        self.assertIn("row_max_attempts", set_rc_params)
+        # attempts default 1 keeps non-retry deliveries single-shot
+        self.assertEqual(deliver_params["attempts"].default, 1)
+        self.assertTrue(callable(generate_row_with_retry))
+
     def test_producer_lb_probes_exist(self):
         """The producer exposes the LB probes the repack bridge consumes."""
         from verl.experimental.trajectory_async.rollout_producer import TrajectoryLevelRollouter

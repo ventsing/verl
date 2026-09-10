@@ -97,11 +97,20 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
         self.trajectory_group_assembly = async_cfg.get("trajectory_group_assembly", True)
         rollout_n = self.config.actor_rollout_ref.rollout.n
 
+        # long-tail mitigation (all opt-in; defaults preserve strict
+        # group semantics): bounded row retries are producer-side
+        # (set_relay_controller); survivor delivery + group deadline are
+        # aggregator-side
+        self.trajectory_min_group_survivors = async_cfg.get("min_group_survivors", None)
+        self.trajectory_group_deadline_s = async_cfg.get("group_deadline_s", None)
+        self.row_max_attempts = int(async_cfg.get("row_max_attempts", 2))
         self.trajectory_collector = TrajectoryBatchCollector(
             mini_batch_groups=self.config.actor_rollout_ref.actor.ppo_mini_batch_size,
             max_staleness_drop=self.trajectory_staleness_drop,
             group_size=rollout_n,
             on_group_complete=self._on_group_complete,
+            min_group_survivors=self.trajectory_min_group_survivors,
+            group_deadline_s=self.trajectory_group_deadline_s,
         )
         self._terminated = False
 
@@ -109,9 +118,11 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
 
     def _on_group_complete(self, group) -> None:
         logger.info(
-            "group %s complete (%d trajectories, version span %d, train-ready %.3fs)",
+            "group %s complete (%d/%d trajectories%s, version span %d, train-ready %.3fs)",
             group.uid,
+            group.survivors,
             group.group_size,
+            " — PARTIAL" if group.partial else "",
             group.version_span,
             group.train_ready_latency_s,
         )
@@ -269,7 +280,7 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
                 "stock FullyAsyncRollouter cannot drive versioned pulls — "
                 "launch via trajectory_async_main.py or set weight_store=null"
             )
-        ray.get(self.rollouter.set_relay_controller.remote(self.relay_controller))
+        ray.get(self.rollouter.set_relay_controller.remote(self.relay_controller, self.row_max_attempts))
         logger.info(
             "relay controller attached (backend=%s, keep_last=%d, max_staged_bytes=%s): "
             "publish is a stage-only metadata phase; pulls are rollout-driven",

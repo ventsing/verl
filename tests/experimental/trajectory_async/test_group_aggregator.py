@@ -173,3 +173,140 @@ class TestGroupRecordStats(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------- long-tail mitigation (partial + deadline)
+
+
+def make_failed(uid: str, idx: int, n: int = 4, attempts: int = 1) -> TrajectorySample:
+    return TrajectorySample(
+        uid=uid,
+        traj_index=idx,
+        group_size=n,
+        model_version=0,
+        attempts=attempts,
+        status=TrajectoryStatus.FAILED,
+    )
+
+
+class TestPartialSurvivorDelivery(unittest.TestCase):
+    def test_failed_row_delivers_survivors_when_enabled(self):
+        agg = GroupAggregator(min_group_survivors=2)
+        for i in (0, 1, 2):
+            self.assertIsNone(agg.add_trajectory(make_traj("a", i)))
+        record = agg.add_trajectory(make_failed("a", 3, attempts=2))
+        self.assertIsNotNone(record)
+        self.assertTrue(record.partial)
+        self.assertFalse(record.evicted)
+        self.assertEqual(record.group_size, 4)  # original rollout.n preserved
+        self.assertEqual(record.survivors, 3)
+        self.assertEqual([t.traj_index for t in record.trajectories], [0, 1, 2])
+        self.assertEqual(agg.total_groups_partial, 1)
+        self.assertEqual(agg.total_rows_recovered_partial, 3)
+        self.assertEqual(agg.total_groups_evicted, 0)
+        self.assertEqual(agg.total_trajectories_evicted, 1)  # the failed row only
+
+    def test_strict_default_still_evicts(self):
+        agg = GroupAggregator()  # no min_group_survivors
+        for i in (0, 1, 2):
+            self.assertIsNone(agg.add_trajectory(make_traj("a", i)))
+        record = agg.add_trajectory(make_failed("a", 3))
+        self.assertIsNone(record)
+        self.assertEqual(agg.total_groups_evicted, 1)
+        self.assertEqual(agg.total_trajectories_evicted, 4)
+        self.assertEqual(agg.total_groups_partial, 0)
+
+    def test_below_threshold_still_evicts(self):
+        agg = GroupAggregator(min_group_survivors=3)
+        for i in (0, 1):
+            self.assertIsNone(agg.add_trajectory(make_traj("a", i)))
+        record = agg.add_trajectory(make_failed("a", 3))
+        self.assertIsNone(record)
+        self.assertEqual(agg.total_groups_evicted, 1)
+        self.assertEqual(agg.total_groups_partial, 0)
+
+    def test_threshold_clamped_to_two(self):
+        agg = GroupAggregator(min_group_survivors=1)
+        self.assertEqual(agg.min_group_survivors, 2)
+        # a lone survivor still evicts (no group-relative signal)
+        self.assertIsNone(agg.add_trajectory(make_traj("a", 0)))
+        record = agg.add_trajectory(make_failed("a", 3))
+        self.assertIsNone(record)
+        self.assertEqual(agg.total_groups_partial, 0)
+
+    def test_survivor_group_snapshot_counters(self):
+        agg = GroupAggregator(min_group_survivors=2)
+        for i in (0, 1, 2):
+            agg.add_trajectory(make_traj("a", i))
+        agg.add_trajectory(make_failed("a", 3))
+        snap = agg.snapshot()
+        self.assertEqual(snap["aggregator/groups_partial"], 1)
+        self.assertEqual(snap["aggregator/rows_recovered_partial"], 3)
+
+    def test_late_sibling_after_partial_is_dropped(self):
+        agg = GroupAggregator(min_group_survivors=2)
+        for i in (0, 1, 2):
+            agg.add_trajectory(make_traj("a", i))
+        agg.add_trajectory(make_failed("a", 3))
+        # protocol violation after resolution: counted, never trained
+        self.assertIsNone(agg.add_trajectory(make_traj("a", 0, version=9)))
+        self.assertEqual(agg.total_late_dropped, 1)
+
+
+class TestGroupDeadline(unittest.TestCase):
+    def test_deadline_resolves_partial_group(self):
+        agg = GroupAggregator(min_group_survivors=2, group_deadline_s=0.05)
+        for i in (0, 1):
+            agg.add_trajectory(make_traj("a", i))
+        # another group keeps arriving -> drives the sweep
+        import time as _time
+
+        _time.sleep(0.08)
+        agg.add_trajectory(make_traj("b", 0, n=2))
+        record = agg.add_trajectory(make_traj("b", 1, n=2))
+        # group "a" resolved as partial (2 survivors >= 2)
+        self.assertEqual(agg.total_groups_deadline, 1)
+        self.assertEqual(agg.total_groups_partial, 1)
+        self.assertEqual(agg.total_rows_recovered_partial, 2)
+        # "b" completed normally
+        self.assertIsNotNone(record)
+        self.assertFalse(record.partial)
+        self.assertEqual(agg.total_groups_completed, 1)
+
+    def test_deadline_without_survivors_policy_evicts(self):
+        agg = GroupAggregator(group_deadline_s=0.05)  # strict survivors policy
+        agg.add_trajectory(make_traj("a", 0))
+        import time as _time
+
+        _time.sleep(0.08)
+        agg.add_trajectory(make_traj("b", 0))
+        self.assertEqual(agg.total_groups_deadline, 1)
+        self.assertEqual(agg.total_groups_evicted, 1)
+        self.assertEqual(agg.total_groups_partial, 0)
+
+    def test_deadline_off_by_default(self):
+        agg = GroupAggregator()
+        agg.add_trajectory(make_traj("a", 0))
+        agg.add_trajectory(make_traj("b", 0))
+        self.assertEqual(agg.total_groups_deadline, 0)
+        self.assertEqual(agg.num_partial_groups, 2)
+
+    def test_no_deadline_fire_before_expiry(self):
+        agg = GroupAggregator(min_group_survivors=2, group_deadline_s=60.0)
+        for i in (0, 1):
+            agg.add_trajectory(make_traj("a", i))
+        agg.add_trajectory(make_traj("b", 0))
+        self.assertEqual(agg.total_groups_deadline, 0)
+
+    def test_late_sibling_after_deadline_counted(self):
+        agg = GroupAggregator(min_group_survivors=2, group_deadline_s=0.05)
+        agg.add_trajectory(make_traj("a", 0))
+        agg.add_trajectory(make_traj("a", 1))
+        import time as _time
+
+        _time.sleep(0.08)
+        agg.add_trajectory(make_traj("b", 0))  # drives sweep; "a" partial-emitted
+        # the straggler finally arrives — dead-uid guard drops it
+        self.assertIsNone(agg.add_trajectory(make_traj("a", 2)))
+        self.assertEqual(agg.total_late_dropped, 1)
+        self.assertEqual(agg.total_rows_recovered_partial, 2)

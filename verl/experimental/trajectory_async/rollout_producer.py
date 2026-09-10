@@ -91,11 +91,14 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
         counts = await asyncio.gather(*[lb.get_inflight_count.remote(sid) for sid in server_ids])
         return dict(zip(server_ids, counts))
 
-    async def set_relay_controller(self, relay_controller):
+    async def set_relay_controller(self, relay_controller, row_max_attempts: int = 2):
         """Attach the versioned-weight relay controller (optional; enables
-        rollout-driven batch-boundary pulls)."""
+        rollout-driven batch-boundary pulls) and the bounded row retry
+        budget (long-tail mitigation: a transient single-response failure
+        is retried instead of terminating the trajectory)."""
         self.relay_controller = relay_controller
         self._pull_version = 0  # version this fleet generates under
+        self.row_max_attempts = max(1, int(row_max_attempts))
         # group submissions run concurrently (streaming processor); the pull
         # DECISION must be serialized so concurrent groups don't both see
         # "behind" and trigger back-to-back fleet pulls (the second would
@@ -136,18 +139,32 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
         group_size: int,
         version: int,
     ):
-        try:
-            ret = await self.async_rollout_manager.generate_sequences_single(row)
-        except Exception:
-            logger.exception("trajectory %s[%d] generation failed", uid, traj_index)
+        from verl.experimental.trajectory_async.row_retry import generate_row_with_retry
+
+        async def deliver(result, attempts: int, stamped_version: int) -> None:
+            # the retry policy computes the version per attempt: attempt 1
+            # carries the group's submission snapshot; retries re-stamp
+            # with the CURRENT fleet version (a retry may run after a
+            # batch-boundary pull moved the fleet to newer weights —
+            # mixed-version group: version_span + the loss-side staleness
+            # correction handle it by design)
             await self._deliver_row(
-                self._failed_row(uid, traj_index, group_size, version), uid, traj_index
+                result, uid, traj_index, group_size, stamped_version, attempts=attempts
             )
-            return
 
-        await self._deliver_row(ret, uid, traj_index, group_size, version)
+        await generate_row_with_retry(
+            row,
+            generate_fn=self.async_rollout_manager.generate_sequences_single,
+            deliver_fn=deliver,
+            failed_row_fn=lambda: self._failed_row(uid, traj_index, group_size, version),
+            version_for_attempt=lambda attempt: version if attempt == 1 else self._pull_version,
+            max_attempts=getattr(self, "row_max_attempts", 2),
+            label=f"{uid}[{traj_index}]",
+        )
 
-    async def _deliver_row(self, row_batch, uid: str, traj_index: int, group_size: int, version: int):
+    async def _deliver_row(
+        self, row_batch, uid: str, traj_index: int, group_size: int, version: int, attempts: int = 1
+    ):
         """Put one 1-row message into the queue, stamped for group re-assembly."""
         from verl.protocol import DataProto
 
@@ -159,6 +176,7 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
         ntb["traj_index"] = np.array([traj_index], dtype=np.int64)
         ntb["group_size"] = np.array([group_size], dtype=np.int64)
         ntb["model_version"] = np.array([version], dtype=np.int64)
+        ntb["attempts"] = np.array([attempts], dtype=np.int64)
         ntb.setdefault("rollout_failed", np.array([False], dtype=bool))
 
         sample = RolloutSample(

@@ -57,6 +57,9 @@ class CollectorStats:
     rows_consumed: int = 0
     groups_trained: int = 0
     groups_evicted: int = 0
+    groups_partial: int = 0
+    rows_recovered_partial: int = 0
+    rows_wasted_failed: int = 0
     groups_dropped_stale: int = 0
     groups_leftover: int = 0  # complete groups flushed at end-of-stream
     groups_incomplete: int = 0  # partial groups still buffered at the end
@@ -76,6 +79,9 @@ class CollectorStats:
             "trajectory_async/rows_consumed": self.rows_consumed,
             "trajectory_async/groups_trained": self.groups_trained,
             "trajectory_async/groups_evicted": self.groups_evicted,
+            "trajectory_async/groups_partial": self.groups_partial,
+            "trajectory_async/rows_recovered_partial": self.rows_recovered_partial,
+            "trajectory_async/rows_wasted_failed": self.rows_wasted_failed,
             "trajectory_async/groups_dropped_stale": self.groups_dropped_stale,
             "trajectory_async/groups_leftover": self.groups_leftover,
             "trajectory_async/groups_incomplete": self.groups_incomplete,
@@ -138,6 +144,7 @@ class TrajectoryBatchCollector:
                 uid=uid,
                 traj_index=row.get("traj_index", pos),
                 group_size=row.get("group_size") or n,
+                attempts=int(row.get("attempts") or 1),
                 model_version=row.get("model_version", 0),
                 reward=row.get("reward"),
                 num_tokens=row.get("num_tokens", 0),
@@ -154,6 +161,7 @@ class TrajectoryBatchCollector:
         reward: float | None = None,
         num_tokens: int = 0,
         failed: bool = False,
+        attempts: int = 1,
         payload: Any = None,
     ) -> None:
         """Trajectory-level producer message: one response row."""
@@ -172,14 +180,16 @@ class TrajectoryBatchCollector:
             model_version=model_version,
             reward=reward,
             num_tokens=num_tokens,
+            attempts=attempts,
             status=TrajectoryStatus.FAILED if failed else TrajectoryStatus.COMPLETED,
         )
         evicted_before = self.aggregator.total_groups_evicted
         wasted_before = self.aggregator.total_trajectories_evicted
         group = self.aggregator.add_trajectory(traj)
-        # the aggregator accounts evictions internally (a FAILED row never
-        # returns a record — buffered siblings are not trainable); surface
-        # the delta in the collector's own metric family
+        # the aggregator accounts waste internally (evicted groups AND the
+        # failed rows of partially-delivered groups); a FAILED row may still
+        # return a PARTIAL survivor record when the long-tail mitigation is
+        # enabled — surface the evicted delta in the collector's metric family
         self.stats.groups_evicted += self.aggregator.total_groups_evicted - evicted_before
         self.stats.trajectories_wasted_evicted += self.aggregator.total_trajectories_evicted - wasted_before
         if group is not None:
@@ -255,6 +265,13 @@ class TrajectoryBatchCollector:
             self.stats.groups_evicted += 1
             self.stats.trajectories_wasted_evicted += len(group.trajectories)
             return
+        if group.partial:
+            # long-tail mitigation: survivors are trainable; the failed or
+            # deadline-expired members were already accounted by the
+            # aggregator (rows_wasted_failed mirrors the row-level waste)
+            self.stats.groups_partial += 1
+            self.stats.rows_recovered_partial += len(group.trajectories)
+            self.stats.rows_wasted_failed += group.group_size - len(group.trajectories)
         self._pending.append(group)
         if self.on_group_complete is not None:
             self.on_group_complete(group)
@@ -289,6 +306,7 @@ def row_from_sample_batch(
     traj_index = _scalar("traj_index", position)
     group_size = _scalar("group_size", n)
     model_version = _scalar("model_version", 0)
+    attempts = _scalar("attempts", 1)
     failed = bool(_scalar("rollout_failed", False))
     row_uid = _scalar("uid", uid) or uid
     reward = _scalar("reward", None)
@@ -305,6 +323,7 @@ def row_from_sample_batch(
         "traj_index": int(traj_index),
         "group_size": int(group_size) if group_size else None,
         "model_version": int(model_version or 0),
+        "attempts": int(attempts or 1),
         "failed": failed,
         "reward": float(reward) if reward is not None else None,
         "num_tokens": int(num_tokens),
@@ -317,10 +336,11 @@ def grpo_group_advantages(rewards: list[float], eps: float = 1e-6) -> list[float
     """Group-normalized advantages (GRPO/DAPO style): zero mean, unit std
     within each prompt group. Degenerate groups (all-equal rewards) get
     zero advantages. The group-preserving contract the collector serves:
-    a group is only trainable once ALL its trajectories are present —
-    this is what group reassembly protects (the real training path
-    computes this inside the actor workers; this stdlib twin is for
-    metrics and tests)."""
+    a group is trainable once all its trajectories are present — or, with
+    the long-tail mitigation, once its settled survivors are (partial
+    records; normalization then runs over the survivors present). This is
+    what group reassembly protects (the real training path computes this
+    inside the actor workers; this stdlib twin is for metrics and tests)."""
     if not rewards:
         return []
     import statistics

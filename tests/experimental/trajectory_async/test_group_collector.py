@@ -204,3 +204,73 @@ class TestRowAdapter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPartialGroupCollection(unittest.TestCase):
+    """Long-tail mitigation end-to-end at the collector: a FAILED row with
+    survivor tolerance delivers a trainable partial group; strict default
+    evicts."""
+
+    def _collector(self, **kw):
+        return TrajectoryBatchCollector(mini_batch_groups=1, group_size=4, **kw)
+
+    def test_partial_group_reaches_mini_batch(self):
+        c = self._collector(min_group_survivors=2)
+        for i in (0, 1, 2):
+            c.add_trajectory("a", traj_index=i, group_size=4, model_version=1)
+        c.add_trajectory("a", traj_index=3, group_size=4, model_version=1, failed=True, attempts=2)
+        # the partial group is pending and trainable
+        self.assertEqual(c.pending_groups, 1)
+        batch = c.take_mini_batch(current_version=1)
+        self.assertIsNotNone(batch)
+        self.assertEqual(len(batch), 1)
+        group = batch[0]
+        self.assertTrue(group.partial)
+        self.assertEqual(group.group_size, 4)
+        self.assertEqual(group.survivors, 3)
+        # stats: trained, partial, recovered rows, wasted row
+        self.assertEqual(c.stats.groups_trained, 1)
+        self.assertEqual(c.stats.groups_partial, 1)
+        self.assertEqual(c.stats.rows_recovered_partial, 3)
+        self.assertEqual(c.stats.rows_wasted_failed, 1)
+        self.assertEqual(c.stats.groups_evicted, 0)
+
+    def test_strict_default_evicts_on_failure(self):
+        c = self._collector()
+        for i in (0, 1, 2):
+            c.add_trajectory("a", traj_index=i, group_size=4, model_version=1)
+        c.add_trajectory("a", traj_index=3, group_size=4, model_version=1, failed=True)
+        self.assertEqual(c.pending_groups, 0)
+        self.assertIsNone(c.take_mini_batch(current_version=1))
+        self.assertEqual(c.stats.groups_evicted, 1)
+        self.assertEqual(c.stats.groups_partial, 0)
+
+    def test_reconciliation_identity_with_partial(self):
+        """trained + evicted + dropped_stale + leftover + incomplete holds."""
+        c = self._collector(min_group_survivors=2, max_staleness_drop=1)
+        # partial group (trained), complete group (trained), stale complete
+        # group (dropped), one incomplete group
+        for i in (0, 1, 2):
+            c.add_trajectory("p", traj_index=i, group_size=4, model_version=1)
+        c.add_trajectory("p", traj_index=3, group_size=4, model_version=1, failed=True)
+        for i in range(2):
+            c.add_trajectory("c", traj_index=i, group_size=2, model_version=1)
+        for i in range(2):
+            c.add_trajectory("s", traj_index=i, group_size=2, model_version=0)  # stale at v2
+        c.add_trajectory("i", traj_index=0, group_size=2, model_version=1)
+        self.assertIsNotNone(c.take_mini_batch(current_version=2))
+        self.assertIsNotNone(c.take_mini_batch(current_version=2))
+        self.assertIsNone(c.take_mini_batch(current_version=2))  # stale refused
+        leftover = c.finalize()
+        self.assertEqual(
+            c.stats.groups_trained + c.stats.groups_evicted + c.stats.groups_dropped_stale
+            + leftover["leftover"] + leftover["incomplete"],
+            4,
+        )
+
+    def test_attempts_threaded_through(self):
+        c = self._collector()
+        c.add_trajectory("a", traj_index=0, group_size=1, model_version=1, attempts=3)
+        group = c.take_mini_batch(current_version=1)[0]
+        self.assertEqual(group.trajectories[0].attempts, 3)
+        self.assertEqual(group.total_attempts, 3)

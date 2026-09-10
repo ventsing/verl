@@ -36,8 +36,19 @@ Semantics:
   ordered by ``traj_index``;
 * duplicate arrivals for the same ``(uid, traj_index)`` are tolerated: the
   first wins, later copies are counted and dropped (retry races);
-* a terminally-failed trajectory (``status == FAILED``) evicts the group: the
-  partial rows are returned for accounting and never trained on;
+* STRICT default: a terminally-failed trajectory (``status == FAILED``)
+  evicts the group — the partial rows are accounted, never trained.
+* LONG-TAIL mitigation (opt-in, ``min_group_survivors``): deliver the
+  SURVIVORS as a trainable partial group instead. One straggler must not
+  poison its n−1 healthy siblings: under the delivery protocol the FAILED
+  sentinel arrives after all sibling tasks settled, so the survivors are
+  complete at that moment. Survivors keep the original ``group_size``
+  stamp; advantage normalization runs over the survivors present.
+* ``group_deadline_s`` (opt-in): wall-clock bound on head-of-line
+  blocking — a group whose oldest buffered trajectory ages past the
+  deadline is resolved (partial delivery per the survivors policy, or
+  eviction). Late siblings arriving after resolution are counted and
+  dropped (``late_dropped``) — the accepted cost of a bounded wait.
 * the buffer never blocks the producer; memory is bounded by
   ``max_buffered_groups`` (soft limit, exceeded only by in-flight groups).
 """
@@ -45,6 +56,7 @@ Semantics:
 from __future__ import annotations
 
 import logging
+import time
 from collections import OrderedDict
 
 from verl.experimental.trajectory_async.types import (
@@ -72,15 +84,30 @@ class GroupAggregator:
         self,
         max_buffered_groups: int | None = None,
         max_dead_uids: int = _DEFAULT_MAX_DEAD_UIDS,
+        min_group_survivors: int | None = None,
+        group_deadline_s: float | None = None,
     ) -> None:
         # uid -> {traj_index: TrajectorySample}
         self._partial: OrderedDict[str, dict[int, TrajectorySample]] = OrderedDict()
         # uid -> expected group size (recorded from the first arrival)
         self._group_sizes: dict[str, int] = {}
+        # uid -> monotonic time of the first arrival (group deadline clock)
+        self._first_seen: dict[str, float] = {}
         # uids whose group was dropped; late arrivals are counted and dropped
         self._dead_uids: OrderedDict[str, None] = OrderedDict()
         self.max_buffered_groups = max_buffered_groups
         self.max_dead_uids = max_dead_uids
+        if min_group_survivors is not None and min_group_survivors < 2:
+            # a 1-survivor group has no GRPO contrast (zero advantage,
+            # pure compute waste) — refuse silently-degenerate configs
+            logger.warning(
+                "min_group_survivors=%s clamped to 2 (a lone survivor has no "
+                "group-relative advantage signal)",
+                min_group_survivors,
+            )
+            min_group_survivors = 2
+        self.min_group_survivors = min_group_survivors
+        self.group_deadline_s = group_deadline_s
 
         # counters
         self.total_added = 0
@@ -89,6 +116,9 @@ class GroupAggregator:
         self.total_groups_completed = 0
         self.total_groups_evicted = 0
         self.total_trajectories_evicted = 0
+        self.total_groups_partial = 0
+        self.total_rows_recovered_partial = 0
+        self.total_groups_deadline = 0
 
     # ------------------------------------------------------------------ core
 
@@ -108,7 +138,9 @@ class GroupAggregator:
             return None
 
         if traj.status == TrajectoryStatus.FAILED:
-            return self._evict_on_failure(traj)
+            record = self._evict_on_failure(traj)
+            self._sweep_deadlines()
+            return record
 
         self.total_added += 1
 
@@ -129,6 +161,7 @@ class GroupAggregator:
             )
 
         rows = self._partial.setdefault(traj.uid, {})
+        self._first_seen.setdefault(traj.uid, time.monotonic())
         if traj.traj_index in rows:
             # Retry race: the same slot already arrived. Keep the first
             # arrival, count the duplicate.
@@ -146,6 +179,7 @@ class GroupAggregator:
         if len(rows) == expected_size:
             del self._partial[traj.uid]
             del self._group_sizes[traj.uid]
+            self._first_seen.pop(traj.uid, None)
             self.total_groups_completed += 1
             return GroupRecord(
                 uid=traj.uid,
@@ -155,6 +189,7 @@ class GroupAggregator:
             )
 
         self._enforce_buffer_limit()
+        self._sweep_deadlines()
         return None
 
     def evict_group(self, uid: str, reason: str = "manual") -> GroupRecord | None:
@@ -186,6 +221,9 @@ class GroupAggregator:
             "aggregator/groups_completed": self.total_groups_completed,
             "aggregator/groups_evicted": self.total_groups_evicted,
             "aggregator/trajectories_evicted": self.total_trajectories_evicted,
+            "aggregator/groups_partial": self.total_groups_partial,
+            "aggregator/rows_recovered_partial": self.total_rows_recovered_partial,
+            "aggregator/groups_deadline": self.total_groups_deadline,
             "aggregator/duplicates_dropped": self.total_duplicates_dropped,
             "aggregator/late_dropped": self.total_late_dropped,
         }
@@ -193,14 +231,33 @@ class GroupAggregator:
     # ---------------------------------------------------------------- private
 
     def _evict_on_failure(self, failed: TrajectorySample) -> None:
-        """Evict the group owning a terminally-failed trajectory.
+        """Resolve the group owning a terminally-failed trajectory.
 
         Under the delivery protocol the failed sentinel arrives after all
         sibling tasks settled, so whatever is buffered for the uid is all
-        there will ever be. The eviction is accounted internally (the partial
-        rows are not returned to the caller — they are never trainable).
+        there will ever be — the survivors are COMPLETE at this moment.
+        Long-tail mitigation: with ``min_group_survivors`` tolerance, a
+        group with enough survivors is delivered as a trainable PARTIAL
+        record instead of being evicted (one straggler must not poison
+        its n−1 healthy siblings). Strict default: evict (the partial
+        rows are accounted internally, never trained).
         """
         uid = failed.uid
+        rows = self._partial.get(uid)
+        if (
+            self.min_group_survivors is not None
+            and rows is not None
+            and len(rows) >= self.min_group_survivors
+        ):
+            record = self._emit_partial(
+                uid, reason=f"trajectory #{failed.traj_index} failed after {failed.attempts} attempts"
+            )
+            if record is not None:
+                # account the failed row separately: its compute is wasted,
+                # the survivors' is not
+                self.total_trajectories_evicted += 1
+                self._mark_dead(uid)
+                return record
         record = self._evict(uid, reason=f"trajectory #{failed.traj_index} failed after {failed.attempts} attempts")
         if record is not None:
             # include the failed trajectory itself in the accounting record
@@ -213,10 +270,71 @@ class GroupAggregator:
                 self.total_groups_evicted += 1
                 self.total_trajectories_evicted += 1
         self._mark_dead(uid)
+        return None
+
+    def _emit_partial(self, uid: str, reason: str) -> GroupRecord | None:
+        """Deliver a partial group's SURVIVORS as a trainable record.
+
+        Used by the failure path (survivors settled) and the deadline
+        sweep (survivors may still be joined by late siblings — those are
+        counted and dropped by the dead-uid guard, the accepted cost of a
+        bounded wait). ``group_size`` keeps the ORIGINAL rollout.n so
+        staleness/version_span stay meaningful.
+        """
+        rows = self._partial.pop(uid, None)
+        expected_size = self._group_sizes.pop(uid, None)
+        self._first_seen.pop(uid, None)
+        if rows is None:
+            return None
+        if expected_size is None:
+            expected_size = next(iter(rows.values())).group_size
+        trajectories = [rows[i] for i in sorted(rows.keys())]
+        self.total_groups_partial += 1
+        self.total_rows_recovered_partial += len(trajectories)
+        record = GroupRecord(
+            uid=uid,
+            group_size=expected_size,
+            trajectories=trajectories,
+            partial=True,
+        )
+        logger.warning(
+            "Partial group %s delivered (%d/%d trajectories survived) — reason: %s",
+            uid,
+            len(trajectories),
+            expected_size,
+            reason,
+        )
+        return record
+
+    def _sweep_deadlines(self) -> None:
+        """Resolve partial groups older than ``group_deadline_s`` (bounded
+        head-of-line blocking): enough survivors -> partial delivery per the
+        survivors policy; otherwise eviction."""
+        if self.group_deadline_s is None:
+            return
+        now = time.monotonic()
+        expired = [
+            uid
+            for uid, first_seen in self._first_seen.items()
+            if now - first_seen > self.group_deadline_s and uid in self._partial
+        ]
+        for uid in expired:
+            self.total_groups_deadline += 1
+            rows = self._partial.get(uid)
+            if (
+                self.min_group_survivors is not None
+                and rows is not None
+                and len(rows) >= self.min_group_survivors
+            ):
+                self._emit_partial(uid, reason=f"group deadline {self.group_deadline_s}s")
+            else:
+                self._evict(uid, reason=f"group deadline {self.group_deadline_s}s")
+            self._mark_dead(uid)
 
     def _evict(self, uid: str, reason: str) -> GroupRecord | None:
         rows = self._partial.pop(uid, None)
         expected_size = self._group_sizes.pop(uid, None)
+        self._first_seen.pop(uid, None)
         if rows is None:
             return None
         if expected_size is None:
@@ -255,6 +373,7 @@ class GroupAggregator:
         for _ in range(overflow):
             uid, _ = self._partial.popitem(last=False)
             self._group_sizes.pop(uid, None)
+            self._first_seen.pop(uid, None)
             self.total_groups_evicted += 1
             self._mark_dead(uid)
             logger.warning("Aggregator buffer over limit, dropped oldest partial group %s", uid)

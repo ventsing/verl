@@ -120,6 +120,14 @@ class GroupRecord:
         evicted: True if the group was dropped because one trajectory
             terminally failed (only set on eviction records, which are
             reported for accounting but never trained on).
+        partial: True if the group is TRAINABLE despite missing
+            trajectories — the long-tail mitigation (one failed or
+            deadline-expired member must not poison its n−1 healthy
+            siblings): the record carries only the survivors, with
+            ``group_size`` keeping the ORIGINAL rollout.n so staleness/
+            version_span stay meaningful. Requires
+            ``min_group_survivors`` tolerance on the aggregator (else
+            eviction, the strict default).
     """
 
     uid: str
@@ -127,6 +135,12 @@ class GroupRecord:
     trajectories: list[TrajectorySample] = field(default_factory=list)
     complete_time: float = field(default_factory=_now)
     evicted: bool = False
+    partial: bool = False
+
+    @property
+    def survivors(self) -> int:
+        """Trajectories actually present (== group_size unless partial)."""
+        return len(self.trajectories)
 
     def __post_init__(self) -> None:
         if len(self.trajectories) > self.group_size:
@@ -134,11 +148,11 @@ class GroupRecord:
                 f"GroupRecord({self.uid}) built with {len(self.trajectories)} "
                 f"trajectories but group_size={self.group_size}"
             )
-        if not self.evicted and len(self.trajectories) != self.group_size:
+        if not self.evicted and not self.partial and len(self.trajectories) != self.group_size:
             raise ValueError(
                 f"GroupRecord({self.uid}) is marked trainable but has "
                 f"{len(self.trajectories)}/{self.group_size} trajectories; only "
-                f"eviction records may be partial"
+                f"eviction or partial-survivor records may be incomplete"
             )
 
     # ------------------------------------------------------------------ stats

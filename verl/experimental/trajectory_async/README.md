@@ -18,7 +18,7 @@ the kimi/mooncake adapters).
 | Module | Role |
 |---|---|
 | `types.py` | data model: `TrajectorySample` (one response: uid, traj_index, model_version, reward, attempts, payload), `GroupRecord`, `TrajectoryStatus` |
-| `group_aggregator.py` | trainer-side GRPO group reassembly from per-trajectory rows; FAILED-sentinel eviction protocol; late-arrival guard; buffer limits |
+| `group_aggregator.py` | trainer-side GRPO group reassembly from per-trajectory rows; FAILED-sentinel resolution — strict eviction (default) OR long-tail survivor delivery (`min_group_survivors`: one straggler must not poison its n−1 healthy siblings); `group_deadline_s` bounded head-of-line blocking; late-arrival guard; buffer limits |
 | `group_collector.py` | consumption core: `TrajectoryBatchCollector` forms exact mini-batches of complete, fresh groups under staleness control, with full accounting (trained / evicted / dropped-stale / leftover / incomplete); `row_from_sample_batch` adapts verl `DataProto` rows (traj_index / model_version / rollout_failed / uid); `grpo_group_advantages` (group-preserving contract) |
 | `mini_batcher.py` | exact-size mini-batch formation over completed groups |
 | `async_trainer.py` | `TrajectoryAsyncTrainer(FullyAsyncTrainer)` — the real separate-deployment trainer (ray remote), overrides sample intake to route through the collector; emits `trajectory_async/*` metrics |
@@ -26,7 +26,8 @@ the kimi/mooncake adapters).
 | `relay_tier.py` | hierarchical relay tier (Laminar §4): `RelayService` / `RelayNode` (one per rollout machine; master stage = the whole actor stall; background chunk-pipelined chain distribution; anytime local pull of the latest complete version); trainer-side `format_fn` (HF format) + `reshard_fn` (rollout TP layout) hooks. Also the repack execution seam: `RolloutRepackExecutor` over `RolloutReplicaHandle` replicas (recompute or KV-transfer prefill, pluggable `kv_transfer_fn`) |
 | `repack.py` | active scheduling (Laminar §5): `ReplicaState` idleness (KVCache ramp-down), Algorithm 1 `best_fit_consolidation` (pure function), `RepackManager` (periodic + post-update triggers, drives any `RepackExecutor`), `MigrationResult` |
 | `relay_controller.py` | the Ray-native control plane of the versioned pull path: `RelayController` (version registry, retention + staged-bytes quota, fleet AND per-replica pull drivers with per-replica locking, metrics — CPU-testable) + `derive_replica_partition` + `build_relay_controller` / `make_relay_controller_actor` wiring it over a real `CheckpointEngineManager` |
-| `rollout_producer.py` | `TrajectoryLevelRollouter(FullyAsyncRollouter)` — the trajectory-level producer: one queue message per response (uid / traj_index / group_size / model_version stamped), FAILED rows on failure, batch-boundary weight pulls |
+| `rollout_producer.py` | `TrajectoryLevelRollouter(FullyAsyncRollouter)` — the trajectory-level producer: one queue message per response (uid / traj_index / group_size / model_version / attempts stamped), bounded row retries (`row_retry.py` policy; retried rows re-stamp the version they actually generated under), FAILED rows on budget exhaustion, batch-boundary weight pulls |
+| `row_retry.py` | bounded per-row generation retry policy (stdlib-pure, CPU-testable): attempt budget, per-attempt version stamping, FAILED-sentinel delivery on exhaustion — the cheapest long-tail mitigation (a transient single-response failure stops terminating whole groups) |
 | `repack_bridge.py` | the repack closed loop over the real rollout fleet (paper §5): `RolloutReplicaView` (LB in-flight probe + per-replica pull), `FleetRepackExecutor` (idle-replica refresh after each publish — the real §5 payoff on this stack; migration declined until request-control RPCs exist), `build_repack_controller` / `make_repack_controller_actor` |
 | `staleness_correction.py` | loss-side version-staleness correction: per-trajectory reweighting by version age (`staleness_weights`), adaptive clip scaling (`adaptive_clip_scale`), version-cohort GRPO baselines (`cohort_advantages`), cohort diagnostics; `apply_staleness_correction` attaches `staleness_weights` / `cliprange_scale` batch columns consumed by the policy loss (see below) |
 | `trajectory_async_main.py` | the launcher: `TrajectoryAsyncTaskRunner` wiring `TrajectoryLevelRollouter` + `TrajectoryAsyncTrainer` + MessageQueue + the relay controller (mirrors `fully_async_main.py`) |
@@ -214,10 +215,30 @@ KV movement); freed sources immediately pull the latest weights.
     tolerance as a whole).
 16. Partial response pool + fault tolerance (paper §3.3): stream
     in-progress trajectories centrally; on replica failure redirect to a
-    same-version replica reusing partial progress. The single biggest
-    remaining design pillar with no counterpart here. (FAILED-row
-    delivery at trajectory granularity already landed with the producer;
-    the pool + redirect is the missing part.)
+    same-version replica reusing partial progress. Necessity scoping
+    (deliberate deferral): the pool is a RELIABILITY substrate, not a
+    requirement of trajectory-level async RL. And note the plain
+    sentinel+eviction story was NOT enough for the true long tail — one
+    straggler used to poison its n−1 healthy siblings (compute waste ∝
+    group size, head-of-line blocking until the straggler settled, and a
+    length-correlated dropout: failures concentrate on long generations,
+    so the effective training distribution skewed short — a milder
+    cousin of the paper's Appendix C critique of partial-rollout mixing).
+    The landed mitigations: bounded ROW RETRIES (`row_max_attempts`,
+    preserves the length distribution up to budget exhaustion; retried
+    rows re-stamp the version they actually generated under, so a
+    mixed-version group is exactly what version_span + loss-side
+    staleness correction handle), SURVIVOR DELIVERY
+    (`min_group_survivors`, opt-in — deliver the settled survivors as a
+    trainable partial group instead of evicting; group_size keeps the
+    original rollout.n; advantage normalization runs over survivors), and
+    a GROUP DEADLINE (`group_deadline_s`, bounds head-of-line blocking;
+    late siblings are counted and dropped — the accepted cost of a
+    bounded wait). What still argues FOR the pool: (a) fleet scale where
+    worker failure is routine, or (b) active migration that empties BUSY
+    replicas and the re-prefill cost of recompute resend matters — until
+    then retries + survivors + recompute resend cover the cases without a
+    pool.
 
 ## Staleness correction (loss-side)
 
@@ -279,9 +300,9 @@ off-policy distance, the latter reweights what is admitted.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (144 tests; 132 stdlib-only +
+`tests/experimental/trajectory_async/` (167 tests; 153 stdlib-only +
 3 torch-gated adapter smokes + 2 torch-gated staleness batch-application
-smokes + 7 ray-gated wiring smokes, all skipping gracefully without
+smokes + 9 ray-gated wiring smokes, all skipping gracefully without
 their deps):
 
 * aggregator: completion order, duplicates, FAILED-eviction protocol,
@@ -295,6 +316,14 @@ their deps):
   unknown skipped, one failure never stops the rest), migration
   declining (never half-migrates), manager hook + notify-update wakeup,
   conservative no-mapping wiring;
+* long-tail mitigation: row-retry policy (success / retry-then-success /
+  budget exhaustion delivering the FAILED sentinel / single-shot legacy
+  semantics / delivery-error propagation / per-attempt version stamping),
+  survivor delivery (threshold satisfied, below threshold, clamp to 2,
+  strict default, late-sibling drops, snapshot counters), group deadline
+  (partial resolve, evict without a survivors policy, no premature fire,
+  late stragglers counted), collector end-to-end (partial group trains,
+  reconciliation identity holds, attempts threading);
 * staleness correction: weight families (decay/exp/none), normalization
   invariants, adaptive clip bounds + caps, cohort baselines (mixed-version
   groups, singleton fallback, degenerate rewards), diagnostics, config

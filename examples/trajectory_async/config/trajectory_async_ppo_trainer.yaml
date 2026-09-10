@@ -63,6 +63,23 @@ async_training:
   # staleness, no static cap — rely on staleness_threshold instead).
   staleness_drop: null
 
+  # Long-tail mitigation (one straggler must not poison its group):
+  # row_max_attempts: bounded per-row generation retries (producer-side;
+  #   2 = one retry; 1 = single-shot). Retried rows re-stamp the version
+  #   they actually generated under (mixed-version group -> version_span
+  #   + staleness_correction handle it).
+  # min_group_survivors: deliver the SURVIVORS of a group whose member
+  #   terminally failed as a trainable PARTIAL group (null = strict
+  #   eviction, the default). Clamped to >= 2 (a lone survivor has no
+  #   group-relative signal).
+  # group_deadline_s: wall-clock bound on head-of-line blocking — a
+  #   group whose oldest trajectory ages past this is resolved (survivor
+  #   delivery or eviction; late siblings are counted and dropped).
+  #   null = wait indefinitely.
+  row_max_attempts: 2
+  min_group_survivors: null
+  group_deadline_s: null
+
   # Loss-side version-staleness correction (see staleness_correction.py):
   # the PPO ratio already carries the per-token cross-version IS
   # (bypass_mode: old_log_probs = rollout_log_probs -> ratio = pi_V/pi_vi,

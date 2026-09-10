@@ -59,6 +59,7 @@ from verl.experimental.trajectory_async.repack_bridge import (
     RolloutReplicaView,
     build_repack_controller,
 )
+from verl.experimental.trajectory_async.row_retry import generate_row_with_retry
 from verl.experimental.trajectory_async.staleness_correction import (
     StalenessCorrectionConfig,
     adaptive_clip_scale,
@@ -130,6 +131,8 @@ __all__ = [
     "FleetRepackExecutor",
     "RolloutReplicaView",
     "build_repack_controller",
+    # bounded row-generation retry (long-tail mitigation)
+    "generate_row_with_retry",
     # loss-side staleness correction (version-aware off-policy layer)
     "StalenessCorrectionConfig",
     "adaptive_clip_scale",
