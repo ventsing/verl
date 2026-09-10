@@ -179,15 +179,16 @@ semantics, at ≥2 it stalls the whole fleet per publish):
    scheduling stack's territory.
 
 **Verify before refactoring (the 2-replica experiment).** Before any
-further push-down work, run a 2-replica kimi cluster
-(`rollout.nnodes=2` + `async_training.weight_store`) and read the
-`PULL_REPLICA_BEGIN/END replica=...` interval logs the controller now
-emits (per-replica windows spanning the full abort → release KV →
-subgroup receive → resume sequence): OVERLAPPING windows across
-replicas = the subgroups are live and per-replica pulls are truly
-concurrent; DISJOINT windows = a global barrier remains (revisit the
-split). The per-rank `receive v{N} done ... time cost` engine lines
-corroborate. Chunk-pipelined chain distribution remains
+further push-down work, run the 2-replica experiment — the full
+runbook is cluster TODO-6 Tier 2 (launch command, log markers, pass/
+fail reading): the controller emits `PULL_REPLICA_BEGIN/END
+replica=...` interval logs (per-replica windows spanning the full
+abort → release KV → subgroup receive → resume sequence), and
+OVERLAPPING windows across replicas = the subgroups are live and
+per-replica pulls are truly concurrent, while DISJOINT windows = a
+global barrier remains (revisit the split). The per-rank
+`receive v{N} done ... time cost` engine lines corroborate.
+Chunk-pipelined chain distribution remains
 `relay_tier.py`'s CPU-verified model (TODO-12). The mooncake engine
 raises `NotImplementedError` on `stage_version` (per-version RDMA
 staging buffers still to design — TODO below).
@@ -372,11 +373,73 @@ staged-bytes accounting (item 8) are done; the remaining items are the
 cluster validation run itself (6) and mooncake per-version RDMA
 staging (9).
 
-6. Full-run of `examples/trajectory_async/dapo_qwen25_math_7b_traj_async.sh`:
-   the launcher, the producer's per-row messages against a real ALM/vLLM,
-   the kimi stage/gather/pull collectives, and the trainer's group
-   re-assembly end to end (syntax + CPU logic verified; the cluster run
-   is the actual gate).
+6. Full-run cluster validation of
+   `examples/trajectory_async/dapo_qwen25_math_7b_traj_async.sh` — the
+   actual gate for every path in this package (syntax + CPU logic are
+   verified; the cluster run is the only honest evidence). Runbook:
+
+   **Launch** (the interesting topology is 2 rollout replicas — it
+   activates the per-replica subgroups a single-replica run never
+   exercises):
+
+   ```bash
+   pip install "checkpoint-engine[p2p]"   # the kimi engine
+   NNODES_ROLLOUT=2 bash examples/trajectory_async/dapo_qwen25_math_7b_traj_async.sh
+   ```
+
+   **Tier 1 — the closed loop (the minimum pass).** One full step cycle
+   (publish → per-row generation → group re-assembly → trainer update)
+   completes, observably:
+   * startup wiring logs fire — "relay controller attached
+     (backend=kimi, ...)", "fault tolerance attached (heartbeat ...)",
+     "partial response pool attached" (when enabled);
+   * every publish takes the stage-only path and updates
+     `relay/publishes` / `relay/staged_bytes`; per-rank engine lines
+     `Rank N receive v{V} done ... time cost ... bandwidth` appear for
+     each pull;
+   * the trainer consumes complete groups (version-span /
+     staleness-accounted) and steps; teardown is clean — bounded
+     collector leftovers, supervisor + repack actors stopped.
+
+   **Tier 2 — the 2-replica concurrency verdict (the watershed).** With
+   repack enabled (default), a lagging IDLE replica is refreshed
+   per-replica after each publish ("repack refresh: replica N ... ->
+   vV"): grep the relay-controller actor logs for
+   `PULL_REPLICA_BEGIN/END replica=0|1` — the windows span the full
+   abort → release KV → subgroup receive → resume sequence.
+   OVERLAPPING windows = the communication-domain split is live and
+   per-replica pulls are truly concurrent; DISJOINT windows = a global
+   barrier remains — capture the log and revisit the split BEFORE any
+   pull-control push-down work (the wiring guide's two-breakthrough
+   framing). `relay/replica_pulls` / `relay/replica_pull_last_s`
+   corroborate. NOTE: the producer's batch-boundary pull is
+   fleet-synchronized by design — PULL_REPLICA lines come from the
+   repack idle refresh only, so keep a replica idle across a publish
+   (small gen batch or a long generation elsewhere) to exercise it.
+
+   **Tier 3 — fault injection (a second run).**
+   * `ray kill` the relay-controller actor → the supervisor logs
+     "relay controller failed over (attempt N ...)", re-attaches the
+     producer + repack consumers, and the next publish succeeds (state
+     rebuilt via `recover` — no async checkpoint exists by design);
+   * `ray kill` a rollout server actor → after `failure_threshold`
+     probe strikes the supervisor logs "retired dead replicas [...]";
+     row retries redirect onto the healthy replica (recompute
+     prefill); a restarted server is re-added on its next successful
+     probe.
+   Every injection must leave the run ALIVE — the supervisor survives
+   even a failed controller resurrection (counted, retried next
+   heartbeat).
+
+   **Known non-failures (expected — do not file):** a single-replica
+   run never logs PULL_REPLICA (per-replica path inert by design —
+   `repack/per_replica_pulls: 0`); migration without LB drain sockets
+   logs "repack declined ... begin_drain unsupported" and degrades to
+   idle refresh only; the mooncake backend raises
+   NotImplementedError on stage_version (TODO-9); KV never actually
+   moves — recompute prefill is the only migration mode; hard_drain
+   requires abort-resume semantics (L2 or partial_rollout=true) —
+   keep it off on the stock client.
 7. `row_from_sample_batch` against real DataProto (`union(position)`
    slicing, `non_tensor_batch` `.item()` paths) — including the FAILED
    row shape (`DataProto(non_tensor_batch=...)` with no tensor batch).
