@@ -439,6 +439,113 @@ class TestDrainEscalation(unittest.TestCase):
         self.assertEqual(ex.refresh_failures, 1)
 
 
+class TestPullCapabilityDegradation(unittest.TestCase):
+    """Single-replica topologies: per-replica pulls are unavailable BY
+    DESIGN (one block == the fleet); refresh must skip such views
+    cleanly instead of raising NotImplementedError every tick."""
+
+    def test_unrefreshable_view_is_skipped_not_failed(self):
+        pulls, inflight = [], {"srv-0": 0}
+        views = [_view(0, {0: 3}, inflight, pulls)]
+        views[0].pull_fn = None  # wiring disabled the capability
+        ex = _executor(views, latest=5, config=RepackConfig(batch_bound=32))
+        refreshed = asyncio.run(ex.refresh_idle())
+        self.assertEqual(pulls, [])  # no pull attempted
+        self.assertEqual(refreshed, 0)
+        self.assertEqual(ex.refresh_failures, 0)  # NOT counted as failures
+
+    def test_capability_metric_reflects_wiring(self):
+        pulls, inflight = [], {"srv-0": 0, "srv-1": 0}
+        views = [_view(0, {0: 3}, inflight, pulls), _view(1, {1: 3}, inflight, pulls)]
+        ex = _executor(views, latest=5, config=RepackConfig(batch_bound=32))
+        snap = ex.bridge_metrics()
+        self.assertEqual(snap["repack/per_replica_pulls"], 1)
+        views[1].pull_fn = None  # still >=1 capable
+        self.assertEqual(ex.bridge_metrics()["repack/per_replica_pulls"], 1)
+        views[0].pull_fn = None  # none capable
+        self.assertEqual(ex.bridge_metrics()["repack/per_replica_pulls"], 0)
+
+    def test_first_notimplementederror_latches_off(self):
+        """The real single-replica deployment: pull_fn is wired but the
+        controller raises NotImplementedError (no subgroups BY DESIGN).
+        First refresh latches the view off and counts NOTHING; the second
+        does not even try."""
+        versions = {0: 3}
+        inflight = {"srv-0": 0}
+        attempts = []
+
+        async def version_fn(rid):
+            return versions.get(rid)
+
+        async def unavailable_pull(rid, version):
+            attempts.append((rid, version))
+            raise NotImplementedError("no per-replica subgroups")
+
+        async def inflight_fn():
+            return inflight
+
+        view = RolloutReplicaView(
+            replica_id=0, server_id="srv-0", version_fn=version_fn,
+            pull_fn=unavailable_pull, inflight_fn=inflight_fn,
+        )
+        ex = _executor([view], latest=5, config=RepackConfig(batch_bound=32))
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(attempts, [(0, 5)])  # tried once
+        self.assertIsNone(view.pull_fn)  # latched off
+        self.assertEqual(ex.refresh_failures, 0)  # unavailability, not failure
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(attempts, [(0, 5)])  # never retried
+        self.assertEqual(ex.refresh_failures, 0)
+
+    def test_watcher_unavailable_pull_completes_drain(self):
+        """A drained source whose pull turns out unavailable: the drain
+        COMPLETES (end_drain, back to routing) instead of stranding, and
+        the source keeps its old version (the producer's fleet pull
+        brings it current)."""
+        versions = {0: 3}
+        inflight = {"srv-0": 0}
+
+        async def version_fn(rid):
+            return versions.get(rid)
+
+        async def unavailable_pull(rid, version):
+            raise NotImplementedError("no per-replica subgroups")
+
+        async def inflight_fn():
+            return inflight
+
+        view = RolloutReplicaView(
+            replica_id=0, server_id="srv-0", version_fn=version_fn,
+            pull_fn=unavailable_pull, inflight_fn=inflight_fn,
+        )
+        drain = _FakeDrain()
+        ex = _executor([view], latest=5, drain=drain, config=RepackConfig(batch_bound=32))
+        ex._draining[0] = "srv-0"
+        asyncio.run(ex.refresh_idle())
+        self.assertNotIn(0, ex._draining)  # drain completed, not stranded
+        self.assertEqual(ex.migrations_completed, 1)
+        self.assertEqual(ex.refresh_failures, 0)
+        self.assertEqual(versions[0], 3)  # kept its old version
+        self.assertIn((("srv-0",), False), drain.calls)  # back to routing
+
+    def test_drained_unrefreshable_source_completes_without_pull(self):
+        """Defensive watcher path: a drained source with no pull wiring
+        returns to routing at its current version (the producer's fleet
+        pull brings it current) instead of stranding the drain."""
+        pulls, inflight = [], {"srv-0": 0}
+        views = [_view(0, {0: 3}, inflight, pulls)]
+        views[0].pull_fn = None
+        drain = _FakeDrain()
+        ex = _executor(views, latest=5, drain=drain, config=RepackConfig(batch_bound=32))
+        ex._draining[0] = "srv-0"
+        refreshed = asyncio.run(ex.refresh_idle())
+        self.assertEqual(pulls, [])  # no pull possible
+        self.assertNotIn(0, ex._draining)  # drain released
+        self.assertIn((("srv-0",), False), drain.calls)  # back to routing
+        self.assertEqual(ex.migrations_completed, 1)
+        self.assertEqual(ex.refresh_failures, 0)
+
+
 class TestRetireRevive(unittest.TestCase):
     """Fault tolerance (§3.3): dead replicas are excluded from every
     lifecycle path; revived ones return."""

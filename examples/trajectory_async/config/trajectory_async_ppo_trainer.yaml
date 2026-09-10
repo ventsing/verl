@@ -121,8 +121,10 @@ async_training:
 
   # Repack closed loop (Laminar §5, the executable subset): after each
   # publish (and periodically), IDLE replicas lagging the fresh version
-  # pull it over their OWN engine subgroup (per-replica pull) — the
-  # "freed sources pull fresh weights" payoff. Migration-dependent
+  # pull it over their OWN engine subgroup (per-replica pull — needs
+  # >=2 rollout replicas; single-replica deployments disable idle
+  # refresh and the producer's batch-boundary fleet pull covers them) —
+  # the "freed sources pull fresh weights" payoff. Migration-dependent
   # consolidation needs rollout-server request-control RPCs (TODO).
   # null = off.
   repack:

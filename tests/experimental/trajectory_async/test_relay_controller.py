@@ -221,6 +221,55 @@ class TestDeriveReplicaPartition(unittest.TestCase):
         self.assertIsNone(derive_replica_partition(4, []))
 
 
+class TestPullCapabilityProbe(unittest.TestCase):
+    """supports_pull_replica tells the bridge whether scoped pulls exist
+    (single-replica topologies install no subgroups BY DESIGN)."""
+
+    def test_probe_false_without_wiring(self):
+        from verl.experimental.trajectory_async.relay_controller import RelayController
+
+        async def publish(v):
+            return {}
+
+        async def pull(v):
+            return None
+
+        async def unstage(v):
+            return None
+
+        c = RelayController(publish_fn=publish, pull_fn=pull, unstage_fn=unstage)
+        self.assertFalse(c.supports_pull_replica)
+
+    def test_probe_true_with_wiring(self):
+        from verl.experimental.trajectory_async.relay_controller import RelayController
+
+        async def publish(v):
+            return {}
+
+        async def pull(v):
+            return None
+
+        async def unstage(v):
+            return None
+
+        async def pull_replica(rid, v):
+            return None
+
+        c = RelayController(
+            publish_fn=publish,
+            pull_fn=pull,
+            unstage_fn=unstage,
+            pull_replica_fn=pull_replica,
+            num_replicas=2,
+        )
+        self.assertTrue(c.supports_pull_replica)
+        # and pull_replica itself stays functional
+        c._versions[3] = {"published_s": 0.0, "retired": False, "staged_bytes": 0}
+        import asyncio
+
+        self.assertEqual(asyncio.run(c.pull_replica(1)), 3)
+
+
 class TestPerReplicaPull(unittest.TestCase):
     def _controller(self, num_replicas=3, **kwargs):
         async def publish_fn(version):

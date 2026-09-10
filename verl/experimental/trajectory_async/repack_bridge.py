@@ -98,6 +98,15 @@ AbortAllFn = Callable[[str], Awaitable[int]]  # server_id -> aborted count (-1 u
 ResumeFn = Callable[[str], Awaitable[bool]]  # server_id -> resumed
 
 
+class _PullUnavailable(Exception):
+    """Per-replica pull capability absent (single-replica topology) —
+    an unavailability signal, never counted as a refresh failure."""
+
+    def __init__(self, replica_id: int):
+        super().__init__(f"replica {replica_id} has no per-replica pull wiring")
+        self.replica_id = replica_id
+
+
 @dataclass
 class RolloutReplicaView:
     """One rollout replica as seen by the repack bridge.
@@ -109,7 +118,10 @@ class RolloutReplicaView:
             mapping documented in :func:`build_repack_controller`).
         version_fn: async -> the version this replica currently runs.
         pull_fn: async (version) -> pulls that version into this replica
-            over its own engine subgroup (idleness is the CALLER's gate).
+            over its own engine subgroup (idleness is the CALLER's gate);
+            None when the topology has no per-replica subgroups (a
+            single-replica deployment — scoped pulls are meaningless
+            there; refresh paths skip such views).
         inflight_fn: async -> in-flight request count, or None when
             unknown (treated as BUSY — never refresh a maybe-busy replica).
     """
@@ -117,7 +129,7 @@ class RolloutReplicaView:
     replica_id: int
     server_id: str
     version_fn: ReplicaVersionFn
-    pull_fn: PullReplicaFn
+    pull_fn: PullReplicaFn | None
     inflight_fn: InflightFn
 
     async def current_version(self) -> int | None:
@@ -293,8 +305,32 @@ class FleetRepackExecutor:
             try:
                 version = await view.current_version()
                 if version is None or version < latest:
-                    await self._pull_tracked(view, latest)
-                    refreshed += 1
+                    if view.pull_fn is None:
+                        # latched off earlier (or defensive: planning needs
+                        # >=2 candidates, so single-replica topologies never
+                        # get here) — complete the drain WITHOUT the refresh;
+                        # the producer's next batch-boundary fleet pull
+                        # brings the source current
+                        logger.warning(
+                            "repack: replica %d emptied but has no per-replica "
+                            "pull wiring; returning it to routing at v%s",
+                            replica_id,
+                            version,
+                        )
+                    else:
+                        try:
+                            await self._pull_tracked(view, latest)
+                            refreshed += 1
+                        except _PullUnavailable:
+                            # first discovery: capability absent — complete
+                            # the drain without the refresh (never strand it)
+                            logger.warning(
+                                "repack: replica %d emptied but per-replica pulls "
+                                "are unavailable; returning it to routing at v%s "
+                                "(the producer's fleet pull brings it current)",
+                                replica_id,
+                                version,
+                            )
                     logger.info(
                         "repack migration completed: replica %d %s drained -> v%d",
                         replica_id,
@@ -325,6 +361,8 @@ class FleetRepackExecutor:
         for view, version, running in await self._snapshot_states():
             if view.replica_id in self._draining or view.replica_id in handled or self._is_retired(view):
                 continue
+            if view.pull_fn is None:
+                continue  # no per-replica subgroups (single-replica topology)
             if version is None or running is None or running > 0:
                 continue  # unknown version, unknown load, or busy -> skip
             if version >= latest:
@@ -333,6 +371,8 @@ class FleetRepackExecutor:
                 await self._pull_tracked(view, latest)
                 refreshed += 1
                 logger.info("repack refresh: replica %d %s -> v%d", view.replica_id, view.server_id, latest)
+            except _PullUnavailable:
+                pass  # capability absence (latched off): not a failure
             except Exception:  # noqa: BLE001 — one replica must not stop the rest
                 self.refresh_failures += 1
                 logger.exception("repack refresh failed for replica %d", view.replica_id)
@@ -369,10 +409,27 @@ class FleetRepackExecutor:
         return view.server_id in self._retired
 
     async def _pull_tracked(self, view: RolloutReplicaView, version: int) -> None:
-        """Pull with in-flight tracking (the planner's ``pulling`` flag)."""
+        """Pull with in-flight tracking (the planner's ``pulling`` flag).
+
+        A ``NotImplementedError`` from the controller means the topology
+        installed no per-replica subgroups (single-replica deployment —
+        one block == the fleet, scoped pulls are meaningless BY DESIGN):
+        the view's pull is latched OFF and the capability absence is
+        re-raised so callers can count it as unavailability, not failure."""
+        if view.pull_fn is None:
+            raise _PullUnavailable(view.replica_id)
         self._pulling.add(view.replica_id)
         try:
             await view.pull_fn(view.replica_id, version)
+        except NotImplementedError as exc:
+            view.pull_fn = None  # latch: capability absent, stop trying
+            logger.info(
+                "repack: per-replica pulls unavailable (single-replica topology?) "
+                "— idle refresh disabled for replica %d; the producer's "
+                "batch-boundary fleet pull covers weight updates",
+                view.replica_id,
+            )
+            raise _PullUnavailable(view.replica_id) from exc
         finally:
             self._pulling.discard(view.replica_id)
 
@@ -508,6 +565,7 @@ class FleetRepackExecutor:
             "repack/migrations_completed": self.migrations_completed,
             "repack/requests_aborted_redirected": self.requests_aborted_redirected,
             "repack/draining_replicas": len(self._draining),
+            "repack/per_replica_pulls": int(any(v.pull_fn is not None for v in self.handles.values())),
             "repack/drains_escalated": self.drains_escalated,
             "repack/retired_replicas": len(self._retired),
         }
@@ -610,6 +668,7 @@ def build_repack_controller(
         if version is None:
             return await relay_controller.pull_replica.remote(replica_id)
         return await relay_controller.pull_replica.remote(replica_id, version)
+
 
     if server_ids is None:
         # without an explicit server-id list we cannot map LB servers to

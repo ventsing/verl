@@ -121,19 +121,40 @@ replaces it (kimi engine only for now):
   version — the batch-boundary pull — and stamps every row with the
   version it generates under.
 
-Topology (LANDED, cluster validation pending): `derive_replica_partition`
-+ `build_process_group(replica_partition=...)` install one engine
-subgroup per rollout replica; `receive_weights_version(version,
-replica_id=...)` pulls over that subgroup alone (H2D bucket partition +
-barriers touch only the replica's ranks), and `RelayController.
-pull_replica` drives it with per-replica locks — distinct replicas pull
-CONCURRENTLY; fleet pulls and publishes take all locks (ordered,
-deadlock-free — the concurrent-collective-safety question is TODO-11).
-The producer's batch-boundary fleet pull is unchanged. Chunk-pipelined
-chain distribution remains `relay_tier.py`'s CPU-verified model
-(TODO-12). The mooncake engine raises `NotImplementedError` on
-`stage_version` (per-version RDMA staging buffers still to design —
-TODO below).
+Topology — per-replica subgroups are LANDED but activate only with
+**≥2 worker-bearing rollout replicas** (`derive_replica_partition`
+returns None below that: a single replica IS the whole fleet, scoped
+pulls are meaningless there by design). NOTE the shipped example runs
+`rollout.nnodes=1` — one replica — so the per-replica path never
+activates in that deployment; the repack bridge's idle refresh probes
+once, latches off cleanly (`repack/per_replica_pulls: 0`), and the
+producer's fleet pull covers weight updates. Where subgroups ARE
+installed: `receive_weights_version(version, replica_id=...)` pulls
+over that subgroup alone (H2D bucket partition + barriers touch only
+the replica's ranks), and `RelayController.pull_replica` drives it
+with per-replica locks — distinct replicas pull CONCURRENTLY; fleet
+pulls and publishes take all locks (ordered, deadlock-free — the
+concurrent-collective-safety question is TODO-11). The ONLY per-replica
+pull caller today is the repack bridge's idle refresh (post-publish +
+periodic) — Laminar's anytime pull, realized for idle replicas.
+
+**The known P0-path gap (deliberate, documented): the producer's
+batch-boundary pull is FLEET-SYNCHRONIZED** — `_maybe_pull_weights` →
+`controller.pull()` aborts in-flight, releases KV, runs the collective
+receive, and resumes on ALL replicas at every version bump. On one
+replica that coincides with per-replica semantics; at ≥2 it stalls the
+whole fleet's generation per publish and is the actual bottleneck vs
+Laminar's per-replica anytime pull (§3.2). Closing it needs two things
+that sit OUTSIDE this package's committed surfaces: (a) per-row
+version attribution from the engine (a row's true version becomes
+per-replica-dependent — the stamp can no longer come from the
+producer's fleet-wide `_pull_version`), and (b) version-aware routing
+(new work may only route to replicas at/above the group's target
+version) — an LB/manager seam, i.e. the L2 scheduling stack's
+territory. Chunk-pipelined chain distribution remains `relay_tier.py`'s
+CPU-verified model (TODO-12). The mooncake engine raises
+`NotImplementedError` on `stage_version` (per-version RDMA staging
+buffers still to design — TODO below).
 
 Run it (see `examples/trajectory_async/`):
 
@@ -277,7 +298,10 @@ head-of-line blocking; late siblings are counted and dropped).
 Status at a glance: the core closed loop, fault tolerance (§3.3
 heartbeat/retire + §4.4 controller failover), and the partial-pool
 substrate are LANDED. P0 is complete; in P1 the per-replica process
-groups and pinned-memory (staged-bytes) accounting have landed — what
+groups and pinned-memory (staged-bytes) accounting have landed
+(subgroups activate at ≥2 rollout replicas — the shipped single-replica
+example never exercises them, and the producer's batch-boundary pull
+stays fleet-synchronized either way) — what
 remains is cluster validation and mooncake's per-version RDMA staging;
 in P2 the two biggest open gaps are the relay-chain distribution's
 real deployment and per-token KV introspection. For positioning vs
@@ -509,7 +533,7 @@ off-policy distance, the latter reweights what is admitted.
 | §3.1 experience buffer (sampling/eviction) | ✅ upstream v1 `ReplayBuffer`; ⚠️ here: collector is FIFO + staleness refusal only |
 | §3.1 prompt pool | ✅ upstream v1 (streaming dataloader + refill) |
 | §3.1 partial response pool (fault-tolerance substrate) | ✅ substrate + retry consumer (`partial_pool.py`); token-level writer = documented external seam (TODO-16 tail) |
-| §3.2 workflow steps ④-⑦ (interleaved train/publish/background distribute/anytime pull) | ✅ P0 wiring (`relay_controller.py` + `rollout_producer.py` batch-boundary pulls); chain distribution = TODO-12 |
+| §3.2 workflow steps ④-⑦ (interleaved train/publish/background distribute/anytime pull) | ✅ versioned path live; ⚠️ the producer's batch-boundary pull is FLEET-synchronized (the known P0 gap vs per-replica anytime pull — see the wiring guide's topology paragraph); per-replica anytime pull exists today only via the repack idle refresh (≥2 replicas); chain distribution = TODO-12 |
 | §3.3 + §4.3 fault tolerance (heartbeat failover, chain rebuild, master failover, checkpoint recovery) | ✅ LANDED (`fault_tolerance.py`: supervisor failover + `recover`, probe/retire/revive; `rebuild_chain` pure core); engine-side RDMA re-registration = TODO-15 tail; checkpoint recovery = standard path + `recover` (no separate async checkpoint by design) |
 | §4.2 relay hierarchy: master + per-machine relays, resharding, chain-pipelined broadcast, PCIe local pull | ⚠️ flat path via `relay_controller.py` (versioned stage + fleet pull + PER-REPLICA subgroup pulls, live); per-machine chain tier = `relay_tier.py` (CPU-verified) = TODO-12 |
 | §4.2 actor stall = single push to master | ✅ `publish` returns after the master stage |
@@ -518,7 +542,7 @@ off-policy distance, the latter reweights what is admitted.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (217 tests; 201 stdlib-only +
+`tests/experimental/trajectory_async/` (224 tests; 208 stdlib-only +
 3 torch-gated adapter smokes + 2 torch-gated staleness batch-application
 smokes + 11 ray-gated wiring smokes, all skipping gracefully without
 their deps):
@@ -548,6 +572,11 @@ their deps):
   deads ignored), controller recover semantics, bridge retire/revive
   (no refresh, non-routable snapshots, drain release, migrate-pair
   decline, idempotence);
+* per-replica pull capability degradation: unavailable pulls latch off
+  on first discovery (never retried, never counted as failures), the
+  capability metric reflects wiring, a drained source with unavailable
+  pulls completes its drain instead of stranding, controller
+  capability probe;
 * repack drain escalation: soft-drain deadline (abort past deadline,
   once per source; no deadline keeps static semantics; inside the
   window natural completion wins; abort failure degrades to soft);

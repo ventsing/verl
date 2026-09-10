@@ -298,6 +298,14 @@ class RelayController:
         finally:
             self._release_all(locks)
 
+    @property
+    def supports_pull_replica(self) -> bool:
+        """Whether per-replica pulls are wired (engine replica partition
+        installed — needs >=2 worker-bearing rollout replicas; a
+        single-replica topology is its own fleet, so scoped pulls are
+        meaningless there and the wiring is absent by design)."""
+        return self._pull_replica_fn is not None
+
     async def pull_replica(self, replica_id: int, version: int | None = None) -> int | None:
         """Load weights into ONE replica (per-replica, any-time pull).
 
@@ -497,6 +505,9 @@ def make_relay_controller_actor():
 
         def replica_version(self, replica_id: int) -> int | None:
             return self._controller.replica_version(replica_id)
+
+        def supports_pull_replica(self) -> bool:
+            return self._controller.supports_pull_replica
 
         def behind_latest(self, current: int) -> bool:
             return self._controller.behind_latest(current)
