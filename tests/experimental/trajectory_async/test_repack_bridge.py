@@ -338,6 +338,107 @@ class TestDrainWatcher(unittest.TestCase):
         self.assertEqual(drain.calls, [])  # end_drain NOT called
 
 
+class TestDrainEscalation(unittest.TestCase):
+    """Soft-drain deadline escalation (v1-integration posture): drain
+    first, abort as the bounded fallback — one long tail must not pin a
+    migration."""
+
+    def _cfg(self, deadline, **kw):
+        return RepackConfig(batch_bound=32, drain_deadline_s=deadline, **kw)
+
+    def test_soft_drain_escalates_past_deadline(self):
+        """One long-tail generation on the source: soft first, abort
+        past the deadline, natural completion takes over."""
+        pulls, inflight = [], {"srv-0": 1, "srv-1": 2}
+        views = [_view(0, {0: 3}, inflight, pulls), _view(1, {1: 5}, inflight, pulls)]
+        drain = _FakeDrain()
+        abort = _FakeAbort({"srv-0": 1})
+        ex = _executor(views, latest=5, drain=drain, abort=abort, config=self._cfg(0.0))
+
+        result = asyncio.run(ex.migrate([(0, 1)]))
+        self.assertEqual(result.plan, [(0, 1)])  # migration accepted (soft)
+        self.assertEqual(abort.calls, [])  # not yet: soft mode first
+
+        # tick: busy past a 0s deadline -> escalate (abort once)
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(abort.calls, ["srv-0"])
+        self.assertEqual(ex.drains_escalated, 1)
+
+        # the aborted request resumes elsewhere -> source empties -> done
+        inflight["srv-0"] = 0
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(pulls, [(0, 5)])
+        self.assertEqual(ex.migrations_completed, 1)
+        self.assertIn((("srv-0",), False), drain.calls)  # undrained
+        self.assertNotIn(0, ex._drain_escalated)  # bookkeeping cleaned
+
+    def test_no_deadline_never_escalates(self):
+        """Static modes keep today's semantics: soft waits, no abort."""
+        pulls, inflight = [], {"srv-0": 1, "srv-1": 2}
+        views = [_view(0, {0: 3}, inflight, pulls), _view(1, {1: 5}, inflight, pulls)]
+        drain = _FakeDrain()
+        abort = _FakeAbort({"srv-0": 1})
+        ex = _executor(views, latest=5, drain=drain, abort=abort, config=self._cfg(None))
+
+        asyncio.run(ex.migrate([(0, 1)]))
+        asyncio.run(ex.refresh_idle())
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(abort.calls, [])  # soft drain waits indefinitely
+        self.assertEqual(ex.drains_escalated, 0)
+
+    def test_deadline_not_reached_stays_soft(self):
+        """Inside the deadline window: no abort; natural completion wins."""
+        pulls, inflight = [], {"srv-0": 1, "srv-1": 2}
+        views = [_view(0, {0: 3}, inflight, pulls), _view(1, {1: 5}, inflight, pulls)]
+        drain = _FakeDrain()
+        abort = _FakeAbort({"srv-0": 1})
+        ex = _executor(views, latest=5, drain=drain, abort=abort, config=self._cfg(3600.0))
+
+        asyncio.run(ex.migrate([(0, 1)]))
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(abort.calls, [])  # deadline far away
+        self.assertEqual(ex.drains_escalated, 0)
+        # the tail finishes naturally: migration completes without abort
+        inflight["srv-0"] = 0
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(pulls, [(0, 5)])
+        self.assertEqual(abort.calls, [])
+        self.assertEqual(ex.drains_escalated, 0)
+
+    def test_escalation_fires_once_per_source(self):
+        """A still-busy source is aborted once, not once per tick."""
+        pulls, inflight = [], {"srv-0": 2, "srv-1": 2}
+        views = [_view(0, {0: 3}, inflight, pulls), _view(1, {1: 5}, inflight, pulls)]
+        drain = _FakeDrain()
+        abort = _FakeAbort({"srv-0": 1})  # aborts 1; one request remains
+        ex = _executor(views, latest=5, drain=drain, abort=abort, config=self._cfg(0.0))
+
+        asyncio.run(ex.migrate([(0, 1)]))
+        asyncio.run(ex.refresh_idle())
+        asyncio.run(ex.refresh_idle())
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(abort.calls, ["srv-0"])  # once, despite 3 ticks
+        self.assertEqual(ex.requests_aborted_redirected, 1)
+
+    def test_abort_failure_stays_soft(self):
+        """An escalation abort that fails degrades to soft (retry next
+        tick) instead of stranding the drain."""
+        pulls, inflight = [], {"srv-0": 1, "srv-1": 2}
+        views = [_view(0, {0: 3}, inflight, pulls), _view(1, {1: 5}, inflight, pulls)]
+        drain = _FakeDrain()
+
+        class _ExplodingAbort:
+            async def __call__(self, server_id):
+                raise RuntimeError("engine unreachable")
+
+        ex = _executor(views, latest=5, drain=drain, abort=_ExplodingAbort(), config=self._cfg(0.0))
+        asyncio.run(ex.migrate([(0, 1)]))
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(ex.drains_escalated, 0)  # not marked
+        self.assertIn(0, ex._draining)  # drain lifecycle intact
+        self.assertEqual(ex.refresh_failures, 1)
+
+
 class TestRetireRevive(unittest.TestCase):
     """Fault tolerance (§3.3): dead replicas are excluded from every
     lifecycle path; revived ones return."""

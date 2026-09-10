@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -162,6 +163,8 @@ class FleetRepackExecutor:
 
         # drain lifecycle state
         self._draining: dict[int, str] = {}  # replica_id -> server_id
+        self._drain_since: dict[int, float] = {}  # replica_id -> monotonic drain start
+        self._drain_escalated: set[int] = set()  # sources already aborted past deadline
         self._pulling: set[int] = set()  # replica_ids with a pull in flight
         self._retired: set[str] = set()  # server_ids removed from routing (dead)
         self._prev_inflight: dict[int, int] = {}  # replica_id -> last tick's count
@@ -175,6 +178,7 @@ class FleetRepackExecutor:
         self.migrations_started = 0
         self.migrations_completed = 0  # sources fully freed (pulled + undrained)
         self.requests_aborted_redirected = 0
+        self.drains_escalated = 0
         self.retired_replicas = 0
 
     # ------------------------------------------------------------ probes
@@ -250,6 +254,41 @@ class FleetRepackExecutor:
                 continue
             running = await view.running_count()
             if running is None or running > 0:
+                # soft-drain deadline escalation: one long-tail generation
+                # must not pin the migration — past the deadline, abort the
+                # source's in-flight requests (clients resume them
+                # elsewhere) and let the natural completion path take over
+                if (
+                    running is not None
+                    and running > 0
+                    and self.config.drain_deadline_s is not None
+                    and replica_id not in self._drain_escalated
+                    and self.abort_fn is not None
+                    and time.monotonic() - self._drain_since.get(replica_id, 0.0)
+                    > self.config.drain_deadline_s
+                ):
+                    try:
+                        aborted = await self.abort_fn(view.server_id)
+                    except Exception:  # noqa: BLE001 — stay soft; retry next tick
+                        self.refresh_failures += 1
+                        logger.exception(
+                            "repack drain escalation abort failed for replica %d; "
+                            "soft drain continues",
+                            replica_id,
+                        )
+                    else:
+                        self._drain_escalated.add(replica_id)
+                        self.drains_escalated += 1
+                        self.requests_aborted_redirected += aborted
+                        logger.warning(
+                            "repack drain escalated: replica %d %s still busy past "
+                            "%.1fs — aborted %d in-flight request(s) (clients resume "
+                            "them elsewhere)",
+                            replica_id,
+                            view.server_id,
+                            self.config.drain_deadline_s,
+                            aborted,
+                        )
                 continue  # still finishing its tail (soft) or resumes in flight (hard)
             try:
                 version = await view.current_version()
@@ -270,6 +309,8 @@ class FleetRepackExecutor:
                 if self.drain_fn is not None:
                     await self.drain_fn([view.server_id], on=False)
                 self._draining.pop(replica_id, None)
+                self._drain_since.pop(replica_id, None)
+                self._drain_escalated.discard(replica_id)
                 self.migrations_completed += 1
                 handled.add(replica_id)
             except Exception:  # noqa: BLE001 — one replica must not stop the rest
@@ -312,6 +353,8 @@ class FleetRepackExecutor:
             # the lifecycle so the counters stay honest
             for replica_id in [rid for rid, sid in self._draining.items() if sid in dead]:
                 self._draining.pop(replica_id, None)
+                self._drain_since.pop(replica_id, None)
+                self._drain_escalated.discard(replica_id)
             logger.warning("repack: replicas %s retired (dead) — excluded from all lifecycle paths", sorted(newly))
         return len(newly)
 
@@ -409,8 +452,11 @@ class FleetRepackExecutor:
         # the sources are now owned by the drain lifecycle — mark them
         # BEFORE any abort so a crash mid-round cannot strand a drained
         # replica without a watcher
+        now = time.monotonic()
         for src, _ in accepted:
             self._draining[src] = self.handles[src].server_id
+            self._drain_since[src] = now
+            self._drain_escalated.discard(src)
         self.migrations_started += len(accepted)
 
         # 2. hard mode: abort in-flight on sources -> client-side resume
@@ -462,6 +508,7 @@ class FleetRepackExecutor:
             "repack/migrations_completed": self.migrations_completed,
             "repack/requests_aborted_redirected": self.requests_aborted_redirected,
             "repack/draining_replicas": len(self._draining),
+            "repack/drains_escalated": self.drains_escalated,
             "repack/retired_replicas": len(self._retired),
         }
 

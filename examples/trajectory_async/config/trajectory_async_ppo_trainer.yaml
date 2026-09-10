@@ -133,6 +133,11 @@ async_training:
     # migration executes as the DRAIN LIFECYCLE: begin_drain steers new
     # work away from consolidation sources; the completion watcher pulls
     # fresh weights into emptied sources and returns them to routing.
+    # drain_deadline_s: soft drain waits this long for natural completion,
+    # then escalates to a hard abort (clients resume elsewhere) —
+    # drain-first, abort as the bounded fallback so one long tail cannot
+    # pin a migration. Default: no deadline (static mode only).
+    # drain_deadline_s: 120.0
     # hard_drain: ALSO abort in-flight requests on sources — clients
     #   transparently resume them on other replicas (recompute prefill).
     #   Requires abort-resume semantics on the rollout stack (L2

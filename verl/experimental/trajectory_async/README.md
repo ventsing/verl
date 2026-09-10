@@ -53,6 +53,40 @@ collector is redundant. What this package adds on EITHER path: the
 the alignment audit. Combining the relay tier + repack with the v1 stack
 is the most direct route to a full Laminar deployment.
 
+### Phased v1-integration route (data plane: TransferQueue; control + parameter planes: this package)
+
+Grounded in verified upstream facts: the v1 TQ writer already stamps
+per-trajectory weight versions (`agent_loop_tq.py` tags
+`min/max_global_steps`, sourced from the rollout client's
+`extra_fields` — the engine's bound version is observable on that path
+today), the replay buffer already filters on them
+(`max_off_policy_threshold`), and the v1 trainer's weight sync is the
+synchronous `update_weights` collective — the exact actor stall the
+relay tier removes. The phases:
+
+* **Phase 0 — zero-architecture staleness correction.** The version
+  signal exists; what is missing is only consuming it at the v1 loss:
+  `staleness_correction.apply_staleness_correction` is
+  path-agnostic (reads `model_version` per row, computes
+  `τ = v_trainer − v_rollout` in trainer memory, no relay push needed
+  for the signal — the relay tier distributes weights; it does not
+  need to distribute versions). A v1-side adapter maps the TQ tags to
+  the row field and calls it before the loss.
+* **Phase 1 — relay-tier mount.** `RelayControllerActor` +
+  `VersionedWeightStore` are already standalone actors: the v1 trainer
+  publishes after staging (it does not wait for fleet-wide reload),
+  and a v1 rollout-side batch-boundary pull driver (the same seam as
+  this package's producer) fetches per replica. Per-replica process
+  groups (landed here, P0 item 10) are the prerequisite that keeps
+  pulls from degrading to global-barrier broadcasts.
+* **Phase 2 — repack as the resident monitor.** `notify_update` on
+  publish + best-fit drain (landed here) with the new
+  `repack.drain_deadline_s`: soft drain FIRST (in-flight finishes,
+  zero recompute), escalate to abort only past the deadline — the
+  v1-integration posture of drain-first with abort as the bounded
+  fallback, so frequent publishes cannot thrash long generations into
+  repeated re-prefill.
+
 ## Real-engine wiring guide
 
 ### Weights: multi-version pull (P0 wiring — implemented)
@@ -369,7 +403,7 @@ off-policy distance, the latter reweights what is admitted.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (212 tests; 196 stdlib-only +
+`tests/experimental/trajectory_async/` (217 tests; 201 stdlib-only +
 3 torch-gated adapter smokes + 2 torch-gated staleness batch-application
 smokes + 11 ray-gated wiring smokes, all skipping gracefully without
 their deps):
@@ -399,6 +433,9 @@ their deps):
   deads ignored), controller recover semantics, bridge retire/revive
   (no refresh, non-routable snapshots, drain release, migrate-pair
   decline, idempotence);
+* repack drain escalation: soft-drain deadline (abort past deadline,
+  once per source; no deadline keeps static semantics; inside the
+  window natural completion wins; abort failure degrades to soft);
 * repack drain lifecycle: soft plan execution (drain steering, deferred
   emptiness), hard mode (abort counts, drain-before-abort ordering,
   crash-degrades-to-soft), execution-time CanFit rejections, no-drain

@@ -153,6 +153,12 @@ class RepackConfig:
     # resume them elsewhere) instead of letting them finish. Requires the
     # rollout stack's abort-resume semantics; soft (False) never aborts.
     hard_drain: bool = False
+    # soft-drain deadline (s): a drained source still busy after this long
+    # escalates to a hard abort (in-flight requests resume elsewhere) so
+    # one long-tail generation cannot pin a migration — the v1-integration
+    # posture: drain-first, abort as the bounded fallback. None = the
+    # static mode only (soft waits; hard aborts immediately).
+    drain_deadline_s: float | None = None
     # engine decode batch bound B (max_num_seqs) — the planner's CanFit
     # capacity. None disables migration planning (no honest capacity).
     batch_bound: int | None = None
