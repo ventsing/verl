@@ -125,6 +125,17 @@ KV movement); freed sources immediately pull the latest weights.
 
 ## Cluster TODO list (ordered)
 
+Status at a glance: the core closed loop, fault tolerance (§3.3
+heartbeat/retire + §4.4 controller failover), and the partial-pool
+substrate are LANDED. P0 is complete; in P1 the per-replica process
+groups and pinned-memory (staged-bytes) accounting have landed — what
+remains is cluster validation and mooncake's per-version RDMA staging;
+in P2 the two biggest open gaps are the relay-chain distribution's
+real deployment and per-token KV introspection. For positioning vs
+the v1 separate-async stack see the section above: this package's
+incremental value on ANY path is the relay tier (weights) and the
+repack algorithm + executor.
+
 **P0 — make the real path runnable** ✅ DONE (this branch)
 
 1. ~~Launcher~~ — `trajectory_async_main.py` + hydra config
@@ -146,7 +157,11 @@ KV movement); freed sources immediately pull the latest weights.
    `consumer_ctx["engine"]` (the receiver's parameter server drives the
    pull), matching the mooncake adapter and stock semantics.
 
-**P1 — validate the written code on a real machine**
+**P1 — validate the written code on a real machine** — PARTIALLY
+LANDED HERE: per-replica process groups (item 10) and pinned-memory /
+staged-bytes accounting (item 8) are done; the remaining items are the
+cluster validation run itself (6) and mooncake per-version RDMA
+staging (9).
 
 6. Full-run of `examples/trajectory_async/dapo_qwen25_math_7b_traj_async.sh`:
    the launcher, the producer's per-row messages against a real ALM/vLLM,
@@ -197,7 +212,12 @@ KV movement); freed sources immediately pull the latest weights.
 13. Collector behavior under real queue semantics (cloudpickle'd
    samples, `put_sample(None)` termination).
 
-**P2 — close the remaining gaps vs the paper**
+**P2 — close the remaining gaps vs the paper** — MOSTLY LANDED:
+items 14 (repack execution), 15 (fault tolerance), 16 (partial pool
+substrate + long-tail mitigations) are live; the two biggest open gaps
+are the relay-chain distribution on real transports (12) and per-token
+KV introspection (13's real-queue semantics and 9's mooncake staging
+also remain).
 
 14. `RolloutReplicaHandle` against the real rollout stack — MOSTLY
     LIVE: the closed loop is wired (`repack_bridge.py`:
