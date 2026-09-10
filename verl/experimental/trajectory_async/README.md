@@ -626,6 +626,32 @@ design; a real deployment would swap `WeightRelayService` for the actual
 parameter service and `MultiReplicaEngine` for rollout replicas behind a
 routing manager.
 
+## Relation to the v1 separate-async stack (TransferQueue replay buffer)
+
+Recent upstream work moved the separate-async experience storage to
+[TransferQueue](https://github.com/Ascend/TransferQueue)
+(`verl/trainer/ppo/v1/`) — check before building on this package's
+trainer path, because parts of the Laminar data plane now exist upstream
+natively:
+
+| Laminar concept (§3.1) | v1 stack (TransferQueue) | this package |
+|---|---|---|
+| trajectory-level production | `agent_loop_tq.py`: one `kv_put` per agent-loop output, key `{uid}_{session_id}_{index}`; prompt-level tag tracks GRPO group status (pending/running/finished/failure) | `TrajectoryRollouter` (mock) + `TrajectoryBatchCollector`'s trajectory-level entry (contract-ready) |
+| experience buffer (writer/sampler/eviction) | `replay_buffer.py`: `ReplayBuffer`/`ReplayBufferAsync` polls TransferQueue, re-assembles GRPO groups, samples **oldest-global-steps-first**, evicts stale groups (`max_off_policy_threshold`, strategies `drop`/`wait`), DAPO-filters degenerate-reward groups, evicts failure groups, refills via `refill_fn`; pluggable custom sampler | `GroupAggregator` + `MiniBatcher` + collector: FIFO completion order, staleness refusal at mini-batch formation, FAILED-sentinel eviction — the MessageQueue-path equivalent |
+| prompt pool | streaming dataloader + `refill_fn` dispatch | `PromptRecord` list (mock) |
+| partial response pool (fault tolerance) | **still missing** | still missing (deferred) |
+
+Positioning: `TrajectoryAsyncTrainer` extends the
+`fully_async_policy` **MessageQueue** path (group-level `RolloutSample`
+delivery; the collector re-splits rows to gain trajectory-level
+accounting). On the **v1 TransferQueue path the collector is redundant**
+— `ReplayBuffer` already re-assembles groups from per-trajectory keys
+with staleness eviction and refill. What this package adds on EITHER
+path: the multi-version **relay tier** (`relay_tier.py`, weights), the
+**repack** algorithm + executor seam, and the simulation/A-B harness
+with data-equivalence invariants. Combining the relay tier + repack with
+the v1 stack is the most direct route to a full Laminar deployment.
+
 ## Alignment audit vs the Laminar paper
 
 Full re-read of arXiv 2510.12633 against this implementation. What is
@@ -635,7 +661,7 @@ aligned, and the honest gaps:
 |---|---|---|
 | §3 trajectory-level asynchrony: per-trajectory generation/consumption, no lockstep (Fig. 3(e)) | ✅ mock + real path | delivery unit = one response; trainer-side `GroupAggregator`/`TrajectoryBatchCollector`; no static staleness bound — staleness emerges per trajectory (§6) |
 | §3.1 rollout manager: monitor + repack | ✅ mock | `RepackManager`; real-path counterpart is the AgentLoopManager (deployment) |
-| §3.1 **data module: prompt pool / partial response pool / experience buffer with pluggable sampling + eviction** | ⚠️ partial | collector is a degenerate FIFO experience buffer (completion order, no sampling strategies, no capacity eviction). The **partial response pool** (central in-progress-trajectory storage) is missing entirely — it is the fault-tolerance substrate |
+| §3.1 **data module: prompt pool / partial response pool / experience buffer with pluggable sampling + eviction** | ✅ upstream (v1) / ⚠️ here | verl's v1 stack HAS the real one: `ReplayBuffer` over TransferQueue (oldest-first sampling, staleness eviction `max_off_policy_threshold` drop/wait, DAPO filter, failure eviction, refill, custom sampler hook) + streaming-dataloader prompt pool. This package's collector is the FIFO MessageQueue-path equivalent. Still missing everywhere: the **partial response pool** (fault-tolerance substrate) |
 | §3.2 workflow steps ①-⑦ (generate → buffer → train interleaved → publish → background distribute → anytime pull) | ✅ mock | `run_demo` pipeline; timing mock + `VersionedWeightStore` |
 | §3.3 + §4.3 **fault tolerance** (heartbeat failover, rollout re-init, machine eviction, interrupted-trajectory redirect to same-version rollouts, relay-chain O(1) rebuild, master failover, trainer ckpt recovery) | ❌ missing | only per-trajectory *retry from scratch* exists. The paper's redirect **reuses partial progress** via the partial response pool; not modeled in mock or real path. Biggest missing pillar |
 | §4.2 relay hierarchy: master relay + per-machine relays, **resharding by rollout TP**, chain-pipelined RDMA broadcast, PCIe local pull | ⚠️ mock only | `WeightRelayService` models the *timing*; the real path (`KimiP2PBackend`/`MooncakeP2PBackend`) has replicas read the actor's registered memory **directly** — no relay tier, no local copies (actor NIC becomes the bottleneck at scale), no resharding. Cluster engineering gap |
@@ -644,7 +670,7 @@ aligned, and the honest gaps:
 | §8 metrics: throughput, inherent staleness, avg KVCache utilization, repack overhead | ✅ mock | `trainer/tokens_per_s`, `inherent_staleness`, `engine/kv_util_*`, `repack/overhead_total_s`; end-to-end throughput in the sync A/B |
 | §8 headline: sync vs trajectory-async (Fig. 3(a) vs 3(e)) | ✅ mock | `examples/trajectory_async/run_vs_sync.sh`: 81s vs 45s wall, first update 69s vs 7s, +79% end-to-end tokens/s, staleness 0 vs 0.71 — the paper's trade-off shape |
 | §8 convergence guarantees / multi-iteration training | ❌ out of scope | this is a timing simulation: data equivalence is verified, learning quality is not (no model, no gradient step) |
-| real trajectory-level *producer* (rollout side emits one response per message) | ⚠️ collector ready, producer not wired | `TrajectoryBatchCollector` accepts both granularities; the stock fully-async producer still emits whole groups |
+| real trajectory-level *producer* (rollout side emits one response per message) | ✅ upstream (v1) / ⚠️ here | v1's `agent_loop_tq.py` puts each agent-loop output separately (`{uid}_{session_id}_{index}`); on the fully_async_policy path the stock producer still emits whole groups — the collector accepts both |
 
 Gap priorities: (1) fault tolerance + partial response pool — a whole
 design pillar with no counterpart here; (2) relay-tier topology in the real
@@ -682,12 +708,14 @@ not implemented.** What survives that filter:
    wiring `FullyAsyncRollouter` + MessageQueue + `TrajectoryAsyncTrainer`.
    With the stock producer this validates the group-level path end to end
    (collector splits rows, re-aggregates, exact mini-batches, metrics).
-2. **Trajectory-level producer**: in the rollouter/AgentLoopManager path,
-   emit one message per response (1-row DataProto carrying
-   `non_tensor_batch` fields `traj_index`, `model_version`,
-   `rollout_failed`; reward scored per row — mirrors `AgentLoopWorker`'s
-   per-row tasks). This is THE core gap of "trajectory-level" on the real
-   path.
+2. **Trajectory-level producer**: SOLVED upstream for the v1 stack —
+   `agent_loop_tq.py` emits one `kv_put` per agent-loop output. What
+   remains here is a decision, not an implementation: either extend the
+   fully_async_policy producer to emit 1-row DataProto messages
+   (`traj_index`/`model_version`/`rollout_failed` in `non_tensor_batch`)
+   for the MessageQueue path, or re-target the deployment recipe at the
+   v1 stack (where the collector is redundant and only the relay tier +
+   repack need porting).
 3. **kimi read side placement**: `KimiP2PBackend.read_into` currently
    calls `self.engine.parameter_server.receive_tensor` on the
    constructor's engine (actor-side). Stock semantics: the RECEIVER's

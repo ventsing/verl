@@ -36,6 +36,14 @@ module is the deployable trainer, structured after
   ``trajectory_async/*``: groups trained / evicted / dropped-stale /
   leftover / incomplete, staleness + version-span summaries.
 
+NOTE — v1 stack: verl's newer separate-async path
+(`verl/trainer/ppo/v1/`) stores experiences in a TransferQueue-backed
+`ReplayBuffer` (per-trajectory keys, group re-assembly, staleness
+eviction, refill) fed by `agent_loop_tq.py` (one kv_put per agent-loop
+output). On that path this trainer's collector is redundant; what ports
+is the relay tier (`relay_tier.py`) and the repack executor. See the
+README section "Relation to the v1 separate-async stack".
+
 Weight versioning: this trainer keeps the stock push-based
 ``CheckpointEngineManager.update_weights`` (versioned by
 ``global_steps``). The multi-version pull-based store
