@@ -259,6 +259,13 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
         self.relay_controller = controller_cls.remote(self.checkpoint_manager, keep_last=keep_last)
 
         # the rollout side drives pulls at ITS batch boundaries
+        if not hasattr(self.rollouter, "set_relay_controller"):
+            raise RuntimeError(
+                "async_training.weight_store requires a rollouter with "
+                "batch-boundary pull support (TrajectoryLevelRollouter); the "
+                "stock FullyAsyncRollouter cannot drive versioned pulls — "
+                "launch via trajectory_async_main.py or set weight_store=null"
+            )
         ray.get(self.rollouter.set_relay_controller.remote(self.relay_controller))
         logger.info(
             "relay controller attached (backend=%s, keep_last=%d): publish is a "

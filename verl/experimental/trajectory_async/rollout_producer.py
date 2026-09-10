@@ -71,6 +71,11 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
         rollout-driven batch-boundary pulls)."""
         self.relay_controller = relay_controller
         self._pull_version = 0  # version this fleet generates under
+        # group submissions run concurrently (streaming processor); the pull
+        # DECISION must be serialized so concurrent groups don't both see
+        # "behind" and trigger back-to-back fleet pulls (the second would
+        # abort the first's freshly resumed in-flight requests for nothing)
+        self._pull_lock = asyncio.Lock()
 
     # ------------------------------------------------------------ delivery
 
@@ -164,19 +169,27 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
     # -------------------------------------------------------------- pulls
 
     async def _maybe_pull_weights(self) -> int:
-        """Batch-boundary weight pull: if the trainer published a newer
-        version, pull it here (fleet-synchronized on the P0 topology) and
-        return the version the next group generates under."""
+        """Batch-boundary weight pull, decision serialized across concurrent
+        group submissions: if the trainer published a newer version, pull it
+        here (fleet-synchronized on the P0 topology) and return the version
+        the next group generates under. In-flight requests on the replicas
+        are aborted and RESUMED around the load (stock partial-rollout
+        semantics — the interruption is invisible to the agent loop)."""
         controller = getattr(self, "relay_controller", None)
         if controller is None:
             return getattr(self, "_pull_version", 0)
 
-        try:
-            if not await controller.behind_latest.remote(self._pull_version):
-                return self._pull_version
-            pulled = await controller.pull.remote()
-            if pulled is not None:
-                self._pull_version = pulled
-        except Exception:
-            logger.exception("relay pull failed; generating on v%d", self._pull_version)
-        return self._pull_version
+        lock = getattr(self, "_pull_lock", None)
+        if lock is None:  # set_relay_controller raced ahead of attribute init
+            return getattr(self, "_pull_version", 0)
+
+        async with lock:
+            try:
+                if not await controller.behind_latest.remote(self._pull_version):
+                    return self._pull_version
+                pulled = await controller.pull.remote()
+                if pulled is not None:
+                    self._pull_version = pulled
+            except Exception:
+                logger.exception("relay pull failed; generating on v%d", self._pull_version)
+            return self._pull_version
