@@ -121,16 +121,19 @@ replaces it (kimi engine only for now):
   version — the batch-boundary pull — and stamps every row with the
   version it generates under.
 
-P0 topology (known limit, next cluster item): the stock kimi engine group
-spans actor + ALL rollout ranks and `receive_tensor` barriers on it, so
-pulls are fleet-synchronized (every replica pulls the same version at the
-same moment, chosen by the rollout side — with ONE rollout replica this is
-exactly per-replica anytime pulling). Per-replica process groups — true
-per-replica, any-version pulls — plus chunk-pipelined distribution are
-what `relay_tier.py` (the CPU-verified tier) models and the remaining
-cluster work; all engine-group traffic is serialized behind one lock until
-then. The mooncake engine raises `NotImplementedError` on `stage_version`
-(per-version RDMA staging buffers still to design — TODO below).
+Topology (LANDED, cluster validation pending): `derive_replica_partition`
++ `build_process_group(replica_partition=...)` install one engine
+subgroup per rollout replica; `receive_weights_version(version,
+replica_id=...)` pulls over that subgroup alone (H2D bucket partition +
+barriers touch only the replica's ranks), and `RelayController.
+pull_replica` drives it with per-replica locks — distinct replicas pull
+CONCURRENTLY; fleet pulls and publishes take all locks (ordered,
+deadlock-free — the concurrent-collective-safety question is TODO-11).
+The producer's batch-boundary fleet pull is unchanged. Chunk-pipelined
+chain distribution remains `relay_tier.py`'s CPU-verified model
+(TODO-12). The mooncake engine raises `NotImplementedError` on
+`stage_version` (per-version RDMA staging buffers still to design —
+TODO below).
 
 Run it (see `examples/trajectory_async/`):
 
@@ -146,16 +149,128 @@ python -m verl.experimental.trajectory_async.trajectory_async_main \
 group-level consumption (either producer granularity works on the
 trainer side either way).
 
-### Repack: active scheduling over real rollouts
+### Repack: active scheduling over real rollouts (drain lifecycle — implemented)
 
-`RolloutRepackExecutor` binds Algorithm 1 to replicas that implement
-`RolloutReplicaHandle` (vLLM-stats mapping: `kv_cache_usage` × capacity →
-`kv_used_tokens`, `max_num_seqs` → `batch_limit`, scheduler request
-states → `running_requests` / `remove_request` / `admit_request`, a
-collective-rpc weight reload → `pull_weights`). Migration semantics:
-move each running request to its destination — recompute prefill
-(portable: resend prompt + partial response) or `kv_transfer_fn` (real
-KV movement); freed sources immediately pull the latest weights.
+`FleetRepackExecutor` binds Algorithm 1 to the real fleet through the
+rollouter's LB + manager seams (committed sockets: `remove_servers` /
+`add_servers`, server-handle RPCs; the stock `LLMServerManager` exposes
+`server_handles` / `server_addresses` as parallel lists — replica index
+== LB server index). The loop:
+
+* **triggers**: `notify_update()` after every publish + a periodic
+  `check_interval_s` tick (post-publish refresh of idle lagging
+  replicas + migration planning over version-consistent idle groups).
+* **migration = the drain lifecycle**: `begin_drain` steers NEW work
+  away from consolidation sources (crash-safe: sources are marked
+  BEFORE any abort, so a watcher always exists); soft mode lets
+  in-flight finish; hard mode (`hard_drain=true`, requires the rollout
+  stack's abort-resume semantics — L2 scheduling or
+  `partial_rollout=true`) aborts in-flight on sources and clients
+  transparently resume them on other replicas (recompute prefill —
+  real KV movement is NOT implemented: the pluggable `kv_transfer_fn`
+  hook exists only in `relay_tier.py`'s CPU model, the honest
+  boundary); the completion watcher then pulls the fresh version into
+  the emptied source over ITS engine subgroup and `end_drain` returns
+  it to routing.
+* **escalation**: `drain_deadline_s` bounds the soft wait — past the
+  deadline the source's in-flight is aborted (once per source), so one
+  long-tail generation cannot pin a migration.
+* **execution-time re-checks**: CanFit is re-verified against live
+  in-flight at execution; retired (dead) replicas are excluded from
+  every path; `batch_bound` gates planning when no honest capacity
+  exists.
+
+`repack.enabled=false` disables the loop; `server_ids` overrides the
+replica-index → LB-server mapping when the deployment order differs.
+
+### Fault tolerance: heartbeat failover + replica retire/revive (implemented)
+
+`fault_tolerance.py` + the trainer's supervisor wiring
+(`async_training.fault_tolerance.*`, on by default):
+
+* **controller failover (§4.3 master)**: `RelaySupervisor` heartbeats
+  the `RelayControllerActor` (`ping`); on actor death it recreates the
+  controller via a factory, RECOVERS state (`recover`: the trainer's
+  `current_param_version` is the authority, engines keep their staged
+  shards, replica versions re-sync on the next pull — the registry is
+  derived data, so NO separate async checkpoint exists by design), and
+  re-attaches every consumer (the producer's pull hook, the repack
+  controller actor). A failed resurrection is counted and retried on
+  the next heartbeat — the supervisor itself never crashes the run.
+* **replica heartbeat (§3.3)**: liveness probes are a harmless
+  `abort_request` RPC per server handle (a dead actor raises; a live
+  one returns a not-found no-op). `ReplicaHealthMonitor` declares a
+  server dead after `failure_threshold` consecutive failures; dead
+  servers are RETIRED from LB routing (`remove_servers`) and from
+  every repack lifecycle path (no refresh, non-routable, drains
+  released, migration pairs declined); a restarted server is REVIVED
+  (`add_servers`, zero in-flight — least-loaded routing refills it).
+* **failure redirect**: a row that fails on a dead replica is retried
+  by the row-retry loop onto healthy replicas (recompute prefill); with
+  the partial pool enabled the retry resumes from same-version pooled
+  progress instead of restarting.
+* **chain rebuild (§4.3)**: `rebuild_chain` — the O(dead) splice
+  (exclude dead ranks, neighbors reconnect, live ranks never
+  re-receive) as a pure core; engine-side re-registration for the
+  mooncake rank chain is the TODO-15 tail (kimi needs no chain:
+  per-rank P2P reads are already failure-isolated per replica).
+
+### Partial response pool: version-gated store + retry consumer (implemented substrate)
+
+`partial_pool.py` + `async_training.partial_pool.*`: a central Ray
+actor holding in-progress trajectories. Every read enforces the
+same-version redirect rule (a cross-version partial is refused AND
+dropped — cross-version resume would mix weight versions WITHIN one
+trajectory, the exact property trajectory-level delivery protects);
+TTL + LRU + byte-quota bound the store (never the just-put entry).
+The consumer is wired: a row retry consults the pool — a same-version
+hit becomes a resume hint on the retry (`row_retry.py`'s
+`pool_consult_fn` → `generate_fn(row, hint)`; the producer attaches it
+as `non_tensor_batch["resume_tokens"]`, which resume-aware rollout
+paths honor and stock agent loops ignore), a miss restarts clean, and
+a pool error never breaks a retry. The token-level WRITER is the
+deliberately-external seam: partials must be checkpointed where tokens
+are observable (the LLM client's generation loop or a resume-aware
+agent loop — shared rollout infrastructure outside this package); the
+pool actor's `put` RPC is the seam.
+
+### Long-tail group policy: retries, survivors, deadlines (implemented)
+
+Three knobs (`async_training.*`) so one straggler cannot poison its
+group: `row_max_attempts` (bounded per-row generation retries;
+retried rows re-stamp the version they actually generated under — a
+mixed-version group flows through `version_span` + staleness
+correction), `min_group_survivors` (deliver a terminally-failed
+group's survivors as a trainable PARTIAL group; null = strict
+eviction, the default; clamped ≥ 2 — a lone survivor has no
+group-relative signal), and `group_deadline_s` (wall-clock bound on
+head-of-line blocking; late siblings are counted and dropped).
+
+## Configuration reference (`async_training.*`)
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `trajectory_group_assembly` | `True` | trainer-side GRPO re-assembly from per-trajectory messages (`False` = stock group-level consumption) |
+| `staleness_drop` | `null` | per-trajectory staleness refusal (versions behind current); null = emergent staleness, rely on loss-side correction |
+| `weight_store` | `backend: kimi` | versioned pull path; `null` = stock push-based sync |
+| `weight_store.keep_last` | `2` | retained staged versions |
+| `weight_store.max_staged_bytes` | `null` | host pinned-memory quota (retires oldest, never the latest) |
+| `row_max_attempts` | `2` | per-row generation retry budget (1 = single-shot) |
+| `min_group_survivors` | `null` | survivor-delivery threshold (null = strict eviction) |
+| `group_deadline_s` | `null` | head-of-line blocking bound |
+| `partial_pool.enabled` | `false` | attach the partial response pool actor |
+| `partial_pool.max_entries` / `.max_bytes` / `.ttl_s` | `4096` / `null` / `null` | pool bounds |
+| `fault_tolerance.enabled` | `true` | supervisor: controller failover + replica retire/revive |
+| `fault_tolerance.heartbeat_s` | `10.0` | heartbeat + probe cadence |
+| `fault_tolerance.failure_threshold` | `3` | consecutive probe failures before retire |
+| `repack.enabled` | `True` | the closed loop (post-publish + periodic triggers) |
+| `repack.check_interval_s` | `5.0` | periodic trigger cadence |
+| `repack.min_group_candidates` | `2` | min idle candidates for consolidation planning |
+| `repack.hard_drain` | `false` | abort in-flight on drained sources (requires abort-resume semantics; with `partial_rollout=false` on the stock client aborted requests are DROPPED) |
+| `repack.drain_deadline_s` | `null` | soft-drain deadline before abort escalation |
+| `repack.batch_bound` | `rollout.max_num_seqs` | CanFit decode batch capacity |
+| `repack.kv_per_request` | `null` | KV-token estimate per in-flight request |
+| `staleness_correction.mode` | `decay` | loss-side reweighting (`none` / `decay` / `exp`); full knob set in the yaml + staleness section below |
 
 ## Cluster TODO list (ordered)
 
@@ -393,9 +508,9 @@ off-policy distance, the latter reweights what is admitted.
 | §3 trajectory-level asynchrony, no lockstep; emergent per-trajectory staleness (§6, no static k) | ✅ collector + trainer (MessageQueue path); ✅ upstream v1 (TransferQueue) |
 | §3.1 experience buffer (sampling/eviction) | ✅ upstream v1 `ReplayBuffer`; ⚠️ here: collector is FIFO + staleness refusal only |
 | §3.1 prompt pool | ✅ upstream v1 (streaming dataloader + refill) |
-| §3.1 partial response pool (fault-tolerance substrate) | ❌ TODO-16 |
+| §3.1 partial response pool (fault-tolerance substrate) | ✅ substrate + retry consumer (`partial_pool.py`); token-level writer = documented external seam (TODO-16 tail) |
 | §3.2 workflow steps ④-⑦ (interleaved train/publish/background distribute/anytime pull) | ✅ P0 wiring (`relay_controller.py` + `rollout_producer.py` batch-boundary pulls); chain distribution = TODO-12 |
-| §3.3 + §4.3 fault tolerance (heartbeat failover, chain rebuild, master failover, checkpoint recovery) | ❌ TODO-15 (deferred) |
+| §3.3 + §4.3 fault tolerance (heartbeat failover, chain rebuild, master failover, checkpoint recovery) | ✅ LANDED (`fault_tolerance.py`: supervisor failover + `recover`, probe/retire/revive; `rebuild_chain` pure core); engine-side RDMA re-registration = TODO-15 tail; checkpoint recovery = standard path + `recover` (no separate async checkpoint by design) |
 | §4.2 relay hierarchy: master + per-machine relays, resharding, chain-pipelined broadcast, PCIe local pull | ⚠️ flat path via `relay_controller.py` (versioned stage + fleet pull + PER-REPLICA subgroup pulls, live); per-machine chain tier = `relay_tier.py` (CPU-verified) = TODO-12 |
 | §4.2 actor stall = single push to master | ✅ `publish` returns after the master stage |
 | §5 repack: triggers, version grouping, KVCache idleness, Algorithm 1 Best-Fit + CanFit(`C_max` ∧ `B`), freed sources pull fresh weights | ⚠️ closed loop LIVE (`repack_bridge.py`: post-publish + periodic triggers; idle replicas refresh to fresh versions per-replica); algorithm + executor CPU-verified; request migration + KV introspection = TODO-14 |
