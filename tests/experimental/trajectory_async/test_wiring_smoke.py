@@ -127,6 +127,18 @@ class TestP0Wiring(unittest.TestCase):
         for method in ("pull_weights", "running_requests", "remove_request", "admit_request"):
             self.assertTrue(hasattr(RolloutReplicaView, method), f"replica view missing {method}")
 
+    def test_drain_lifecycle_wiring(self):
+        """Migration execution path: the producer exposes the drain
+        lifecycle RPCs the repack bridge drives."""
+        from verl.experimental.trajectory_async.rollout_producer import TrajectoryLevelRollouter
+
+        import inspect
+
+        for rpc in ("replica_drain", "replica_abort_all", "replica_resume"):
+            self.assertTrue(hasattr(TrajectoryLevelRollouter, rpc), rpc)
+            params = inspect.signature(getattr(TrajectoryLevelRollouter, rpc)).parameters
+            self.assertTrue(all(p.kind is not p.VAR_POSITIONAL for p in params.values()), rpc)
+
     def test_row_retry_wiring(self):
         """The producer's retry seam: policy function importable, deliver
         stamps attempts, the trainer passes the budget."""

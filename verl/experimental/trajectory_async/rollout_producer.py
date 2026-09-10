@@ -91,6 +91,62 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
         counts = await asyncio.gather(*[lb.get_inflight_count.remote(sid) for sid in server_ids])
         return dict(zip(server_ids, counts))
 
+    async def replica_drain(self, server_ids: list[str], on: bool) -> bool:
+        """Begin/end a soft drain of the given LB servers (migration
+        steering): drained servers stop acquiring NEW requests; in-flight
+        ones keep running. Returns False when the load balancer lacks the
+        drain sockets (stock GlobalRequestLoadBalancer) — callers must
+        treat that as "migration unsupported", never as "drained"."""
+        lb = await self._lb()
+        if lb is None:
+            return False
+        method = getattr(lb, "begin_drain" if on else "end_drain", None)
+        if method is None:
+            return False
+        await method.remote(server_ids=list(server_ids))
+        return True
+
+    async def replica_abort_all(self, server_id: str) -> int:
+        """Abort all in-flight generation requests on one replica's
+        engines (hard drain). The rollout clients receive ABORT outputs
+        and transparently resume the requests on other replicas (prompt +
+        partial response, recompute prefill). Returns the aborted count,
+        or -1 when the engine path is unavailable (unknown server id,
+        engine type without the RPC). NOTE: the engine stays PAUSED after
+        this call until resume (the pull path's scoping or
+        ``replica_resume`` un-pauses it)."""
+        mgr = getattr(self, "llm_server_manager", None)
+        if mgr is None:
+            return -1
+        try:
+            addresses = list(mgr.get_addresses())
+            replica = mgr.get_replicas()[addresses.index(server_id)]
+            result = await replica.abort_all_requests()
+            return int(result.get("aborted_count", 0))
+        except (ValueError, AttributeError, IndexError, TypeError):
+            return -1
+        except Exception:  # noqa: BLE001 — probing must never kill the caller
+            logger.exception("replica_abort_all failed for %s", server_id)
+            return -1
+
+    async def replica_resume(self, server_id: str) -> bool:
+        """Resume generation on a replica's engines after a hard-drain
+        abort (idempotent; also the un-pause for the weight-pull path).
+        Returns False when unavailable."""
+        mgr = getattr(self, "llm_server_manager", None)
+        if mgr is None:
+            return False
+        try:
+            addresses = list(mgr.get_addresses())
+            replica = mgr.get_replicas()[addresses.index(server_id)]
+            await replica.resume_generation()
+            return True
+        except (ValueError, AttributeError, IndexError, TypeError):
+            return False
+        except Exception:  # noqa: BLE001
+            logger.exception("replica_resume failed for %s", server_id)
+            return False
+
     async def set_relay_controller(self, relay_controller, row_max_attempts: int = 2):
         """Attach the versioned-weight relay controller (optional; enables
         rollout-driven batch-boundary pulls) and the bounded row retry

@@ -28,7 +28,7 @@ the kimi/mooncake adapters).
 | `relay_controller.py` | the Ray-native control plane of the versioned pull path: `RelayController` (version registry, retention + staged-bytes quota, fleet AND per-replica pull drivers with per-replica locking, metrics — CPU-testable) + `derive_replica_partition` + `build_relay_controller` / `make_relay_controller_actor` wiring it over a real `CheckpointEngineManager` |
 | `rollout_producer.py` | `TrajectoryLevelRollouter(FullyAsyncRollouter)` — the trajectory-level producer: one queue message per response (uid / traj_index / group_size / model_version / attempts stamped), bounded row retries (`row_retry.py` policy; retried rows re-stamp the version they actually generated under), FAILED rows on budget exhaustion, batch-boundary weight pulls |
 | `row_retry.py` | bounded per-row generation retry policy (stdlib-pure, CPU-testable): attempt budget, per-attempt version stamping, FAILED-sentinel delivery on exhaustion — the cheapest long-tail mitigation (a transient single-response failure stops terminating whole groups) |
-| `repack_bridge.py` | the repack closed loop over the real rollout fleet (paper §5): `RolloutReplicaView` (LB in-flight probe + per-replica pull), `FleetRepackExecutor` (idle-replica refresh after each publish — the real §5 payoff on this stack; migration declined until request-control RPCs exist), `build_repack_controller` / `make_repack_controller_actor` |
+| `repack_bridge.py` | the repack closed loop over the real rollout fleet (paper §5): `RolloutReplicaView` (LB in-flight probe + per-replica pull), `FleetRepackExecutor` — idle-replica refresh after each publish PLUS cross-replica migration as the DRAIN LIFECYCLE (`begin_drain` steering → optional hard abort with client-side transparent resume → completion watcher pulls fresh weights into emptied sources and `end_drain`s them back to routing), real async fleet snapshots feeding the Best-Fit planner, `build_repack_controller` / `make_repack_controller_actor` |
 | `staleness_correction.py` | loss-side version-staleness correction: per-trajectory reweighting by version age (`staleness_weights`), adaptive clip scaling (`adaptive_clip_scale`), version-cohort GRPO baselines (`cohort_advantages`), cohort diagnostics; `apply_staleness_correction` attaches `staleness_weights` / `cliprange_scale` batch columns consumed by the policy loss (see below) |
 | `trajectory_async_main.py` | the launcher: `TrajectoryAsyncTaskRunner` wiring `TrajectoryLevelRollouter` + `TrajectoryAsyncTrainer` + MessageQueue + the relay controller (mirrors `fully_async_main.py`) |
 
@@ -197,19 +197,38 @@ KV movement); freed sources immediately pull the latest weights.
 
 **P2 — close the remaining gaps vs the paper**
 
-14. `RolloutReplicaHandle` against the real rollout stack — PARTIAL:
-    the closed loop is wired (`repack_bridge.py`: `RepackControllerActor`
-    owns the manager loop; the trainer's `_publish_versioned_weights`
-    tail fires `notify_update`; `async_training.repack` config), and the
-    paper-§5 payoff runs for real: IDLE replicas lagging the fresh
-    version pull it per-replica right after a publish
-    (`FleetRepackExecutor.refresh_idle`; idleness = LB in-flight == 0,
-    conservative on unknown). Still missing: cross-replica REQUEST
-    MIGRATION (needs per-request abort/redirect/admit RPCs on the
-    rollout servers — declined, never half-migrated, until then;
-    `repack/migrations_declined` shows the headroom), per-token KV
-    introspection (idle is request-count based), and a real
-    `kv_transfer_fn`.
+14. `RolloutReplicaHandle` against the real rollout stack — MOSTLY
+    LIVE: the closed loop is wired (`repack_bridge.py`:
+    `RepackControllerActor` owns the manager loop; the trainer's
+    `_publish_versioned_weights` tail fires `notify_update`;
+    `async_training.repack` config), and BOTH §5 mechanisms now execute:
+    (a) idle-replica refresh (replicas with LB in-flight == 0 lagging
+    the fresh version pull it per-replica right after a publish) and
+    (b) CROSS-REPLICA REQUEST MIGRATION as the drain lifecycle — the
+    engine pieces already existed scattered (LB drain sockets
+    `begin_drain`/`end_drain`, server-level `abort_all_requests`, the
+    fully-async client's transparent abort-resume with recompute
+    prefill); what was missing was the driver. `FleetRepackExecutor`
+    now supplies it: plans execute as `begin_drain(sources)` (new work
+    steers to the planner's CanFit-verified destinations) → soft mode
+    (default) lets in-flight requests FINISH on their source under the
+    version they started on (no version mixing, no lost work) while
+    hard mode (`repack.hard_drain=true`) aborts them for client-side
+    resume elsewhere → the completion watcher pulls fresh weights into
+    emptied sources and returns them to routing. Execution-time CanFit
+    re-checks reject pairs on live counts; a crashing abort RPC degrades
+    to soft instead of stranding a drained source; capability probes
+    (drain socket absent → plan declined, `repack/migrations_declined`)
+    keep the clean-branch behavior honest. Remaining boundaries:
+    per-request DIRECTED placement is the LB's, not the executor's (the
+    plan's Best-Fit math gates safety; actual redirect placement is
+    least-loaded); hard mode requires abort-resume semantics on the
+    rollout stack (L2 scheduling, or `partial_rollout=true` — with
+    `partial_rollout=false` the stock client DROPS aborted requests);
+    per-token KV introspection (KV columns are linear in the in-flight
+    count, CanFit collapses onto the true batch bound
+    `rollout.max_num_seqs`); a real `kv_transfer_fn` (KV blocks never
+    travel — recompute prefill is the accepted default).
 15. Relay tier elasticity: per the paper's §4.3, O(1) chain rebuild on
     relay failure, master failover (deliberately deferred with fault
     tolerance as a whole).
@@ -300,9 +319,9 @@ off-policy distance, the latter reweights what is admitted.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (167 tests; 153 stdlib-only +
+`tests/experimental/trajectory_async/` (183 tests; 167 stdlib-only +
 3 torch-gated adapter smokes + 2 torch-gated staleness batch-application
-smokes + 9 ray-gated wiring smokes, all skipping gracefully without
+smokes + 11 ray-gated wiring smokes, all skipping gracefully without
 their deps):
 
 * aggregator: completion order, duplicates, FAILED-eviction protocol,
@@ -316,6 +335,15 @@ their deps):
   unknown skipped, one failure never stops the rest), migration
   declining (never half-migrates), manager hook + notify-update wakeup,
   conservative no-mapping wiring;
+* repack drain lifecycle: soft plan execution (drain steering, deferred
+  emptiness), hard mode (abort counts, drain-before-abort ordering,
+  crash-degrades-to-soft), execution-time CanFit rejections, no-drain
+  and no-LB-socket declines, completion watcher (pull + end_drain,
+  busy sources wait, hard-mode resume ordering, no double-refresh,
+  failure retried), real snapshots (inflight/KV-linear/pulling/routable,
+  kv_prev decline tracking, fleet util from cache, no-batch-bound
+  degradation), end-to-end planning over real snapshots, config
+  passthrough;
 * long-tail mitigation: row-retry policy (success / retry-then-success /
   budget exhaustion delivering the FAILED sentinel / single-shot legacy
   semantics / delivery-error propagation / per-attempt version stamping),

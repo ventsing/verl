@@ -302,6 +302,18 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
             manager_cfg = RepackConfig(
                 **{k: v for k, v in dict(repack_cfg).items() if k in field_names}
             )
+            # migration planning needs an honest capacity bound: derive the
+            # engine decode batch bound B (max_num_seqs) and the per-request
+            # KV-token estimate (prompt+response budget) from the rollout
+            # config unless explicitly overridden
+            rollout_cfg = self.config.actor_rollout_ref.rollout
+            if manager_cfg.batch_bound is None:
+                manager_cfg.batch_bound = int(getattr(rollout_cfg, "max_num_seqs", 0)) or None
+            if manager_cfg.kv_per_request <= 1:
+                prompt_len = int(getattr(rollout_cfg, "prompt_length", 0) or 0)
+                resp_len = int(getattr(rollout_cfg, "response_length", 0) or 0)
+                if prompt_len + resp_len > 0:
+                    manager_cfg.kv_per_request = prompt_len + resp_len
             server_ids = repack_cfg.get("server_ids", None)
             if server_ids is None and hasattr(self.rollouter, "replica_server_ids"):
                 # convention: replica index i (engine partition order) <->
@@ -315,10 +327,13 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
                 config=manager_cfg,
             )
             logger.info(
-                "repack controller attached (check_interval_s=%.1f, replicas=%d): "
-                "idle replicas refresh to fresh versions per-replica after each publish",
+                "repack controller attached (check_interval_s=%.1f, replicas=%d, "
+                "hard_drain=%s, B=%s): idle refresh per-replica after each publish; "
+                "migration = drain lifecycle (soft: in-flight finishes; hard: abort+resume)",
                 manager_cfg.check_interval_s,
                 len(server_ids) if server_ids else 0,
+                manager_cfg.hard_drain,
+                manager_cfg.batch_bound,
             )
 
     def _fit_compute_advantage(self, batch):

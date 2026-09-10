@@ -44,6 +44,7 @@ throughput, +14.8% average KVCache utilization, 0.69s repack overhead).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -130,6 +131,9 @@ class RepackExecutor(Protocol):
     repack_overhead_s: float
 
     def snapshot(self) -> list[ReplicaState]:
+        """Point-in-time replica states. May return an awaitable (the
+        manager awaits awaitable snapshots) — real engine probes are
+        async; sync engines return the list directly."""
         ...
 
     def fleet_kv_util(self) -> float:
@@ -145,6 +149,17 @@ class RepackConfig:
     check_interval_s: float = 1.0
     # a version group needs at least this many idle candidates to bother
     min_group_candidates: int = 2
+    # hard drain: abort in-flight requests on drained sources (clients
+    # resume them elsewhere) instead of letting them finish. Requires the
+    # rollout stack's abort-resume semantics; soft (False) never aborts.
+    hard_drain: bool = False
+    # engine decode batch bound B (max_num_seqs) — the planner's CanFit
+    # capacity. None disables migration planning (no honest capacity).
+    batch_bound: int | None = None
+    # KV-token estimate per in-flight request (prompt+response budget) —
+    # the KV columns are linear in the in-flight count without engine
+    # token introspection; 1 makes them count-denominated.
+    kv_per_request: int = 1
 
 
 @dataclass
@@ -323,6 +338,8 @@ class RepackManager:
             except Exception:  # noqa: BLE001 — the manager must survive
                 logger.exception("repack refresh_idle failed; continuing")
         states = self.engine.snapshot()
+        if inspect.isawaitable(states):
+            states = await states
         kv_util_before = self.engine.fleet_kv_util()
         idle_before = sum(1 for r in states if not r.has_work)
 
@@ -349,6 +366,8 @@ class RepackManager:
         # step ③: transfer unfinished trajectories of sources to destinations
         result = await self.engine.migrate(plan)
         after = self.engine.snapshot()
+        if inspect.isawaitable(after):
+            after = await after
         self.stats.plans += 1
         self.stats.sources_released += result.sources_planned
         self.stats.sources_emptied += result.sources_emptied

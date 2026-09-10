@@ -98,6 +98,11 @@ stale_lam=0.5
 # repack closed loop: idle replicas refresh to fresh versions per-replica
 repack_enabled="True"
 repack_interval_s=5.0
+# migration executes as the drain lifecycle; hard_drain additionally
+# aborts in-flight requests on drained sources (clients resume them
+# elsewhere — requires abort-resume semantics on the rollout stack)
+repack_hard_drain="False"
+
 # long-tail mitigation: row retries on, strict groups otherwise
 row_max_attempts=2
 min_group_survivors=""   # e.g. 4: deliver survivors of failed groups
@@ -194,5 +199,6 @@ python -m verl.experimental.trajectory_async.trajectory_async_main \
     async_training.staleness_correction.lam="${stale_lam}" \
     async_training.repack.enabled="${repack_enabled}" \
     async_training.repack.check_interval_s="${repack_interval_s}" \
+    async_training.repack.hard_drain="${repack_hard_drain}" \
     async_training.row_max_attempts="${row_max_attempts}" \
     rollout.checkpoint_engine.backend="kimi_ckpt_engine"
