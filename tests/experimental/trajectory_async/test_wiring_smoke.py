@@ -127,6 +127,46 @@ class TestP0Wiring(unittest.TestCase):
         for method in ("pull_weights", "running_requests", "remove_request", "admit_request"):
             self.assertTrue(hasattr(RolloutReplicaView, method), f"replica view missing {method}")
 
+    def test_kimi_topology_change_fails_loud(self):
+        """Elastic-safety guard: a re-init with a CHANGED replica
+        partition must raise (silently keeping stale subgroups would
+        route per-replica pulls over the wrong topology); the SAME
+        partition is an idempotent no-op (the failover factory rebuilds
+        the controller without changing the fleet)."""
+        from verl.checkpoint_engine.kimi_checkpoint_engine import KIMICheckpointEngine
+
+        engine = KIMICheckpointEngine.__new__(KIMICheckpointEngine)  # no model paths
+        engine.initialized = True
+        engine._installed_partition = [[8, 9, 10, 11], [12, 13, 14, 15]]
+
+        # same topology: silent no-op (failover re-init)
+        engine.init_process_group(
+            rank=9, actor_wg_world_size=8, rollout_world_size=8,
+            master_metadata=None, replica_partition=[[8, 9, 10, 11], [12, 13, 14, 15]],
+        )
+
+        # elastic change: fail loud, never a silent stale topology
+        with self.assertRaises(RuntimeError):
+            engine.init_process_group(
+                rank=9, actor_wg_world_size=8, rollout_world_size=8,
+                master_metadata=None, replica_partition=[[8, 9, 10, 11]],
+            )
+
+        # flat -> partitioned is also a topology change
+        flat = KIMICheckpointEngine.__new__(KIMICheckpointEngine)
+        flat.initialized = True
+        flat._installed_partition = None
+        with self.assertRaises(RuntimeError):
+            flat.init_process_group(
+                rank=9, actor_wg_world_size=8, rollout_world_size=8,
+                master_metadata=None, replica_partition=[[8, 9, 10, 11]],
+            )
+        # flat -> flat stays a no-op (the stock path)
+        flat.init_process_group(
+            rank=9, actor_wg_world_size=8, rollout_world_size=8,
+            master_metadata=None, replica_partition=None,
+        )
+
     def test_fault_tolerance_wiring(self):
         """§3.3/§4.3 wiring: producer lifecycle RPCs, controller
         ping/recover, pool actor factory, supervisor + pool exports."""

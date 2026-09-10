@@ -268,6 +268,11 @@ class TestPullCapabilityProbe(unittest.TestCase):
         import asyncio
 
         self.assertEqual(asyncio.run(c.pull_replica(1)), 3)
+        # the 2-replica concurrency-validation window is observable:
+        # every pull records its duration for snapshot consumers
+        snap = c.snapshot()
+        self.assertGreater(snap["relay/replica_pull_last_s"], 0.0)
+        self.assertEqual(snap["relay/replica_pulls"], 1)
 
 
 class TestPerReplicaPull(unittest.TestCase):

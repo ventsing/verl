@@ -320,6 +320,24 @@ class KIMICheckpointEngine(CheckpointEngine):
                 ``dist.new_group`` is collective, so every rank (actor
                 included) creates all subgroups in partition order.
         """
+        # idempotence WITH topology checking: a re-init with the SAME
+        # partition is a no-op (the relay controller rebuilds the group on
+        # failover without changing the fleet); a DIFFERENT partition means
+        # the replica set changed (elastic add/remove) — silently keeping
+        # the old subgroups would route per-replica pulls over a stale
+        # topology, so fail loud instead. True dynamic group rebuild (and
+        # the NCCL group-teardown traps that come with it) is a cluster TODO.
+        if self.initialized:
+            installed = getattr(self, "_installed_partition", None)
+            if replica_partition != installed:
+                raise RuntimeError(
+                    f"checkpoint-engine process group already initialized with "
+                    f"replica_partition={installed}; refusing to silently re-init "
+                    f"with {replica_partition} (elastic replica changes need an "
+                    f"explicit group rebuild, not a re-init)"
+                )
+            return  # same topology: idempotent no-op
+
         self.rank = rank
         self.actor_wg_world_size = actor_wg_world_size
         self.rollout_world_size = rollout_world_size
@@ -329,41 +347,41 @@ class KIMICheckpointEngine(CheckpointEngine):
         self.replica_group = None
         self.replica_ranks: list[int] | None = None
 
-        if not self.initialized:
-            self.parameter_server = ParameterServer(
-                rank=rank,
-                world_size=self.world_size,
-                auto_pg=False,
-                master_addr=master_metadata.dist_ip,
-                master_port=master_metadata.dist_port,
-            )
-            self.parameter_server.receive_tensor = types.MethodType(receive_tensor, self.parameter_server)
+        self.parameter_server = ParameterServer(
+            rank=rank,
+            world_size=self.world_size,
+            auto_pg=False,
+            master_addr=master_metadata.dist_ip,
+            master_port=master_metadata.dist_port,
+        )
+        self.parameter_server.receive_tensor = types.MethodType(receive_tensor, self.parameter_server)
 
-            dist.use_backend(f"vllm_{get_nccl_backend()}")
-            self.parameter_server.init_process_group()
+        dist.use_backend(f"vllm_{get_nccl_backend()}")
+        self.parameter_server.init_process_group()
 
-            self.rollout_ranks = list(range(self.actor_wg_world_size, self.world_size))
-            self.rollout_group = dist.new_group(self.rollout_ranks)
+        self.rollout_ranks = list(range(self.actor_wg_world_size, self.world_size))
+        self.rollout_group = dist.new_group(self.rollout_ranks)
 
-            if replica_partition:
-                expected = set(self.rollout_ranks)
-                covered: set[int] = set()
-                for part in replica_partition:
-                    covered.update(part)
-                if covered != expected or len(covered) != sum(len(p) for p in replica_partition):
-                    raise ValueError(
-                        f"replica_partition {replica_partition} must exactly tile the "
-                        f"rollout ranks {self.rollout_ranks} (no overlap, no gap)"
-                    )
-                # every rank creates every subgroup (collective, same order);
-                # members receive a usable group, non-members an inert handle
-                for replica_id, part in enumerate(replica_partition):
-                    group = dist.new_group(part)
-                    if self.rank in part:
-                        self.replica_id = replica_id
-                        self.replica_group = group
-                        self.replica_ranks = list(part)
-            self.initialized = True
+        if replica_partition:
+            expected = set(self.rollout_ranks)
+            covered: set[int] = set()
+            for part in replica_partition:
+                covered.update(part)
+            if covered != expected or len(covered) != sum(len(p) for p in replica_partition):
+                raise ValueError(
+                    f"replica_partition {replica_partition} must exactly tile the "
+                    f"rollout ranks {self.rollout_ranks} (no overlap, no gap)"
+                )
+            # every rank creates every subgroup (collective, same order);
+            # members receive a usable group, non-members an inert handle
+            for replica_id, part in enumerate(replica_partition):
+                group = dist.new_group(part)
+                if self.rank in part:
+                    self.replica_id = replica_id
+                    self.replica_group = group
+                    self.replica_ranks = list(part)
+        self._installed_partition = replica_partition
+        self.initialized = True
 
     @torch.no_grad()
     async def send_weights(

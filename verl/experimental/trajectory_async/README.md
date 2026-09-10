@@ -138,23 +138,59 @@ concurrent-collective-safety question is TODO-11). The ONLY per-replica
 pull caller today is the repack bridge's idle refresh (post-publish +
 periodic) — Laminar's anytime pull, realized for idle replicas.
 
-**The known P0-path gap (deliberate, documented): the producer's
-batch-boundary pull is FLEET-SYNCHRONIZED** — `_maybe_pull_weights` →
-`controller.pull()` aborts in-flight, releases KV, runs the collective
-receive, and resumes on ALL replicas at every version bump. On one
-replica that coincides with per-replica semantics; at ≥2 it stalls the
-whole fleet's generation per publish and is the actual bottleneck vs
-Laminar's per-replica anytime pull (§3.2). Closing it needs two things
-that sit OUTSIDE this package's committed surfaces: (a) per-row
-version attribution from the engine (a row's true version becomes
-per-replica-dependent — the stamp can no longer come from the
-producer's fleet-wide `_pull_version`), and (b) version-aware routing
-(new work may only route to replicas at/above the group's target
-version) — an LB/manager seam, i.e. the L2 scheduling stack's
-territory. Chunk-pipelined chain distribution remains `relay_tier.py`'s
-CPU-verified model (TODO-12). The mooncake engine raises
-`NotImplementedError` on `stage_version` (per-version RDMA staging
-buffers still to design — TODO below).
+**The known P0-path gap, framed as two breakthrough points** (the
+producer's batch-boundary pull is FLEET-SYNCHRONIZED:
+`_maybe_pull_weights` → `controller.pull()` aborts in-flight, releases
+KV, runs the collective receive, and resumes on ALL replicas per
+version bump; on one replica that coincides with per-replica
+semantics, at ≥2 it stalls the whole fleet per publish):
+
+1. **Communication-domain split (the prerequisite) — LANDED at the
+   manager-level split point**: `CheckpointEngineManager
+   .build_process_group(replica_partition=...)` installs one
+   `dist.new_group` subgroup per replica (not inside the engine — the
+   partition flows manager → topology → `init_process_group`).
+   Subgroup composition note: each subgroup contains the replica's
+   ROLLOUT ranks only — actor ranks are deliberately NOT in the pull
+   group (kimi's P2P store: shards are registered into the store at
+   STAGE time; a pull READS the store, so the pull group needs no
+   actor membership — the barriers and H2D bucket partition touch
+   only the replica's ranks). Without this split, pushing pull
+   control down would be "logically async, physically synchronized"
+   (a global barrier under every scoped call).
+   Elastic safety: the engine's init guard now FAILS LOUD on a
+   re-init with a CHANGED partition (silently keeping stale subgroups
+   would route per-replica pulls over the wrong topology); a
+   same-partition re-init (the failover factory path) is an
+   idempotent no-op. True dynamic group rebuild remains a cluster
+   TODO (NCCL group-teardown traps).
+2. **Pushing pull control down to the replica — the open half.** The
+   centralized fallback is RETAINED by design (the producer's fleet
+   pull doubles as the emergency/timeout convergence path). What
+   exists today at replica granularity: the repack idle refresh —
+   per-replica DECISION + per-replica EXECUTION over the subgroups;
+   only the observation is centralized polling. The full
+   self-triggered form (a server/client-side loop calling
+   `relay_controller.pull_replica(self.id)` when the replica's own
+   scheduler goes idle or hits an internal drain state) additionally
+   needs per-row version attribution from the engine and
+   version-aware routing (new work may only go to replicas at/above
+   the group's target version) — an LB/manager seam, i.e. the L2
+   scheduling stack's territory.
+
+**Verify before refactoring (the 2-replica experiment).** Before any
+further push-down work, run a 2-replica kimi cluster
+(`rollout.nnodes=2` + `async_training.weight_store`) and read the
+`PULL_REPLICA_BEGIN/END replica=...` interval logs the controller now
+emits (per-replica windows spanning the full abort → release KV →
+subgroup receive → resume sequence): OVERLAPPING windows across
+replicas = the subgroups are live and per-replica pulls are truly
+concurrent; DISJOINT windows = a global barrier remains (revisit the
+split). The per-rank `receive v{N} done ... time cost` engine lines
+corroborate. Chunk-pipelined chain distribution remains
+`relay_tier.py`'s CPU-verified model (TODO-12). The mooncake engine
+raises `NotImplementedError` on `stage_version` (per-version RDMA
+staging buffers still to design — TODO below).
 
 Run it (see `examples/trajectory_async/`):
 
@@ -542,9 +578,9 @@ off-policy distance, the latter reweights what is admitted.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (224 tests; 208 stdlib-only +
+`tests/experimental/trajectory_async/` (225 tests; 208 stdlib-only +
 3 torch-gated adapter smokes + 2 torch-gated staleness batch-application
-smokes + 11 ray-gated wiring smokes, all skipping gracefully without
+smokes + 12 ray-gated wiring smokes, all skipping gracefully without
 their deps):
 
 * aggregator: completion order, duplicates, FAILED-eviction protocol,
@@ -572,6 +608,10 @@ their deps):
   deads ignored), controller recover semantics, bridge retire/revive
   (no refresh, non-routable snapshots, drain release, migrate-pair
   decline, idempotence);
+* kimi topology guard (ray-gated): same-partition re-init is an
+  idempotent no-op, changed/flat-to-partitioned re-init fails loud
+  (elastic safety); per-replica pull durations recorded in snapshot
+  (the 2-replica concurrency-validation window);
 * per-replica pull capability degradation: unavailable pulls latch off
   on first discovery (never retried, never counted as failures), the
   capability metric reflects wiring, a drained source with unavailable

@@ -131,6 +131,7 @@ class RelayController:
         self._publishes = 0
         self._pulls = 0
         self._replica_pulls = 0
+        self._replica_pull_last_s: float | None = None
         self._quota_retires = 0
         self._publish_seconds = 0.0
         self._pull_seconds = 0.0
@@ -336,13 +337,25 @@ class RelayController:
             if self._replica_versions.get(replica_id) == target:
                 return target  # already there — idempotent no-op
 
+            # PULL_REPLICA interval markers: the 2-replica cluster
+            # validation greps these to judge whether per-replica pulls
+            # OVERLAP (subgroup topology live) or serialize (a global
+            # barrier remains). The window spans the full semantic
+            # sequence (abort -> release KV -> subgroup receive -> resume),
+            # not just the tensor transfer.
             start = time.monotonic()
+            logger.info(
+                "PULL_REPLICA_BEGIN replica=%d version=%d t=%.6f",
+                replica_id, target, start,
+            )
             await self._pull_replica_fn(replica_id, target)
             elapsed = time.monotonic() - start
             self._replica_versions[replica_id] = target
             self._replica_pulls += 1
+            self._replica_pull_last_s = elapsed
             logger.info(
-                "relay pull_replica %d v%d: loaded in %.3fs", replica_id, target, elapsed
+                "PULL_REPLICA_END replica=%d version=%d t=%.6f took=%.3fs",
+                replica_id, target, time.monotonic(), elapsed,
             )
             return target
 
@@ -369,6 +382,7 @@ class RelayController:
             "relay/publishes": self._publishes,
             "relay/pulls": self._pulls,
             "relay/replica_pulls": self._replica_pulls,
+            "relay/replica_pull_last_s": self._replica_pull_last_s or 0.0,
             "relay/recoveries": getattr(self, "recoveries", 0),
             "relay/quota_retires": self._quota_retires,
             "relay/staged_bytes": sum(self._versions[v]["staged_bytes"] for v in live),
