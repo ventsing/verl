@@ -82,6 +82,21 @@ async_training:
     adaptive_clip_min_scale: 0.5
     cohort_baseline: False  # version-cohort GRPO baselines (experimental)
 
+  # Repack closed loop (Laminar §5, the executable subset): after each
+  # publish (and periodically), IDLE replicas lagging the fresh version
+  # pull it over their OWN engine subgroup (per-replica pull) — the
+  # "freed sources pull fresh weights" payoff. Migration-dependent
+  # consolidation needs rollout-server request-control RPCs (TODO).
+  # null = off.
+  repack:
+    enabled: True
+    check_interval_s: 5.0     # periodic trigger cadence
+    # min idle candidates before a version group is worth consolidating
+    min_group_candidates: 2
+    # replica index (engine partition order) -> LB server id; default:
+    # sorted server ids from the rollouter's load balancer
+    server_ids: null
+
   # Multi-version, pull-based weight path (the relay tier's P0 wiring):
   #   publish = stage-only (actor ranks register per-version CPU shards in
   #             the kimi P2P store; the metadata gather is the whole
@@ -92,6 +107,11 @@ async_training:
   weight_store:
     backend: kimi
     keep_last: 2
+    # host pinned-memory quota: each staged version pins a full CPU copy of
+    # the actor shards on every actor rank; the controller retires the
+    # oldest live versions (never the latest) when the sum exceeds this.
+    # e.g. 68719476736 = 64 GiB; null = keep_last only.
+    max_staged_bytes: null
 
 # Rollout config
 rollout:

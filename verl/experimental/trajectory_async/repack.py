@@ -312,6 +312,16 @@ class RepackManager:
         moved, and sources actually emptied (freed to pull fresh weights).
         """
         self.stats.checks += 1
+        # optional executor pre-step: e.g. the rollout-fleet bridge refreshes
+        # idle replicas that lag the latest version to the fresh weights
+        # (paper §5 payoff — "freed sources pull fresh weights") BEFORE any
+        # migration planning
+        refresh_idle = getattr(self.engine, "refresh_idle", None)
+        if refresh_idle is not None:
+            try:
+                await refresh_idle()
+            except Exception:  # noqa: BLE001 — the manager must survive
+                logger.exception("repack refresh_idle failed; continuing")
         states = self.engine.snapshot()
         kv_util_before = self.engine.fleet_kv_util()
         idle_before = sum(1 for r in states if not r.has_work)

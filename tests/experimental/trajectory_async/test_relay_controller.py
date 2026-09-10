@@ -25,7 +25,7 @@ try:
 except ImportError:
     import _bootstrap  # noqa: F401
 
-from verl.experimental.trajectory_async.relay_controller import RelayController
+from verl.experimental.trajectory_async.relay_controller import RelayController, derive_replica_partition
 
 
 class FakeOps:
@@ -195,3 +195,236 @@ class TestRelayController(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0], "-v"])
+
+
+# ---------------------------------------------------------------- new: partition / per-replica / quota
+
+
+class _FakeReplica:
+    def __init__(self, n_workers):
+        self.workers = [f"w{i}" for i in range(n_workers)]
+
+
+class TestDeriveReplicaPartition(unittest.TestCase):
+    def test_contiguous_blocks_in_flatten_order(self):
+        parts = derive_replica_partition(4, [_FakeReplica(2), _FakeReplica(3), _FakeReplica(1)])
+        self.assertEqual(parts, [[4, 5], [6, 7, 8], [9]])
+
+    def test_skips_workerless_replicas(self):
+        parts = derive_replica_partition(2, [_FakeReplica(0), _FakeReplica(2), _FakeReplica(0), _FakeReplica(2)])
+        self.assertEqual(parts, [[2, 3], [4, 5]])
+
+    def test_single_replica_is_none(self):
+        self.assertIsNone(derive_replica_partition(4, [_FakeReplica(8)]))
+
+    def test_no_replicas_is_none(self):
+        self.assertIsNone(derive_replica_partition(4, []))
+
+
+class TestPerReplicaPull(unittest.TestCase):
+    def _controller(self, num_replicas=3, **kwargs):
+        async def publish_fn(version):
+            return None
+
+        async def pull_fn(version):
+            return None
+
+        async def unstage_fn(version):
+            return None
+
+        return RelayController(
+            publish_fn=publish_fn,
+            pull_fn=pull_fn,
+            unstage_fn=unstage_fn,
+            pull_replica_fn=kwargs.pop("pull_replica_fn", None),
+            num_replicas=num_replicas,
+            **kwargs,
+        )
+
+    def test_pull_replica_updates_one_version(self):
+        pulled = []
+
+        async def pull_replica_fn(replica_id, version):
+            pulled.append((replica_id, version))
+
+        ctrl = self._controller(pull_replica_fn=pull_replica_fn)
+
+        async def run():
+            await ctrl.publish(1)
+            await ctrl.publish(2)
+            self.assertEqual(await ctrl.pull_replica(1), 2)
+            self.assertEqual(ctrl.replica_version(1), 2)
+            self.assertIsNone(ctrl.replica_version(0))  # untouched
+            self.assertEqual(pulled, [(1, 2)])
+
+        asyncio.run(run())
+
+    def test_pull_replica_idempotent_when_current(self):
+        calls = []
+
+        async def pull_replica_fn(replica_id, version):
+            calls.append(replica_id)
+
+        async def run():
+            ctrl = self._controller(pull_replica_fn=pull_replica_fn)
+            await ctrl.publish(3)
+            self.assertEqual(await ctrl.pull_replica(2), 3)
+            self.assertEqual(await ctrl.pull_replica(2), 3)  # no-op
+            self.assertEqual(calls, [2])
+
+        asyncio.run(run())
+
+    def test_pull_replica_requires_wiring(self):
+        async def run():
+            ctrl = self._controller()
+            with self.assertRaises(NotImplementedError):
+                await ctrl.pull_replica(0)
+
+        asyncio.run(run())
+
+    def test_pull_replica_out_of_range(self):
+        async def pull_replica_fn(replica_id, version):
+            return None
+
+        async def run():
+            ctrl = self._controller(num_replicas=2, pull_replica_fn=pull_replica_fn)
+            with self.assertRaises(ValueError):
+                await ctrl.pull_replica(5)
+
+        asyncio.run(run())
+
+    def test_fleet_pull_sets_all_replica_versions(self):
+        async def run():
+            ctrl = self._controller(num_replicas=3)
+            await ctrl.publish(7)
+            await ctrl.pull()
+            self.assertEqual([ctrl.replica_version(i) for i in range(3)], [7, 7, 7])
+            snap = ctrl.snapshot()
+            self.assertEqual(snap["relay/replica_lag_versions_max"], 0)
+
+        asyncio.run(run())
+
+    def test_distinct_replicas_pull_concurrently(self):
+        """Per-replica pulls must overlap in time (each takes only ITS lock)."""
+        entered = []
+        overlap_seen = []
+
+        async def pull_replica_fn(replica_id, version):
+            entered.append(replica_id)
+            await asyncio.sleep(0.02)
+            if len(entered) > 1:
+                overlap_seen.append(len(entered))
+            entered.remove(replica_id)
+
+        async def run():
+            ctrl = self._controller(num_replicas=2, pull_replica_fn=pull_replica_fn)
+            await ctrl.publish(1)
+            await ctrl.publish(2)
+            await asyncio.gather(ctrl.pull_replica(0), ctrl.pull_replica(1))
+            self.assertTrue(overlap_seen, "per-replica pulls did not overlap")
+
+        asyncio.run(run())
+
+    def test_pull_replica_retired_version_raises(self):
+        async def pull_replica_fn(replica_id, version):
+            return None
+
+        async def run():
+            ctrl = self._controller(num_replicas=2, pull_replica_fn=pull_replica_fn, keep_last=1)
+            await ctrl.publish(1)
+            await ctrl.publish(2)  # retires v1 (keep_last=1)
+            with self.assertRaises(LookupError):
+                await ctrl.pull_replica(0, version=1)
+
+        asyncio.run(run())
+
+
+class TestStagedBytesQuota(unittest.TestCase):
+    def _make(self, keep_last=2, max_staged_bytes=None):
+        async def pull_fn(version):
+            return None
+
+        async def unstage_fn(version):
+            return None
+
+        ctrl = RelayController(
+            publish_fn=self._publish_fn,
+            pull_fn=pull_fn,
+            unstage_fn=unstage_fn,
+            keep_last=keep_last,
+            max_staged_bytes=max_staged_bytes,
+        )
+        return ctrl
+
+    async def _publish_fn(self, version):
+        return {"staged_bytes": version * 100}
+
+    def test_bytes_recorded_and_retired_by_keep_last(self):
+        async def run():
+            ctrl = self._make(keep_last=2)
+            await ctrl.publish(1)
+            await ctrl.publish(2)
+            await ctrl.publish(3)  # retires v1
+            snap = ctrl.snapshot()
+            self.assertEqual(snap["relay/staged_bytes"], 500)  # v2 (200) + v3 (300)
+            self.assertEqual(snap["relay/quota_retires"], 0)
+
+        asyncio.run(run())
+
+    def test_byte_quota_retires_oldest_beyond_keep_last(self):
+        async def run():
+            # keep_last=3 would keep v1..v3, but 150-byte quota only fits
+            # the latest (100) + nothing else -> retire down to v3 only
+            ctrl = self._make(keep_last=3, max_staged_bytes=150)
+            await ctrl.publish(1)
+            await ctrl.publish(2)
+            await ctrl.publish(3)
+            snap = ctrl.snapshot()
+            self.assertEqual(snap["relay/versions_live"], 1)
+            self.assertEqual(snap["relay/staged_bytes"], 300)
+            self.assertEqual(snap["relay/staged_bytes_limit"], 150)
+            self.assertEqual(snap["relay/quota_retires"], 2)
+
+        asyncio.run(run())
+
+    def test_quota_never_retires_latest(self):
+        async def run():
+            # even one version overflows the quota: keep it anyway
+            ctrl = self._make(keep_last=2, max_staged_bytes=1)
+            await ctrl.publish(1)
+            snap = ctrl.snapshot()
+            self.assertEqual(snap["relay/versions_live"], 1)
+            self.assertEqual(ctrl.latest_version, 1)
+
+        asyncio.run(run())
+
+    def test_quota_rolling_retirement(self):
+        async def run():
+            # publish sizes grow with the version number (100, 200, ...);
+            # the 500-byte quota keeps only the versions that fit, newest
+            # first — a rolling window, never the latest
+            ctrl = self._make(keep_last=5, max_staged_bytes=500)
+            for v in range(1, 5):
+                await ctrl.publish(v)
+            snap = ctrl.snapshot()
+            # after v4: [v2,v3,v4]=900 -> retire v2; [v3,v4]=700 -> retire
+            # v3; [v4]=400 fits
+            self.assertEqual(snap["relay/versions_live"], 1)
+            self.assertEqual(snap["relay/staged_bytes"], 400)
+            self.assertEqual(snap["relay/quota_retires"], 3)
+            self.assertEqual(ctrl.latest_version, 4)
+
+        asyncio.run(run())
+
+    def test_quota_keeps_fitting_pair(self):
+        async def run():
+            # v1 (100) + v2 (200) fit in 350; v3 (300) would overflow
+            ctrl = self._make(keep_last=5, max_staged_bytes=350)
+            for v in range(1, 3):
+                await ctrl.publish(v)
+            snap = ctrl.snapshot()
+            self.assertEqual(snap["relay/versions_live"], 2)
+            self.assertEqual(snap["relay/staged_bytes"], 300)
+            self.assertEqual(snap["relay/quota_retires"], 0)
+
+        asyncio.run(run())

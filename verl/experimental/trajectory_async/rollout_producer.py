@@ -66,6 +66,31 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
     accepts either granularity interchangeably.
     """
 
+    async def _lb(self):
+        """The load balancer behind this rollouter's LLM servers, if ready."""
+        mgr = getattr(self, "llm_server_manager", None)
+        return getattr(mgr, "global_load_balancer", None) if mgr is not None else None
+
+    async def replica_server_ids(self) -> list[str]:
+        """Sorted LB server ids — the repack bridge's replica identity map
+        (replica index i in the engine partition order must map to the i-th
+        entry here; override via async_training.repack.server_ids when the
+        two orderings diverge)."""
+        lb = await self._lb()
+        if lb is None:
+            return []
+        return sorted(await lb.get_all_servers.remote())
+
+    async def replica_inflight(self) -> dict[str, int]:
+        """Per-server in-flight request counts (the repack bridge's
+        idleness probe). Empty dict when the LB is not reachable."""
+        lb = await self._lb()
+        if lb is None:
+            return {}
+        server_ids = await lb.get_all_servers.remote()
+        counts = await asyncio.gather(*[lb.get_inflight_count.remote(sid) for sid in server_ids])
+        return dict(zip(server_ids, counts))
+
     async def set_relay_controller(self, relay_controller):
         """Attach the versioned-weight relay controller (optional; enables
         rollout-driven batch-boundary pulls)."""

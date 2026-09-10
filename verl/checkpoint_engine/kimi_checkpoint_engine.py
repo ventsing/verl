@@ -267,7 +267,17 @@ class KIMICheckpointEngine(CheckpointEngine):
             self.initialized = False
 
     @classmethod
-    def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadata: list[dict]):
+    def build_topology(
+        cls,
+        actor_wg_world_size: int,
+        rollout_world_size: int,
+        metadata: list[dict],
+        replica_partition: list[list[int]] | None = None,
+    ):
+        """Build per-rank init kwargs; ``replica_partition`` (global engine
+        ranks per rollout replica, tiling ``[actor_ws, actor_ws+rollout_ws)``)
+        additionally creates one process-group SUBGROUP per replica so pulls
+        can be scoped to a single replica (per-replica, any-time pulls)."""
         actor_wg_kwargs = {
             "method": ["init_process_group"] * actor_wg_world_size,
             "rank": list(range(0, actor_wg_world_size)),
@@ -282,6 +292,12 @@ class KIMICheckpointEngine(CheckpointEngine):
             "rollout_world_size": [rollout_world_size] * rollout_world_size,
             "master_metadata": [metadata[0]] * rollout_world_size,
         }
+        if replica_partition is not None:
+            # broadcast the same partition to every rank: new_group is a
+            # collective over the global group, so ALL ranks must create the
+            # subgroups in the same order
+            actor_wg_kwargs["replica_partition"] = [replica_partition] * actor_wg_world_size
+            rollout_kwargs["replica_partition"] = [replica_partition] * rollout_world_size
         return actor_wg_kwargs, rollout_kwargs
 
     def init_process_group(
@@ -290,17 +306,28 @@ class KIMICheckpointEngine(CheckpointEngine):
         actor_wg_world_size: int,
         rollout_world_size: int,
         master_metadata: MasterMetadata,
+        replica_partition: list[list[int]] | None = None,
     ):
         """Initialize the ckpt engine process group.
 
         Args:
             rank (int): The rank of the current process.
             world_size (int): The total number of processes.
+            replica_partition: optional per-replica rank groups (global
+                engine ranks, tiling the rollout range) — creates one
+                subgroup per replica so ``receive_weights_version`` can
+                pull into a SINGLE replica without synchronizing the fleet.
+                ``dist.new_group`` is collective, so every rank (actor
+                included) creates all subgroups in partition order.
         """
         self.rank = rank
         self.actor_wg_world_size = actor_wg_world_size
         self.rollout_world_size = rollout_world_size
         self.world_size = actor_wg_world_size + rollout_world_size
+        # per-replica pull state (None on actor ranks / legacy flat path)
+        self.replica_id: int | None = None
+        self.replica_group = None
+        self.replica_ranks: list[int] | None = None
 
         if not self.initialized:
             self.parameter_server = ParameterServer(
@@ -317,6 +344,25 @@ class KIMICheckpointEngine(CheckpointEngine):
 
             self.rollout_ranks = list(range(self.actor_wg_world_size, self.world_size))
             self.rollout_group = dist.new_group(self.rollout_ranks)
+
+            if replica_partition:
+                expected = set(self.rollout_ranks)
+                covered: set[int] = set()
+                for part in replica_partition:
+                    covered.update(part)
+                if covered != expected or len(covered) != sum(len(p) for p in replica_partition):
+                    raise ValueError(
+                        f"replica_partition {replica_partition} must exactly tile the "
+                        f"rollout ranks {self.rollout_ranks} (no overlap, no gap)"
+                    )
+                # every rank creates every subgroup (collective, same order);
+                # members receive a usable group, non-members an inert handle
+                for replica_id, part in enumerate(replica_partition):
+                    group = dist.new_group(part)
+                    if self.rank in part:
+                        self.replica_id = replica_id
+                        self.replica_group = group
+                        self.replica_ranks = list(part)
             self.initialized = True
 
     @torch.no_grad()
@@ -411,12 +457,16 @@ class KIMICheckpointEngine(CheckpointEngine):
     # every rank snapshots the gathered metas per version. The expensive part
     # (tensor transfer) is what becomes pull-based.
     #
-    # Topology note (cluster TODO): ``rollout_group`` spans ALL rollout ranks,
-    # and ``receive_tensor`` barriers on it — so with the stock single process
-    # group, pulls are fleet-synchronized (every replica pulls the same
-    # version together). Per-replica process groups (true per-replica,
-    # any-version pulls) are the remaining cluster item; with a single rollout
-    # replica the two are equivalent.
+    # Topology note: the stock single ``rollout_group`` spans ALL rollout
+    # ranks, and ``receive_tensor`` barriers on it — pulls are then
+    # fleet-synchronized (every replica pulls the same version together).
+    # Passing a ``replica_partition`` (see ``init_process_group`` /
+    # ``build_topology``) additionally installs one subgroup per replica, and
+    # ``receive_weights_version(version, replica_id=...)`` pulls over that
+    # subgroup alone: the H2D bucket partition and broadcast barriers touch
+    # only the replica's ranks, so OTHER replicas keep generating through it.
+    # The actor ranks serve reads from their registered CPU shards via the
+    # P2P store and need no subgroup membership.
 
     def _versioned_checkpoint_name(self, version: int) -> str:
         return f"{self.checkpoint_name}:v{version}"
@@ -458,6 +508,8 @@ class KIMICheckpointEngine(CheckpointEngine):
 
         # register + KEEP registered: these pinned CPU shards are the relay
         # memory for this version until unstage_version retires it
+        staged_bytes = sum(t.element_size() * t.nelement() for t in named_tensors.values())
+        staged_params = len(named_tensors)
         self.parameter_server.register_checkpoint(checkpoint_name, named_tensors=named_tensors)
         named_tensors = {}
         get_torch_device().empty_cache()
@@ -469,6 +521,9 @@ class KIMICheckpointEngine(CheckpointEngine):
         # this snapshot instead of re-gathering (which would be collective)
         self._versioned_metas[version] = self.parameter_server.get_metas()
         logger.info(f"Rank {self.rank} stage v{version} done, {time.time() - start_time:.2f}s")
+        # per-rank staged-size metrics: the driver sums these for host-memory
+        # quota accounting (relay controller's max_staged_bytes)
+        return {"staged_bytes": staged_bytes, "staged_params": staged_params}
 
     def gather_version_metas(self, version: int):
         """Rollout-side participation in a version's metadata gather.
@@ -484,12 +539,17 @@ class KIMICheckpointEngine(CheckpointEngine):
     async def receive_weights_version(
         self,
         version: int,
+        replica_id: int | None = None,
     ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
         """Pull a staged version into this rollout rank (anytime, repeatable).
 
         Same transfer path as ``receive_weights`` but scoped to the version's
-        checkpoint name and driven by the snapshotted metas (no re-gather, so
-        no collective beyond receive_tensor's own rollout-group barriers).
+        checkpoint name and driven by the snapshotted metas (no re-gather).
+        With ``replica_id``: pull over that replica's SUBGROUP — the H2D
+        bucket partition and the broadcast barriers involve only the
+        replica's ranks, so other replicas keep generating (requires the
+        replica partition from ``init_process_group``). Without: the legacy
+        fleet-synchronized rollout-group pull.
         """
         checkpoint_name = self._versioned_checkpoint_name(version)
         metas = self._versioned_metas.get(version)
@@ -498,6 +558,21 @@ class KIMICheckpointEngine(CheckpointEngine):
                 f"version {version} was never staged on this rank "
                 f"(known versions: {sorted(self._versioned_metas)})"
             )
+
+        if replica_id is not None:
+            if self.replica_id is None:
+                raise ValueError(
+                    f"per-replica pull requested (replica {replica_id}) but no replica "
+                    "partition was installed at init_process_group"
+                )
+            if self.replica_id != replica_id:
+                raise ValueError(
+                    f"per-replica pull for replica {replica_id} hit rank {self.rank} "
+                    f"of replica {self.replica_id} (driver dispatched to the wrong group)"
+                )
+            ranks_group, ranks = self.replica_group, self.replica_ranks
+        else:
+            ranks_group, ranks = self.rollout_group, self.rollout_ranks
 
         ps = self.parameter_server
         # single-slot restore around the transfer: concurrent pulls of other
@@ -508,7 +583,7 @@ class KIMICheckpointEngine(CheckpointEngine):
             start_time = time.time()
             total_bytes, total_params = 0, 0
             async for name, tensor in ps.receive_tensor(
-                checkpoint_name, self.rollout_group, self.rollout_ranks, self.bucket_size
+                checkpoint_name, ranks_group, ranks, self.bucket_size
             ):
                 total_bytes += tensor.element_size() * tensor.nelement()
                 total_params += 1

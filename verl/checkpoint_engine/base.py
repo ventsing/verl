@@ -373,7 +373,7 @@ class CheckpointEngineWorker(Worker):
         self.checkpoint_engine.gather_version_metas(version)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def pull_weights_version(self, version: int):
+    async def pull_weights_version(self, version: int, replica_id: int | None = None):
         """Pull a previously staged version into this rollout replica.
 
         Anytime, repeatable (the version stays registered on the actor side
@@ -381,8 +381,14 @@ class CheckpointEngineWorker(Worker):
         registration and loads them into the rollout server. The driver-side
         sequencing (abort in-flight requests → release kv_cache → pull →
         resume) mirrors the stock ``CheckpointEngineManager.update_weights``.
+
+        With ``replica_id`` the pull runs over that replica's process-group
+        SUBGROUP (kimi backend with a replica partition): the H2D bucket
+        partition and barriers involve only this replica's ranks — dispatch
+        this to that replica's worker group only, and other replicas keep
+        generating through it.
         """
-        weights = self.checkpoint_engine.receive_weights_version(version)
+        weights = self.checkpoint_engine.receive_weights_version(version, replica_id=replica_id)
         await self.server_adapter.update_weights(
             weights,
             global_steps=version,
@@ -462,8 +468,17 @@ class CheckpointEngineManager:
         self.actor_wg = actor_wg
         self.replicas = replicas
 
-    def build_process_group(self, rollout: RayWorkerGroup):
-        """Build process group for actor worker group and rollout replicas."""
+    def build_process_group(self, rollout: RayWorkerGroup, replica_partition: list[list[int]] | None = None):
+        """Build process group for actor worker group and rollout replicas.
+
+        Args:
+            rollout: worker group over every rollout replica's checkpoint
+                engine workers (worker order must match the ``replicas``
+                flatten order used to derive the partition).
+            replica_partition: optional per-replica global-rank groups —
+                backends that support it (kimi) install one process-group
+                subgroup per replica, enabling per-replica scoped pulls.
+        """
         actor_wg = self.actor_wg
 
         # 1. prepare all workers
@@ -473,8 +488,9 @@ class CheckpointEngineManager:
         )
 
         # 2. build communication topology between all workers
+        topology_kwargs = {"replica_partition": replica_partition} if replica_partition is not None else {}
         actor_wg_kwargs, rollout_kwargs = self.backend_cls.build_topology(
-            actor_wg.world_size, rollout.world_size, metadata
+            actor_wg.world_size, rollout.world_size, metadata, **topology_kwargs
         )
         for k, v in actor_wg_kwargs.items():
             assert len(v) == actor_wg.world_size, f"actor_wg_kwargs[{k}] must have length of {actor_wg.world_size}"

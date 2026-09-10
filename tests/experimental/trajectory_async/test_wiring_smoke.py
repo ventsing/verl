@@ -18,6 +18,7 @@ run on the cluster or CI:
     python -m unittest tests.experimental.trajectory_async.test_wiring_smoke -v
 """
 
+import inspect
 import sys
 import unittest
 
@@ -82,6 +83,56 @@ class TestP0Wiring(unittest.TestCase):
 
         for method in ("gather_version_metas", "pull_weights_version"):
             self.assertTrue(hasattr(CheckpointEngineWorker, method), f"engine worker missing {method}")
+
+    def test_per_replica_pull_signatures(self):
+        """The per-replica seam: engine partition + replica-scoped pulls."""
+        import inspect
+
+        from verl.checkpoint_engine.kimi_checkpoint_engine import KIMICheckpointEngine
+
+        engine_params = inspect.signature(KIMICheckpointEngine.receive_weights_version).parameters
+        self.assertIn("replica_id", engine_params)
+        init_params = inspect.signature(KIMICheckpointEngine.init_process_group).parameters
+        self.assertIn("replica_partition", init_params)
+        topology_params = inspect.signature(KIMICheckpointEngine.build_topology).parameters
+        self.assertIn("replica_partition", topology_params)
+        # stage_version reports staged sizes (host-memory quota accounting)
+        from verl.workers.engine_workers import TrainingWorker
+
+        self.assertTrue(hasattr(TrainingWorker, "stage_weights_version"))
+
+    def test_controller_and_bridge_wiring(self):
+        """The per-replica/quota controller + the repack closed loop."""
+        from verl.experimental.trajectory_async.relay_controller import (
+            RelayController,
+            build_relay_controller,
+            derive_replica_partition,
+            make_relay_controller_actor,
+        )
+
+        for method in ("pull_replica", "replica_version"):
+            self.assertTrue(hasattr(RelayController, method), f"controller missing {method}")
+        controller_params = inspect.signature(build_relay_controller).parameters
+        self.assertIn("max_staged_bytes", controller_params)
+
+        from verl.experimental.trajectory_async.repack_bridge import (
+            FleetRepackExecutor,
+            RolloutReplicaView,
+            build_repack_controller,
+            make_repack_controller_actor,
+        )
+
+        for method in ("refresh_idle", "migrate", "snapshot"):
+            self.assertTrue(hasattr(FleetRepackExecutor, method), f"bridge executor missing {method}")
+        for method in ("pull_weights", "running_requests", "remove_request", "admit_request"):
+            self.assertTrue(hasattr(RolloutReplicaView, method), f"replica view missing {method}")
+
+    def test_producer_lb_probes_exist(self):
+        """The producer exposes the LB probes the repack bridge consumes."""
+        from verl.experimental.trajectory_async.rollout_producer import TrajectoryLevelRollouter
+
+        for method in ("replica_server_ids", "replica_inflight"):
+            self.assertTrue(hasattr(TrajectoryLevelRollouter, method), f"producer missing {method}")
 
     def test_rollouter_row_message_fields(self):
         """A delivered row message carries the re-assembly keys; a failed row

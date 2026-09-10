@@ -25,8 +25,9 @@ the kimi/mooncake adapters).
 | `versioned_weight_store.py` | multi-version, pull-based weight store over P2P checkpoint engines: `VersionedWeightStore` (registry, retention GC, per-consumer state/lag) + `KimiP2PBackend` / `MooncakeP2PBackend` adapters + `make_p2p_backend` factory (`--p2p-backend`) + `FakeP2PBackend` (CPU tests) |
 | `relay_tier.py` | hierarchical relay tier (Laminar §4): `RelayService` / `RelayNode` (one per rollout machine; master stage = the whole actor stall; background chunk-pipelined chain distribution; anytime local pull of the latest complete version); trainer-side `format_fn` (HF format) + `reshard_fn` (rollout TP layout) hooks. Also the repack execution seam: `RolloutRepackExecutor` over `RolloutReplicaHandle` replicas (recompute or KV-transfer prefill, pluggable `kv_transfer_fn`) |
 | `repack.py` | active scheduling (Laminar §5): `ReplicaState` idleness (KVCache ramp-down), Algorithm 1 `best_fit_consolidation` (pure function), `RepackManager` (periodic + post-update triggers, drives any `RepackExecutor`), `MigrationResult` |
-| `relay_controller.py` | the Ray-native control plane of the versioned pull path: `RelayController` (version registry, retention, pull policy, metrics — CPU-testable) + `build_relay_controller` / `make_relay_controller_actor` wiring it over a real `CheckpointEngineManager` |
+| `relay_controller.py` | the Ray-native control plane of the versioned pull path: `RelayController` (version registry, retention + staged-bytes quota, fleet AND per-replica pull drivers with per-replica locking, metrics — CPU-testable) + `derive_replica_partition` + `build_relay_controller` / `make_relay_controller_actor` wiring it over a real `CheckpointEngineManager` |
 | `rollout_producer.py` | `TrajectoryLevelRollouter(FullyAsyncRollouter)` — the trajectory-level producer: one queue message per response (uid / traj_index / group_size / model_version stamped), FAILED rows on failure, batch-boundary weight pulls |
+| `repack_bridge.py` | the repack closed loop over the real rollout fleet (paper §5): `RolloutReplicaView` (LB in-flight probe + per-replica pull), `FleetRepackExecutor` (idle-replica refresh after each publish — the real §5 payoff on this stack; migration declined until request-control RPCs exist), `build_repack_controller` / `make_repack_controller_actor` |
 | `staleness_correction.py` | loss-side version-staleness correction: per-trajectory reweighting by version age (`staleness_weights`), adaptive clip scaling (`adaptive_clip_scale`), version-cohort GRPO baselines (`cohort_advantages`), cohort diagnostics; `apply_staleness_correction` attaches `staleness_weights` / `cliprange_scale` batch columns consumed by the policy loss (see below) |
 | `trajectory_async_main.py` | the launcher: `TrajectoryAsyncTaskRunner` wiring `TrajectoryLevelRollouter` + `TrajectoryAsyncTrainer` + MessageQueue + the relay controller (mirrors `fully_async_main.py`) |
 
@@ -152,21 +153,32 @@ KV movement); freed sources immediately pull the latest weights.
 7. `row_from_sample_batch` against real DataProto (`union(position)`
    slicing, `non_tensor_batch` `.item()` paths) — including the FAILED
    row shape (`DataProto(non_tensor_batch=...)` with no tensor batch).
-8. Pinned-memory accounting of `keep_last` versions on the actor ranks
-   (each version pins a full CPU shard copy per rank).
+8. ~~Pinned-memory accounting~~ — DONE: `stage_version` reports per-rank
+   staged bytes, `RelayController` sums them and enforces
+   `async_training.weight_store.max_staged_bytes` (retiring oldest live
+   versions beyond `keep_last` AND the byte quota, never the latest);
+   `relay/staged_bytes` / `relay/quota_retires` metrics. Cluster
+   validation of the accounting itself remains (run with the metric on).
 9. mooncake `stage_version`: per-version RDMA staging buffers + runtime
    `batch_register_memory`/`unregister_memory` semantics + per-version
    buffer descriptor distribution (the engine currently raises
    NotImplementedError by design).
-10. kimi per-replica process-group topology: today pulls are
-   fleet-synchronized on the single engine group; one group per replica
-   (plus serialized-but-per-replica receive) gives true per-replica,
-   any-version pulls — the P0 controller serializes behind one lock
-   until then.
-11. Concurrent collective safety: publish while a pull is in flight
-   (gather_metas vs receive_tensor on the same group) — currently
-   prevented by the controller lock; verify whether the kimi store
-   tolerates overlap before relaxing it.
+10. ~~kimi per-replica process-group topology~~ — DONE: `init_process_group`
+   takes a `replica_partition` (derived from the replicas' worker order;
+   `derive_replica_partition`) and installs one subgroup per replica;
+   `receive_weights_version(version, replica_id=...)` pulls over that
+   subgroup alone (H2D bucket partition + barriers touch only the
+   replica's ranks). `RelayController.pull_replica` drives it with
+   per-replica locks — distinct replicas pull CONCURRENTLY; fleet pulls
+   and publishes take all locks. Fleet-synchronized batch-boundary pulls
+   (producer) are unchanged. Cluster validation pending (TODO-6).
+11. Concurrent collective safety: fleet pulls/publishes take ALL
+   per-replica locks (ordered — deadlock-free); per-replica pulls take
+   only their own, so replicas pull concurrently on disjoint subgroups.
+   Overlap of publish (global gather) with a per-replica pull is still
+   driver-serialized (publish takes all locks); verify whether the kimi
+   store tolerates overlapping gather_metas + a subgroup receive_tensor
+   before relaxing further.
 12. Relay-tier chain distribution (`relay_tier.py`, CPU-verified) on real
    transports: one relay engine per rollout machine, master-side
    format/reshard hooks, chunk-pipelined chain — replaces the flat
@@ -176,10 +188,19 @@ KV movement); freed sources immediately pull the latest weights.
 
 **P2 — close the remaining gaps vs the paper**
 
-14. `RolloutReplicaHandle` implementation against the real rollout stack
-    (vLLM/sglang scheduler APIs) + a real `kv_transfer_fn`; wire
-    `RepackManager` + `RolloutRepackExecutor` into the trainer's update
-    path (post-publish trigger) and the rollout side.
+14. `RolloutReplicaHandle` against the real rollout stack — PARTIAL:
+    the closed loop is wired (`repack_bridge.py`: `RepackControllerActor`
+    owns the manager loop; the trainer's `_publish_versioned_weights`
+    tail fires `notify_update`; `async_training.repack` config), and the
+    paper-§5 payoff runs for real: IDLE replicas lagging the fresh
+    version pull it per-replica right after a publish
+    (`FleetRepackExecutor.refresh_idle`; idleness = LB in-flight == 0,
+    conservative on unknown). Still missing: cross-replica REQUEST
+    MIGRATION (needs per-request abort/redirect/admit RPCs on the
+    rollout servers — declined, never half-migrated, until then;
+    `repack/migrations_declined` shows the headroom), per-token KV
+    introspection (idle is request-count based), and a real
+    `kv_transfer_fn`.
 15. Relay tier elasticity: per the paper's §4.3, O(1) chain rebuild on
     relay failure, master failover (deliberately deferred with fault
     tolerance as a whole).
@@ -243,20 +264,29 @@ off-policy distance, the latter reweights what is admitted.
 | §3.1 partial response pool (fault-tolerance substrate) | ❌ TODO-16 |
 | §3.2 workflow steps ④-⑦ (interleaved train/publish/background distribute/anytime pull) | ✅ P0 wiring (`relay_controller.py` + `rollout_producer.py` batch-boundary pulls); chain distribution = TODO-12 |
 | §3.3 + §4.3 fault tolerance (heartbeat failover, chain rebuild, master failover, checkpoint recovery) | ❌ TODO-15 (deferred) |
-| §4.2 relay hierarchy: master + per-machine relays, resharding, chain-pipelined broadcast, PCIe local pull | ⚠️ P0 flat path via `relay_controller.py` (versioned stage + fleet pull, live); per-machine chain tier = `relay_tier.py` (CPU-verified) = TODO-12 |
+| §4.2 relay hierarchy: master + per-machine relays, resharding, chain-pipelined broadcast, PCIe local pull | ⚠️ flat path via `relay_controller.py` (versioned stage + fleet pull + PER-REPLICA subgroup pulls, live); per-machine chain tier = `relay_tier.py` (CPU-verified) = TODO-12 |
 | §4.2 actor stall = single push to master | ✅ `publish` returns after the master stage |
-| §5 repack: triggers, version grouping, KVCache idleness, Algorithm 1 Best-Fit + CanFit(`C_max` ∧ `B`), freed sources pull fresh weights | ✅ `repack.py` + `RolloutRepackExecutor`; real-stack handle TODO-14 |
+| §5 repack: triggers, version grouping, KVCache idleness, Algorithm 1 Best-Fit + CanFit(`C_max` ∧ `B`), freed sources pull fresh weights | ⚠️ closed loop LIVE (`repack_bridge.py`: post-publish + periodic triggers; idle replicas refresh to fresh versions per-replica); algorithm + executor CPU-verified; request migration + KV introspection = TODO-14 |
 | §8 convergence / off-policy stability under staleness | ⚠️ paper itself derives no bound (App. D = broadcast latency; App. C lists IS-based experience sampling as future work); our mitigation = bounded staleness (collector) + loss-side version-staleness correction (`staleness_correction.py`) |
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (112 tests; 103 stdlib-only + 2
-torch-gated adapter smokes + 4 ray-gated wiring smokes + 1 torch-gated
-kimi read-placement smoke + 2 torch-gated staleness batch-application
-smokes, all skipping gracefully without their deps):
+`tests/experimental/trajectory_async/` (144 tests; 132 stdlib-only +
+3 torch-gated adapter smokes + 2 torch-gated staleness batch-application
+smokes + 7 ray-gated wiring smokes, all skipping gracefully without
+their deps):
 
 * aggregator: completion order, duplicates, FAILED-eviction protocol,
   late-arrival guard, buffer limits, record invariants;
+* relay controller per-replica path: partition derivation (contiguous
+  blocks, workerless replicas skipped, single-replica degenerate),
+  `pull_replica` version tracking / idempotence / error paths,
+  concurrent per-replica pulls (lock overlap asserted), fleet pull
+  fan-out, staged-bytes quota (rolling retirement, never the latest);
+* repack bridge: idle-replica refresh (lagging pulls latest, busy/fresh/
+  unknown skipped, one failure never stops the rest), migration
+  declining (never half-migrates), manager hook + notify-update wakeup,
+  conservative no-mapping wiring;
 * staleness correction: weight families (decay/exp/none), normalization
   invariants, adaptive clip bounds + caps, cohort baselines (mixed-version
   groups, singleton fallback, degenerate rewards), diagnostics, config

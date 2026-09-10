@@ -255,8 +255,11 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
             )
 
         keep_last = int(weight_store_cfg.get("keep_last", 2))
+        max_staged_bytes = weight_store_cfg.get("max_staged_bytes", None)
         controller_cls = make_relay_controller_actor()
-        self.relay_controller = controller_cls.remote(self.checkpoint_manager, keep_last=keep_last)
+        self.relay_controller = controller_cls.remote(
+            self.checkpoint_manager, keep_last=keep_last, max_staged_bytes=max_staged_bytes
+        )
 
         # the rollout side drives pulls at ITS batch boundaries
         if not hasattr(self.rollouter, "set_relay_controller"):
@@ -268,11 +271,44 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
             )
         ray.get(self.rollouter.set_relay_controller.remote(self.relay_controller))
         logger.info(
-            "relay controller attached (backend=%s, keep_last=%d): publish is a "
-            "stage-only metadata phase; pulls are rollout-driven",
+            "relay controller attached (backend=%s, keep_last=%d, max_staged_bytes=%s): "
+            "publish is a stage-only metadata phase; pulls are rollout-driven",
             backend,
             keep_last,
+            max_staged_bytes,
         )
+
+        # repack closed loop (paper §5): a manager actor that refreshes IDLE
+        # replicas lagging the fresh version right after each publish
+        # (per-replica pulls) and periodically; migration-dependent
+        # consolidation waits on rollout-server request-control RPCs
+        repack_cfg = self.config.async_training.get("repack", None)
+        if repack_cfg is not None and repack_cfg.get("enabled", True):
+            from verl.experimental.trajectory_async.repack import RepackConfig
+            from verl.experimental.trajectory_async.repack_bridge import make_repack_controller_actor
+
+            field_names = RepackConfig.__dataclass_fields__
+            manager_cfg = RepackConfig(
+                **{k: v for k, v in dict(repack_cfg).items() if k in field_names}
+            )
+            server_ids = repack_cfg.get("server_ids", None)
+            if server_ids is None and hasattr(self.rollouter, "replica_server_ids"):
+                # convention: replica index i (engine partition order) <->
+                # i-th sorted LB server id; override via repack.server_ids
+                server_ids = ray.get(self.rollouter.replica_server_ids.remote())
+            repack_cls = make_repack_controller_actor()
+            self.repack_controller = repack_cls.remote(
+                self.relay_controller,
+                rollouter=self.rollouter,
+                server_ids=list(server_ids) if server_ids else None,
+                config=manager_cfg,
+            )
+            logger.info(
+                "repack controller attached (check_interval_s=%.1f, replicas=%d): "
+                "idle replicas refresh to fresh versions per-replica after each publish",
+                manager_cfg.check_interval_s,
+                len(server_ids) if server_ids else 0,
+            )
 
     def _fit_compute_advantage(self, batch):
         """Standard advantages + the version-staleness correction layer.
@@ -363,12 +399,24 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
             )
         snapshot = await controller.publish.remote(version)
         self.metrics.update(snapshot)
+        # repack post-update trigger (paper §5.1): the best moment to move
+        # idle replicas onto the fresh version — fire-and-forget; the repack
+        # actor's own loop does the work
+        repack = getattr(self, "repack_controller", None)
+        if repack is not None:
+            repack.notify_update.remote()
 
     async def fit(self):
         """Training loop; finalizes collector accounting on the way out."""
         try:
             return await super().fit()
         finally:
+            repack = getattr(self, "repack_controller", None)
+            if repack is not None:
+                try:
+                    ray.get(repack.stop.remote())
+                except Exception:  # noqa: BLE001 — teardown must not mask results
+                    logger.warning("repack controller stop failed", exc_info=True)
             leftover = self.trajectory_collector.finalize()
             if any(leftover.values()):
                 logger.warning(

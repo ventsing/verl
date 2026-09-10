@@ -95,6 +95,9 @@ weight_store_keep_last=2
 # per-token cross-version IS; this adds age-based reweighting etc.)
 stale_mode="decay"
 stale_lam=0.5
+# repack closed loop: idle replicas refresh to fresh versions per-replica
+repack_enabled="True"
+repack_interval_s=5.0
 
 python -m verl.experimental.trajectory_async.trajectory_async_main \
     data.train_files="${TRAIN_FILE}" \
@@ -185,4 +188,6 @@ python -m verl.experimental.trajectory_async.trajectory_async_main \
     async_training.weight_store.keep_last="${weight_store_keep_last}" \
     async_training.staleness_correction.mode="${stale_mode}" \
     async_training.staleness_correction.lam="${stale_lam}" \
+    async_training.repack.enabled="${repack_enabled}" \
+    async_training.repack.check_interval_s="${repack_interval_s}" \
     rollout.checkpoint_engine.backend="kimi_ckpt_engine"

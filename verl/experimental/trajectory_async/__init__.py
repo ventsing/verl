@@ -53,6 +53,12 @@ from verl.experimental.trajectory_async.relay_controller import (
     build_relay_controller,
     make_relay_controller_actor,
 )
+from verl.experimental.trajectory_async.relay_controller import derive_replica_partition
+from verl.experimental.trajectory_async.repack_bridge import (
+    FleetRepackExecutor,
+    RolloutReplicaView,
+    build_repack_controller,
+)
 from verl.experimental.trajectory_async.staleness_correction import (
     StalenessCorrectionConfig,
     adaptive_clip_scale,
@@ -119,6 +125,11 @@ __all__ = [
     "RelayController",
     "build_relay_controller",
     "make_relay_controller_actor",
+    "derive_replica_partition",
+    # repack closed loop over the real rollout fleet
+    "FleetRepackExecutor",
+    "RolloutReplicaView",
+    "build_repack_controller",
     # loss-side staleness correction (version-aware off-policy layer)
     "StalenessCorrectionConfig",
     "adaptive_clip_scale",
