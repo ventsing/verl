@@ -24,7 +24,7 @@ except ImportError:
     import _bootstrap  # noqa: F401
 
 from verl.experimental.trajectory_async.mini_batcher import MiniBatcher
-from verl.experimental.trajectory_async.trainer import grpo_group_advantages
+from verl.experimental.trajectory_async.group_collector import grpo_group_advantages
 from verl.experimental.trajectory_async.types import GroupRecord, TrajectorySample
 
 

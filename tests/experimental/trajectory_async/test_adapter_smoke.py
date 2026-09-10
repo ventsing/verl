@@ -125,6 +125,66 @@ class TestKimiAdapterSmoke(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_read_into_runs_on_consumer_engine(self):
+        """The receiver's engine drives the pull (stock semantics): the
+        constructor-side engine is the STAGER — read_into must execute
+        receive_tensor on consumer_ctx["engine"], not on self.engine."""
+
+        async def scenario():
+            class StubPS:
+                def __init__(self, owner):
+                    self.owner = owner
+                    self.checkpoints = {}
+
+                def register_checkpoint(self, name, named_tensors):
+                    self.checkpoints[name] = dict(named_tensors)
+
+                def gather_metas(self, name):
+                    pass
+
+                def unregister_checkpoint(self, name):
+                    self.checkpoints.pop(name, None)
+
+                async def receive_tensor(self, checkpoint_name, ranks_group, ranks, bucket_size):
+                    # the assertion: the receiver's OWN engine executes this
+                    self.owner.receive_calls.append((checkpoint_name, ranks_group, ranks))
+                    for name, tensor in self.checkpoints[checkpoint_name].items():
+                        yield name, tensor
+
+            class StubEngine:
+                def __init__(self):
+                    self.receive_calls = []
+                    self.parameter_server = StubPS(self)
+                    self.bucket_size = 1 << 20
+
+            stager, consumer = StubEngine(), StubEngine()
+            backend = KimiP2PBackend(stager, rollout_dtype=None)
+            store = VersionedWeightStore(backend, keep_last=2)
+
+            w = torch.arange(4, dtype=torch.float32)
+            await store.publish(7, [("w", w)])
+            # the consumer's PS mirrors the registration (in reality its
+            # metas snapshot points at the stager's memory)
+            consumer.parameter_server.checkpoints["actor:v7"] = {"w": w}
+
+            got = {}
+            await store.pull(
+                "replica-0",
+                version=7,
+                consumer_ctx={
+                    "engine": consumer,  # <- the receiver's engine
+                    "ranks_group": "rollout-group-0",
+                    "ranks": [3, 4],
+                },
+                sink=lambda n, t: got.__setitem__(n, t.clone()),
+            )
+            self.assertTrue(torch.equal(got["w"], w))
+            # receive ran on the CONSUMER engine, scoped to its group/ranks
+            self.assertEqual(consumer.receive_calls, [("actor:v7", "rollout-group-0", [3, 4])])
+            self.assertEqual(stager.receive_calls, [])
+
+        asyncio.run(scenario())
+
 
 @unittest.skipUnless(HAS_TORCH, "torch required for adapter smoke tests")
 class TestMooncakeAdapterSmoke(unittest.TestCase):

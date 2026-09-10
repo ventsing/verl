@@ -819,6 +819,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.base_sync_done = True
         set_expandable_segments(True)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def stage_weights_version(self, version: int):
+        """Stage the current actor weights as a PULLABLE version (multi-version path).
+
+        Engine-level twin of :meth:`update_weights`' engine branch: fetches the
+        actor engine's per-tensor params and hands them to the checkpoint
+        engine's ``stage_version`` — which registers them under a
+        version-scoped name WITHOUT unregistering, so rollout replicas can pull
+        this version at any later time. The pull path is driven by the rollout
+        side (see verl/experimental/trajectory_async); the rollout ranks must
+        run ``gather_version_metas(version)`` concurrently (gather_metas is a
+        collective over the whole engine group).
+
+        Args:
+            version: The version number (trainer global step) to stage under.
+        """
+        per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+        metrics = await self.checkpoint_engine.stage_version(version, per_tensor_param)
+        return metrics or {}
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
         """Execute checkpoint engine method.

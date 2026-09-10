@@ -21,7 +21,7 @@ becomes *trainable* only once all ``rollout.n`` of its responses arrived.
 Completed groups are emitted in completion order, which decouples the
 mini-batch composition from the prompt submission order.
 
-Delivery protocol (guaranteed by the rollouter):
+Delivery protocol (guaranteed by the producer):
 
 * trajectories of a group may arrive in any order, interleaved with other
   groups' trajectories;

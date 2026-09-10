@@ -46,17 +46,102 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-
-from verl.experimental.trajectory_async.multi_replica_engine import MultiReplicaEngine, ReplicaState
-from verl.experimental.trajectory_async.relay_tier import RepackExecutor
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ReplicaState:
+    """Point-in-time snapshot of one rollout replica, for the repack
+    planner. Built either by the executor probing the real rollout
+    engines (see ``RolloutRepackExecutor.snapshot``) or by tests."""
+
+    replica_id: int
+    version: int
+    kv_used: int
+    kv_capacity: int  # C_max
+    kv_prev: int  # previous tick's kv_used (ramp-down detection)
+    num_running: int
+    num_waiting: int
+    batch_quota: int  # assignment quota per activation
+    max_running: int  # B: roofline decode batch bound
+    pulling: bool
+    routable: bool
+
+    @property
+    def kv_util(self) -> float:
+        return self.kv_used / self.kv_capacity
+
+    @property
+    def idle_candidate(self) -> bool:
+        """Laminar §5.2 idleness: the KVCache is below capacity, no refill
+        pressure remains, and the running count is below the roofline batch
+        bound ``B`` — Algorithm 1 line 3.
+
+        The paper detects "no refill" as a declining KVCache (``C_used <
+        C_prev``, the post-plateau fall in Fig. 9); engines whose KV only
+        grows with decode progress on a flat-low straggler would never
+        show a strict decline, so the equivalent direct signal — an empty
+        waiting queue (completions are not being refilled) — is accepted
+        as well.
+        """
+        below_cap = self.kv_used < self.kv_capacity
+        no_refill = self.num_waiting == 0 or self.kv_used < self.kv_prev
+        return below_cap and no_refill and self.num_running < self.max_running
+
+    @property
+    def has_work(self) -> bool:
+        return self.num_running + self.num_waiting > 0
+
+
+@dataclass
+class MigrationResult:
+    """Outcome of one repack execution round (the KV-denominated report).
+
+    ``requests_moved`` counts trajectories migrated; ``kv_tokens_moved``
+    is the KVCache footprint that traveled with them (running requests
+    only — waiting ones hold no KV yet); ``sources_emptied`` is how many
+    source replicas actually became workless (free to pull fresh weights
+    and re-enter routing), which can be less than planned when the
+    execution-time CanFit re-check rejects part of the work.
+    """
+
+    plan: list[tuple[int, int]]
+    requests_moved: int = 0
+    kv_tokens_moved: int = 0
+    sources_emptied: int = 0
+
+    @property
+    def sources_planned(self) -> int:
+        return len({src for src, _ in self.plan})
+
+
+class RepackExecutor(Protocol):
+    """Execution seam of the repacker (Laminar §5.1 step ③).
+
+    Anything providing a point-in-time replica snapshot, fleet KV
+    utilization, per-round migration cost, and plan execution can be
+    driven by :class:`RepackManager`. The real binding is
+    :class:`~verl.experimental.trajectory_async.relay_tier.RolloutRepackExecutor`
+    over rollout replicas.
+    """
+
+    repack_overhead_s: float
+
+    def snapshot(self) -> list[ReplicaState]:
+        ...
+
+    def fleet_kv_util(self) -> float:
+        ...
+
+    async def migrate(self, plan: list[tuple[int, int]]) -> MigrationResult:
+        ...
+
+
+@dataclass
 class RepackConfig:
-    # periodic trigger cadence; the paper suggests e.g. 5s — the mock runs
-    # faster than a real cluster, so default tighter
+    # periodic trigger cadence; the paper suggests e.g. 5s
     check_interval_s: float = 1.0
     # a version group needs at least this many idle candidates to bother
     min_group_candidates: int = 2
@@ -159,19 +244,18 @@ class RepackManager:
     """Rollout manager loop: monitor replicas, plan, execute migrations.
 
     One instance drives one **repack executor** — anything implementing
-    :class:`~verl.experimental.trajectory_async.relay_tier.RepackExecutor`:
-    the demo's :class:`MultiReplicaEngine` (mock transport) or
+    :class:`RepackExecutor`: the real binding is
     :class:`~verl.experimental.trajectory_async.relay_tier.RolloutRepackExecutor`
-    over real rollout replicas. The algorithm
+    over rollout replicas. The algorithm
     (:func:`best_fit_consolidation` + :class:`ReplicaState` idleness) is
-    executor-agnostic. Run the manager as a task alongside the rollouter
-    and trainer; call :meth:`notify_update` from the trainer's
+    executor-agnostic. Run the manager as a task alongside the rollout and
+    training loops; call :meth:`notify_update` from the trainer's
     weight-publish path for the immediate post-update trigger.
     """
 
     def __init__(
         self,
-        engine: MultiReplicaEngine | RepackExecutor,
+        engine: RepackExecutor,
         config: RepackConfig | None = None,
         on_plan=None,
     ) -> None:

@@ -359,6 +359,36 @@ class CheckpointEngineWorker(Worker):
             wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
         )
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def gather_version_metas(self, version: int):
+        """Rollout-side participation in staging a versioned checkpoint.
+
+        ``gather_metas`` is an all_gather_object over the whole engine group,
+        so every rank — actor AND rollout — must call it while the actor ranks
+        run ``stage_version``. The driver fires this on the rollout worker
+        group concurrently with ``stage_weights_version`` on the actor group.
+        After this, each rollout rank holds the version's metadata snapshot
+        and can pull the version at any time.
+        """
+        self.checkpoint_engine.gather_version_metas(version)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def pull_weights_version(self, version: int):
+        """Pull a previously staged version into this rollout replica.
+
+        Anytime, repeatable (the version stays registered on the actor side
+        until retired): reads the retained tensors from the actor's P2P
+        registration and loads them into the rollout server. The driver-side
+        sequencing (abort in-flight requests → release kv_cache → pull →
+        resume) mirrors the stock ``CheckpointEngineManager.update_weights``.
+        """
+        weights = self.checkpoint_engine.receive_weights_version(version)
+        await self.server_adapter.update_weights(
+            weights,
+            global_steps=version,
+            wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
+        )
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
@@ -375,6 +405,19 @@ class CheckpointEngineWorker(Worker):
 
 
 _worker_cls = ray.remote(CheckpointEngineWorker)
+
+
+def build_replica_worker_group(replicas: list) -> "RayWorkerGroup":
+    """Build ONE worker group over all workers of the given rollout replicas —
+    the same temporary group :meth:`CheckpointEngineManager.update_weights`
+    builds per call, exposed for callers that dispatch to the rollout-side
+    checkpoint-engine workers outside a full collective update (e.g. the
+    versioned pull path's ``gather_version_metas`` / ``pull_weights_version``).
+    """
+    workers = []
+    for replica in replicas:
+        workers.extend(replica.workers)
+    return RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
 
 
 class CheckpointEngineManager:

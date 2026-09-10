@@ -13,14 +13,13 @@
 # limitations under the License.
 """The REAL trainer for trajectory-level async RL — separate deployment.
 
-``run_demo.py`` + ``trainer.py`` are the CPU mock of this contract; this
-module is the deployable trainer, structured after
+This is the deployable trainer, structured after
 ``verl/experimental/fully_async_policy/fully_async_trainer.py``:
 
 * **separate deployment** — inherited from :class:`FullyAsyncTrainer`
   (itself a :class:`SeparateRayPPOTrainer`): training workers are
   ``Role.Actor`` on the trainer GPUs, rollout replicas live on the rollout
-  side managed by a rollouter, connected through the message queue; weight
+  side managed by the rollout stack, connected through the message queue; weight
   sync goes through the ``CheckpointEngineManager`` over the replicas.
 * **trajectory-level consumption** — the stock trainer collects samples
   by COUNT (``required_samples``), where one queue message is a whole
@@ -44,15 +43,16 @@ output). On that path this trainer's collector is redundant; what ports
 is the relay tier (`relay_tier.py`) and the repack executor. See the
 README section "Relation to the v1 separate-async stack".
 
-Weight versioning: this trainer keeps the stock push-based
+Weight versioning: two paths. Default = the stock push-based
 ``CheckpointEngineManager.update_weights`` (versioned by
-``global_steps``). The multi-version pull-based store
-(:class:`VersionedWeightStore` with kimi/mooncake backends) attaches at
-``_fit_update_weights`` — enabled with
-``async_training.weight_store.backend`` — where publish goes through the
-versioned store and replicas pull at their batch boundaries (the
-Laminar-style no-lockstep path; cluster validation required, see the
-package README's real-engine wiring guide).
+``global_steps``). With ``async_training.weight_store`` set, the
+Laminar-style multi-version pull path takes over: the trainer only
+PUBLISHES (``stage_weights_version`` on the actor ranks — version-scoped
+registration in the kimi P2P store, no tensor push; the metadata gather
+is the whole trainer-side stall) through the relay controller, and the
+rollout side pulls at its batch boundaries
+(``rollout_producer.py``). See ``relay_controller.py`` and the package
+README's real-engine wiring guide.
 """
 
 from __future__ import annotations
@@ -225,6 +225,48 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
             self.metrics["trajectory_async/batch_version_span_max"] = max(spans)
         self.metrics["trajectory_async/current_param_version"] = self.current_param_version
 
+    async def _setup_checkpoint_manager(self):
+        """After the stock manager setup: when the multi-version pull path is
+        selected, also build the relay controller (a Ray actor over the actor
+        worker group + rollout replicas) and hand it to the rollouter so its
+        group submissions pull weights at their batch boundaries."""
+        await super()._setup_checkpoint_manager()
+
+        weight_store_cfg = self.config.async_training.get("weight_store", None)
+        if weight_store_cfg is None:
+            return
+
+        from verl.experimental.trajectory_async.relay_controller import make_relay_controller_actor
+
+        backend = weight_store_cfg.get("backend", "kimi")
+        if backend == "kimi":
+            config_backend = self.config.actor_rollout_ref.rollout.checkpoint_engine.get("backend", None)
+            if config_backend not in ("kimi_ckpt_engine", None):
+                logger.warning(
+                    "weight_store.backend=kimi but rollout.checkpoint_engine.backend=%s; "
+                    "the versioned stage path requires the kimi engine",
+                    config_backend,
+                )
+        else:
+            raise NotImplementedError(
+                f"async_training.weight_store.backend={backend!r}: only 'kimi' is "
+                "implemented for the multi-version pull path (mooncake needs "
+                "per-version RDMA staging buffers — see the package README TODO)"
+            )
+
+        keep_last = int(weight_store_cfg.get("keep_last", 2))
+        controller_cls = make_relay_controller_actor()
+        self.relay_controller = controller_cls.remote(self.checkpoint_manager, keep_last=keep_last)
+
+        # the rollout side drives pulls at ITS batch boundaries
+        ray.get(self.rollouter.set_relay_controller.remote(self.relay_controller))
+        logger.info(
+            "relay controller attached (backend=%s, keep_last=%d): publish is a "
+            "stage-only metadata phase; pulls are rollout-driven",
+            backend,
+            keep_last,
+        )
+
     async def _fit_update_weights(self):
         """Weight sync with a multi-version pull-based extension point.
 
@@ -252,43 +294,27 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
         return marked_timer("timing_s/param_sync", self.timing_raw)
 
     async def _publish_versioned_weights(self, version: int) -> None:
-        """Stage the current actor weights as version ``version``.
+        """Stage the current actor weights as pullable version ``version``.
 
-        Extension point for the multi-version pull-based weight path; NOT
-        wired by default because weight tensors never leave the actor
-        workers in the stock flow — the driver cannot hand them to the
-        store. The deployment recipe (see the package README, Real-engine
-        wiring guide):
-
-        1. add a worker-side engine method ``stage_version(version)`` that
-           registers the actor's CPU shards WITHOUT unregistering (kimi:
-           ``parameter_server.register_checkpoint(f"actor:v{version}", ...)``
-           ; mooncake: stage into a per-version RDMA buffer) — executed via
-           the existing generic dispatch
-           ``actor_wg.execute_checkpoint_engine("stage_version", version)``;
-        2. construct the hierarchical :class:`RelayService` in the driver:
-           ONE relay node per rollout machine, each wrapping that machine's
-           engine (``make_p2p_backend`` per node over the kimi/mooncake
-           adapters). ``publish`` applies the trainer-side hooks —
-           ``format_fn`` converts actor-internal params to HF format,
-           ``reshard_fn`` converts to the rollout TP layout — and stages at
-           the master only: that single hop IS the actor stall, the chain
-           distribution to the other relays runs in the background
-           (Laminar §4.2);
-        3. replicas pull at their batch boundaries from their COLOCATED
-           relay (anytime; the local relay's latest complete version) —
-           ``MultiReplicaEngine._drain_cycle`` over
-           ``RelayService.pull`` is the reference implementation.
-
-        Raises NotImplementedError until that wiring lands on a cluster.
+        The real path (P0 topology): the relay controller fires
+        ``stage_weights_version`` on every actor rank (CPU offload +
+        version-scoped registration in the kimi P2P store, metas gather — no
+        tensor push, no unregister) concurrently with ``gather_version_metas``
+        on the rollout ranks (gather_metas is collective over the whole
+        engine group). That metadata phase is the WHOLE trainer-side stall;
+        the version stays pullable until retention retires it, and the
+        rollout side pulls at its batch boundaries
+        (``TrajectoryLevelRollouter._maybe_pull_weights`` →
+        ``RelayControllerActor.pull``). Never blocks training compute.
         """
-        raise NotImplementedError(
-            "async_training.weight_store.* selects the multi-version pull-based "
-            "weight path; wire the worker-side stage_version + the RelayService "
-            "tier + per-replica pulls first "
-            "(verl/experimental/trajectory_async/README.md — Real-engine wiring "
-            "guide; see relay_tier.py)"
-        )
+        controller = getattr(self, "relay_controller", None)
+        if controller is None:
+            raise RuntimeError(
+                "weight_store configured but no relay controller was built "
+                "(expected _setup_checkpoint_manager to attach one)"
+            )
+        snapshot = await controller.publish.remote(version)
+        self.metrics.update(snapshot)
 
     async def fit(self):
         """Training loop; finalizes collector accounting on the way out."""

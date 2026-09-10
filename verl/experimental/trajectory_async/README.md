@@ -1,815 +1,240 @@
-# Trajectory-Level Asynchronous RL (experimental)
+# Trajectory-level async RL on verl (experimental)
 
-A minimal, self-contained implementation of **trajectory-level asynchronous
-RL** on verl: the streaming unit between rollout and training is a *single
-response* (one trajectory of one prompt), not a prompt group and not a
-batch. Groups are re-assembled on the trainer side for group-based
-advantage estimation (GRPO/DAPO), so algorithm semantics stay identical to
-synchronous training.
+An implementation of trajectory-level asynchronous RL training after the
+Laminar design (arXiv 2510.12633): single-response delivery granularity,
+trainer-side GRPO group reassembly, a hierarchical relay tier for
+asynchronous weight synchronization over verl's P2P checkpoint engines,
+and KVCache-aware trajectory repacking.
 
-The package is stdlib-only at its core (`asyncio` + `dataclasses`), runs and
-is unit-tested on a bare CPU machine, and ships an A/B demo that replays an
-*identical* workload (same response lengths, same failures) under both
-delivery granularities. Real-engine (GPU) wiring is a thin adapter — see
-the [wiring guide](#real-engine-wiring-guide) below.
+**Real components only.** Everything in this package is deployable code
+or a pure algorithm; nothing simulates the system to pretend a feature
+exists. What is not implemented yet is a tracked TODO (below), not a
+mock. The only test double is `FakeP2PBackend` — a bytes-level transport
+for CPU tests of the real store/tier orchestration (real deployments use
+the kimi/mooncake adapters).
 
-## Positioning: what already exists in verl
-
-| Existing | Streaming unit | Where groups are formed |
-|---|---|---|
-| `trainer.v1.trainer_mode=separate_async/colocate_async` | prompt group (`ReplayBufferAsync` refills per group) | rollout side |
-| `verl.experimental.fully_async_policy` | prompt group — "sample" = 1 prompt × `rollout.n` rows, delivered once all `n` responses settled | rollout side (`RolloutSample.full_batch`) |
-| **this package** | **single response** — each of the `n` responses crosses the queue the moment it finishes | **trainer side** (`GroupAggregator`) |
-
-`fully_async_policy` already streams sample-by-sample, so the long tail
-*across* prompts is largely hidden. What remains is the long tail *within* a
-group: a group is delivered when its slowest of `n` responses finishes, and
-a terminally-failed response traditionally costs its whole group. This
-package shrinks the delivery/retry unit from `n` responses to 1.
-
-## Architecture
-
-```
-rollout side                              train side
-───────────                              ──────────
-PromptSource
-   │ one prompt = n independent requests
-   ▼
-TrajectoryRollouter ──┐
-  per trajectory:     │  TrajectorySample          TrajectoryTrainer
-  gen → reward → push │  (single response,          consume (FIFO)
-                      │   opaque payload,              │
-                      ▼   version, reward)             ▼
-               TrajectoryQueue ──────────────►  optional per-trajectory
-               (asyncio in-process;             preprocessing stage
-                reuse fully_async_policy's        (policy: per-trajectory
-                MessageQueue actor for            | on-group-complete)
-                multi-process)                       │
-                                                     ▼
-                                              GroupAggregator        ┌──────────────┐
-                                              (uid → n/n rows)  ────►│ MiniBatcher  │
-                                              evicts groups whose     │ K groups =   │
-                                              siblings died           │ one update   │
-                                                                      └──────┬───────┘
-                                                                             ▼
-                                                              update (serialized), version += 1,
-                                                              GRPO group advantages, staleness
-                                                              accounting, weight-sync hook
-```
-
-Components (all under `verl/experimental/trajectory_async/`):
+## Module map
 
 | Module | Role |
 |---|---|
-| `types.py` | `TrajectorySample` (minimum transmission unit — the analogue of `RolloutSample` shrunk to one response), `GroupRecord` (reassembled group with version-span/staleness stats) |
-| `trajectory_queue.py` | in-process asyncio queue with close semantics + stats |
-| `group_aggregator.py` | trainer-side 攒组: per-uid buffering, exactly-once completion emission in completion order, duplicate tolerance, eviction on terminal failure / staleness / buffer limit |
-| `mini_batcher.py` | collects complete groups, emits mini-batches of `ppo_mini_batch_size` groups |
-| `rollouter.py` | both delivery modes over one generation backend; per-trajectory retries; reward scoring mirrors `AgentLoopWorker` (per-row tasks) |
-| `trainer.py` | consumption pipeline: queue → preprocessing (two policies) → aggregation → mini-batch → update; GRPO advantage helper; staleness drop; version timeline + inherent-staleness / tokens-per-iteration metrics |
-| `mock_rollout.py` | slot-bounded fake inference server: continuous batching, lognormal long-tail lengths, deterministic per-request failures, version tracking |
-| `multi_replica_engine.py` | multi-replica rollout cluster mock: per-replica KVCache lifecycle (ramp-up/plateau/ramp-down), per-activation batch quota, roofline decode-batch bound `B`, per-replica weight versions, in-flight migration API |
-| `weight_relay.py` | hierarchical parameter service **timing mock** (Laminar §4): actor→master push (the only actor stall), background chain broadcast, per-replica pull-anytime — used by the demo's `--weight-store relay` |
-| `relay_tier.py` | **real** hierarchical relay tier (Laminar §4) over the P2P backends: `RelayService` (one `RelayNode` per rollout machine; publish = master stage only — the actor stall; background chunk-**pipelined** chain distribution; anytime local pull takes the local relay's latest complete version) with trainer-side hooks (`format_fn` = HF-format conversion, `reshard_fn` = rollout-TP layout) + the repack executor seam (`RepackExecutor` protocol, `RolloutRepackExecutor` over `RolloutReplicaHandle` replicas with pluggable KV transfer) |
-| `versioned_weight_store.py` | **real** multi-version, pull-based weight management over P2P checkpoint engines: `VersionedWeightStore` (registry, retention GC, per-consumer state) + `KimiP2PBackend` / `MooncakeP2PBackend` adapters + `FakeP2PBackend` (owner-memory + remote-read semantics with bytes payloads) |
-| `repack.py` | active scheduling (Laminar §5): idleness detection (KVCache ramp-down), Algorithm 1 Best-Fit trajectory consolidation within weight-version groups, periodic + post-update triggers |
-| `group_collector.py` | the consumption core of the REAL trainer, factored stdlib-only: `TrajectoryBatchCollector` accepts both producer granularities (group-level `RolloutSample` and trajectory-level single rows), re-assembles groups, emits exactly-`ppo_mini_batch_size` fresh batches; `row_from_sample_batch` adapts real DataProto rows |
-| `async_trainer.py` | **the real trainer** — `TrajectoryAsyncTrainer(FullyAsyncTrainer)`: separate deployment (inherits `SeparateRayPPOTrainer` semantics: `Role.Actor` training workers, rollout replicas on the rollout side, message-queue intake, `CheckpointEngineManager` weight sync), overriding `_get_samples_from_queue` with group-aware trajectory-level collection + `trajectory_async/*` metrics, and a multi-version pull-based weight extension point |
-| `run_demo.py` | CLI A/B benchmark with data-equivalence verification (`--compare` delivery granularity, `--compare-repack` active scheduling) |
-
-### The real trainer vs. the mock
-
-`trainer.py` + `run_demo.py` simulate the consumption contract on CPU;
-`async_trainer.py` deploys it on the real stack, structured after
-`verl/experimental/fully_async_policy/fully_async_trainer.py`:
-
-```python
-@ray.remote(num_cpus=10)
-class TrajectoryAsyncTrainer(FullyAsyncTrainer):   # SeparateRayPPOTrainer lineage
-    # separate deployment: Role.Actor workers here, rollout replicas on the
-    # rollout side (rollouter + AgentLoopManager), message queue in between.
-
-    async def _get_samples_from_queue(self):
-        # stock: collect by COUNT — one message = one whole prompt group
-        # (rollout.n rows), the slowest response gates every batch.
-        # ours: every message is split into per-trajectory rows and fed to
-        # TrajectoryBatchCollector, which re-assembles GRPO groups and only
-        # emits a batch of ppo_mini_batch_size COMPLETE, FRESH groups — so a
-        # trajectory-level producer (one response per message) drops in,
-        # while the stock group-level producer keeps working unchanged.
-        ...
-    async def _fit_update_weights(self):
-        # default: stock CheckpointEngineManager push (versioned by
-        # global_steps). async_training.weight_store.backend selects the
-        # multi-version pull path (stage-only publish, per-replica pulls
-        # at batch boundaries) — the README wiring guide is the recipe.
-        ...
-```
-
-`TrajectoryBatchCollector` (the part worth testing without a cluster)
-is stdlib-only and covered by `test_group_collector.py`: both producer
-granularities through one path, complete-group-only batches, staleness
-refusal without batch shrinkage, and the reconciliation identity
-`trained + evicted + dropped_stale + leftover + incomplete == groups
-started`.
-
-## Correctness invariants
-
-* A group is trained **iff** all `n` trajectories arrived and none
-  terminally failed; evicted groups are accounted, never trained.
-* Both delivery modes over the same seeds train on **identical data**
-  (same responses, lengths, rewards, attempt counts) — verified
-  automatically by the demo and by unit tests. Only timing may differ.
-* `FAILED` sentinels for a group are emitted only after all sibling tasks
-  settled, so no trajectory can arrive after its group's eviction (the
-  aggregator additionally keeps a bounded dead-uid guard).
-* Updates are serialized (one policy update at a time); preprocessing and
-  aggregation keep flowing during an update.
-* Staleness is accounted per trajectory (`model_version` at request start):
-  `GroupRecord.staleness/oldest_staleness/version_span` give the exact
-  off-policy distance of every update.
-* Complete groups that never fill a mini-batch are **counted**
-  (`trainer/groups_leftover`), never silently lost: trained + stale-dropped
-  + evicted + leftover reconciles with the number of prompted groups.
-
-## The honest benefit model
-
-Measured on the included A/B demo (same workload both modes; H20-scale
-ratios are not claimed — this is a CPU mock):
-
-**1. Failure/retry granularity (the big one).** A terminally-failed
-response costs 1 response, not its group's `n − 1` completed siblings:
-
-```bash
-python -m verl.experimental.trajectory_async.run_demo --compare \
-    --failure-rate 0.08 --group-retry none
-```
-
-```
-groups trained                          8             24   <- trajectory
-groups dropped on rollout side         14              0   <- trajectory
-wasted trajectory attempts (dropped)   93              0   <- trajectory
-mean group staleness (versions)       0.5            2.5
-```
-
-Trajectory-level delivery saved 16 of 24 groups and wasted zero completed
-work, at the cost of *higher staleness*: the straggler groups it saves were
-generated under older versions. That staleness/coverage trade-off is the
-knob `--staleness-drop` controls.
-
-**2. Timing is *not* a benefit by itself under group aggregation.** With no
-trainer-side per-trajectory work and no failures, both modes are
-timing-equivalent by design: rewards already overlap generation inside
-`AgentLoopWorker` (per-row tasks), and a group becomes trainable when its
-slowest response arrives — regardless of where the waiting happens. The
-default `--compare` run shows exactly this (identical wall time and data).
-Anyone promising large throughput gains from delivery granularity alone,
-under strict GRPO group semantics, is selling snake oil.
-
-**3. Trainer-side preprocessing is where timing re-enters.** If the trainer
-does per-response work (old-log-prob compute, tokenization, trainer-side
-rewards), *when* that work starts matters:
-
-* `preprocess_policy=per-trajectory` — starts on arrival, overlaps the
-  siblings' remaining generation: **better wall time**, but early responses
-  of slow groups head-of-line-block fast groups in the preprocess queue
-  (**later first mini-batch**), and the work is speculative (wasted when
-  the group later dies).
-* `preprocess_policy=on-group-complete` — starts when the group completed
-  at the aggregator: no speculation, earliest first mini-batch, identical
-  timing to group-level delivery while keeping the failure/memory
-  granularity benefits.
-
-```bash
-python -m verl.experimental.trajectory_async.run_demo --compare \
-    --preprocess-latency-s 0.5 --num-prompts 48 --mini-batch-groups 6
-# wall time 14.05s vs 13.84s (trajectory wins)
-# time to first mini-batch 3.02s vs 5.28s (HOL blocking — try
-#   --preprocess-policy on-group-complete to remove it)
-```
-
-**4. Structural benefits (not timed by the mock).** Queue/memory units are
-single responses (n× finer, smoother occupancy); per-trajectory version
-labels enable exact intra-group off-policy accounting — the observability
-`fully_async/partial/*` metrics approximate at group level.
-
-**Costs.** Intra-group version mixing becomes possible (weight sync while
-siblings still generate — harmless for reward-based advantages, visible in
-`version_span`); the trainer holds partial groups in memory; more queue
-operations; saved stragglers raise average staleness (point 1).
-
-## Quick start
-
-```bash
-# unit tests (bare CPython is enough; no numpy/ray/torch needed)
-python -m unittest discover -s tests/experimental/trajectory_async -t .
-
-# end-to-end scenarios as runnable scripts (examples/gspo_trainer style,
-# every knob an env var; see examples/trajectory_async/README.md)
-bash examples/trajectory_async/run_vs_sync.sh                # sync vs trajectory-async (headline)
-bash examples/trajectory_async/run_repack_ab.sh              # active-migration A/B
-bash examples/trajectory_async/run_failure_isolation.sh      # retry vs all-or-nothing
-bash examples/trajectory_async/run_staleness_control.sh      # freshness bound
-bash examples/trajectory_async/run_weight_store_p2p.sh       # weight plane (fake|kimi|mooncake)
-
-# single-mode run with per-event timeline
-python -m verl.experimental.trajectory_async.run_demo --mode trajectory
-
-# honest A/B with data-equivalence verification
-python -m verl.experimental.trajectory_async.run_demo --compare
-
-# Laminar-style cluster: 4 rollout replicas + relay weights + repack
-python -m verl.experimental.trajectory_async.run_demo --mode trajectory \
-    --replicas 4 --num-prompts 48 --mini-batch-groups 8 --update-time-s 0.5
-
-# same, but weights flow through the real multi-version pull-based store
-# (--p2p-backend fake|kimi|mooncake; kimi/mooncake need a cluster engine)
-python -m verl.experimental.trajectory_async.run_demo --mode trajectory \
-    --replicas 4 --weight-store p2p --p2p-backend fake --num-prompts 48 \
-    --mini-batch-groups 8 --update-time-s 0.5
-
-# active-scheduling A/B: repack off vs on, same workload
-python -m verl.experimental.trajectory_async.run_demo \
-    --replicas 4 --num-prompts 48 --mini-batch-groups 8 --update-time-s 0.5 \
-    --compare-repack
-```
-
-> On a machine without verl's heavy dependencies, `import verl` fails in
-> `verl/__init__.py` (numpy/ray). The test suite bootstraps around it via
-> `tests/experimental/trajectory_async/_bootstrap.py` (a package stub that
-> skips the heavy `__init__`). To run the demo on such a machine:
->
-> ```bash
-> python3 -c "import sys; sys.path.insert(0, 'tests/experimental/trajectory_async'); \
->     import _bootstrap; from verl.experimental.trajectory_async import run_demo; \
->     run_demo.main()" --compare
-> ```
-
-Key knobs (see `run_demo.py --help` for all): `--n` (rollout.n),
-`--mini-batch-groups` (ppo_mini_batch_size in groups), `--length-sigma`
-(long-tail severity), `--failure-rate`, `--max-retries`,
-`--preprocess-latency-s`/`--preprocess-policy`, `--update-time-s`,
-`--staleness-drop`, `--group-retry {per-trajectory,none}` (the
-all-or-nothing baseline mirrors the granularity a group-level delivery
-operates at); multi-replica layer: `--replicas`, `--batch-per-replica`
-(assignment quota per activation), `--max-running` (roofline bound `B`),
-`--kv-capacity-tokens` (`C_max`), `--repack {on,off}`,
-`--repack-interval-s`, `--repack-overhead-s`, `--actor-stall-s`,
-`--relay-hop-s`, `--pcie-pull-s`.
-
-## Active scheduling à la Laminar (multi-replica layer)
-
-Everything above (`--replicas 1`, the default) is **passive**: FIFO
-delivery, static admission semaphores, reactive staleness drop. The
-multi-replica layer adds the *active* scheduling of
-[Laminar](https://arxiv.org/abs/2510.12633) (ByteDance Seed + HKU,
-EuroSys'26 — the paper behind
-[《Laminar: 让RL后训练不再等最慢轨迹》](https://zhuanlan.zhihu.com/p/1967188401481557802) and
-[《解锁5.48倍吞吐量》](https://zhuanlan.zhihu.com/p/2074054741554996645)),
-mapped 1:1 onto mock components:
-
-| Laminar concept | This implementation |
-|---|---|
-| trajectory-level asynchrony (generate/consume each trajectory independently) | the whole package (delivery unit = single response) |
-| relay workers: actor pushes to ONE master relay, chain-pipelined RDMA broadcast to per-machine relays (pinned CPU memory), rollout pulls anytime (§4) | **real path**: `VersionedWeightStore` + `KimiP2PBackend`/`MooncakeP2PBackend` (see the next section); **timing mock**: `WeightRelayService` — `publish()` blocks only `--actor-stall-s`, chain arrival at relay *i* = publish + `--relay-hop-s`·(i+1), `pull(replica)` waits for chain propagation + `--pcie-pull-s` |
-| rollout pulls weights at batch completion / when released (no lockstep, version mixing across rollouts) | `MultiReplicaEngine._drain_cycle`: when a replica's activation drains (or a repack empties it) it pulls the latest version, then becomes routable again |
-| dynamic repack (§5): periodic check (e.g. 5s) + immediate trigger after each weight update | `RepackManager.run()` loop (`--repack-interval-s`) + `notify_update()` called from the trainer's publish path |
-| idleness metric: KVCache in ramp-down (`C_used < min(C_max, C_prev)`) and remaining requests < roofline bound `B` (§5.2) | `ReplicaState.idle_candidate` — the mock adds the equivalent direct signal `num_waiting == 0` because per-request KV grows with decode progress, so a flat-low straggler never shows a strict decline |
-| Algorithm 1 Best-Fit consolidation within a weight-version group; sources sorted by footprint; destination = becomes most densely packed; `CanFit`: `C_load ≤ C_max ∧ N_load ≤ B` | `repack.best_fit_consolidation()` — same pseudocode (line-for-line comments), run per version group by `RepackManager.repack_once()` |
-| freed rollouts pull the latest weights and produce fresh on-policy trajectories | migration empties a source → its drain cycle pulls a newer version → the rollouter routes new prompts there under the fresh version |
-
-**Metrics** follow the paper's evaluation section: the headline number is
-throughput in **tokens/s per RL iteration** (tokens in the trained batch ÷
-interval between consecutive actor update completions —
-`trainer/tokens_per_s`), plus **inherent staleness** per trajectory
-(trainer version at the trajectory's finish time minus the version that
-generated it; Laminar reports typically < 3), avg/peak **KVCache
-utilization**, actor stall total, pull chain-wait, and the repack
-activity counters. **Active migration is measured in KV terms**
-(`repack/*`): `requests_moved`, `kv_tokens_moved` (the KVCache footprint
-that traveled), `sources_released` (planned) vs `sources_emptied`
-(actually freed — the execution-time `CanFit` re-check can reject part of
-a plan), and a per-round history `repack/rounds` recording each round's
-plan, what moved, and fleet KVCache utilization **before → after** the
-migration (plus idle-replica count before/after) — the direct causal
-measure of what one repack round did to KV utilization.
-
-Measured with the A/B above (CPU mock, 4 replicas, 48 prompts × 8
-responses, lognormal σ=1 lengths):
-
-```
-metric                                  repack off   repack on
-wall time (s)                              43.201      35.363  <- repack wins
-mean throughput (tok/s)                   28964        32986  <- repack wins (+14%)
-avg KVCache utilization                    0.491       0.593  <- repack wins (+21%)
-mean inherent staleness (versions)         0.388       0.471  <- no-repack wins
-mean group staleness (versions)            1.125       1.312  <- no-repack wins
-```
-
-The scenario script `examples/trajectory_async/run_repack_ab.sh` runs the
-same A/B with tighter straggling (quota 12/replica) and prints the full
-per-round KV effect, e.g.:
-
-```
-wall time (s)                                      72.063         44.451  <- repack wins
-mean throughput (tok/s)                           14824          31210     <- repack wins
-avg KVCache utilization                            0.2821         0.4821  <- repack wins
-repack: 23 rounds, 203 trajectories moved, 228640 KV tokens migrated,
-        22/28 planned sources actually emptied, 11.5s total overhead
-round 3: plan=[[1,3],[0,2]] moved=16 reqs (15872 KV tokens),
-         KV util 0.374 -> 0.454, idle replicas 0 -> 2
-```
-
-The same shape as the paper's §8 (repack: +26% generation throughput,
-+14.8% KVCache utilization, 0.69s overhead): throughput and utilization
-up, a slightly staler tail as the price — the straggler trajectories that
-get consolidated finish later, and freed replicas pull *newer* weights so
-the system mixes more versions. `--compare-repack` also verifies data
-equivalence: repack only moves in-flight work between same-version
-replicas, so both runs train on identical data.
-
-**Fidelity notes** (where the mock deliberately simplifies): no KV
-preemption is modeled — admission reserves prompt + mean length, so
-lognormal overshoot can transiently push utilization past `C_max`;
-per-request decode rate is constant below `B` (the roofline observation);
-migration moves request state instantly at a flat `--repack-overhead-s`;
-the relay is a timing model, not a real RDMA/UCX fabric; and the trainer
-is one in-process actor, so `complete_time`/version timelines share one
-clock (in a real deployment the rollouter would stamp versions from the
-synchronizer, as `fully_async_policy` does today).
-
-## Multi-version weight management (the real path)
-
-`weight_relay.py` is a timing model. The deployable path is two layers:
-
-* `versioned_weight_store.py` — a **pull-based, multi-version weight
-  store** built on the two verl checkpoint engines that already speak
-  peer-to-peer —
-`kimi_ckpt_engine` (KIMICheckpointEngine: actor shards registered in a P2P
-store, receivers read owner memory directly via `receive_tensor`) and
-`mooncake` (MooncakeCheckpointEngine: RDMA `TransferEngine` with registered
-buffers and direct `transfer_sync_read` between sessions).
-
-**What the store adds over the stock engines** (stock = one-shot
-collective broadcast, buffer reused immediately):
-
-1. **Versioned retention.** Each published version gets a
-   version-scoped name (`actor:v{N}`) and *stays in P2P-readable memory*
-   until the retention policy evicts it (`keep_last`, default 2).
-   - kimi: `register_checkpoint("actor:v3", cpu_shards)` + `gather_metas`
-     — and, unlike stock `send_weights`, **no unregister**; the actor's
-     registered CPU shards *are* the relay memory (Laminar's pinned-CPU
-     placement).
-   - mooncake: per-version RDMA-registered staging buffers (instead of
-     reusing the transient `buf`), advertised as
-     `(session_id, ptr, nbytes, buckets)` in the manifest.
-2. **Pull, not broadcast.** `publish` returns as soon as the version is
-   staged — the actor stall is just offload + register. Every replica
-   pulls *when it decides to* (batch boundary / repack release) via a
-   direct peer read:
-   - kimi: the (already-patched) `receive_tensor` scoped to that
-     replica's own `ranks`/`ranks_group` — requires building one process
-     group **per replica** instead of the stock single group over
-     actor + all rollout workers;
-   - mooncake: `transfer_sync_read` from the actor's registered session
-     into the replica's local registered buffer — no chain, no barrier,
-     no coordination with other replicas.
-3. **Per-consumer accounting.** The store tracks each replica's current
-   version, pull count, bytes and **lag** (`latest − consumer_version`)
-   — the input to version-group repacking and the staleness metrics, in
-   one place.
-
-* `relay_tier.py` — the **hierarchical relay** (Laminar §4) on top of the
-  store's backends: ONE relay node per rollout machine (its backend wraps
-  that machine's engine instance, so relay memory is machine-local).
-  `publish` stages at the **master relay only** — that single hop is the
-  whole actor stall — then a background task distributes the version
-  along the relay chain, **chunk-pipelined** (relay `i` starts chunk `k`
-  as soon as relay `i−1` staged it; verified on CPU: total ≈
-  `(chunks + hops − 1) × chunk_time` vs `hops × chunks × chunk_time`
-  sequential). Rollout replicas pull from their **colocated** relay
-  anytime and get its latest *complete* version — a pull never waits for
-  the broadcast (the only wait is the startup edge, before the first
-  version finished arriving locally). Trainer-side hooks at publish:
-  `format_fn` (actor params → **HF format**) and `reshard_fn`
-  (trainer coords → rollout TP layout), both applied once at the master.
-
-```python
-# driver side (replaces CheckpointEngineManager.update_weights' barrier):
-service = RelayService(
-    backends=[make_p2p_backend("kimi", engine=relay_engine_i)
-              for relay_engine_i in relay_engines],   # one per rollout machine
-    config=RelayTierConfig(num_relays=len(relay_engines), chunks=4),
-    format_fn=to_hf_format,          # trainer params -> HF format
-    reshard_fn=to_rollout_tp_layout, # trainer coords -> rollout TP layout
-)
-# publish returns after the master stage — the actor resumes training
-# immediately; the chain distribution runs in the background.
-await service.publish(global_steps, actor.get_per_tensor_param())
-
-# replica side, at its own batch boundary (or when a repack releases it):
-version = await service.pull(replica_id)   # reads the COLOCATED relay
-```
-
-Cross-process, the service is the control plane: wrap it in a Ray actor
-whose methods are exactly `publish` / `latest_published_version` / `pull`
-/ `wait_for_distribution` (the surface is kept Ray-actor-friendly for
-that reason); version identity is the `global_steps` that already flows
-through the `CheckpointEngineManager.update_weights` stack.
-
-**Switching backends** happens at one point — `make_p2p_backend` (CLI:
-`--p2p-backend {fake,kimi,mooncake}`):
-
-```python
-from verl.experimental.trajectory_async import make_p2p_backend, VersionedWeightStore
-
-# CPU demo / tests: no cluster needed, latencies model the transport
-backend = make_p2p_backend("fake", stage_latency_s=0.5, read_latency_s=0.2)
-
-# real cluster: wrap the stock engine constructed the standard way
-engine = CheckpointEngineRegistry.new("kimi_ckpt_engine", bucket_size=..., **engine_kwargs)
-#   ... prepare() / build_topology() / init_process_group() as CheckpointEngineManager does
-#   (kimi additionally needs one process group PER REPLICA for per-consumer pulls)
-backend = make_p2p_backend("kimi", engine=engine)
-
-engine = CheckpointEngineRegistry.new("mooncake", bucket_size=..., **engine_kwargs)
-backend = make_p2p_backend("mooncake", engine=engine,
-                           staging_device="cpu",   # pinned host memory (Laminar relay placement)
-                           chunk_bytes=None)       # defaults to the engine's bucket size
-
-store = VersionedWeightStore(backend, keep_last=2)   # same store either way
-```
-
-Selecting `kimi`/`mooncake` without an engine raises `ValueError` with
-the exact wiring — so the CPU demo exits with instructions instead of
-failing deep inside the transport.
-
-**What is tested vs. what needs a cluster.** The orchestration —
-registry, monotonic versioning, retention eviction (reads of evicted
-versions fail), independent per-consumer pulls, pinned pulls, concurrent
-publish/pull interleavings, byte accounting, the demo-engine contract,
-and the backend-selection factory — runs and is unit-tested over
-`FakeP2PBackend`, which reproduces the owner-memory + remote-read
-lifecycle with bytes payloads. The kimi/mooncake adapters isolate every
-real engine call behind lazy imports and are written against
-`verl/checkpoint_engine/kimi_checkpoint_engine.py` and
-`mooncake_checkpoint_engine.py` as checked in; they need torch + RDMA +
-the engine packages to execute and should be validated on a cluster
-before use (notably: mooncake's `unregister_memory` name, and kimi's
-per-replica process-group topology).
-
-The CPU demo can run the *real* orchestration over the fake transport:
-
-```bash
-python -m verl.experimental.trajectory_async.run_demo --mode trajectory \
-    --replicas 4 --weight-store p2p --compare-repack \
-    --num-prompts 48 --mini-batch-groups 8 --update-time-s 0.5
-# report adds store/* stats, e.g.:
-#   store/retained_versions: [3, 4]
-#   store/consumers: replica-0={'version': 3, 'lag': 1, ...}, ...
-```
-
-with `--keep-last-versions` (retention) and `--weight-mb` (fake payload
-size) as knobs; `--weight-store relay` (default) keeps the chain-broadcast
-timing model instead.
-
-## Debugging on a real machine
-
-### Which layer needs which dependency
-
-| Layer | Needs | How |
-|---|---|---|
-| L0 orchestration: store, repack, engine, demo, all CPU tests | nothing (stdlib) | `python -m unittest discover -s tests/experimental/trajectory_async -t .` |
-| L1 engine import checks | pip packages only (below) | `python -c ...` snippets |
-| L2 adapter smoke: real kimi/mooncake backend code over stub engines | torch (+ the two packages for the engines they stub) | `python -m unittest tests.experimental.trajectory_async.test_adapter_smoke -v` |
-| L3 real transfers | GPUs + RDMA cluster | deployment wiring + the validation points below |
-
-### Installing the engines
-
-```bash
-# kimi backend — PyPI 'checkpoint-engine' (github MoonshotAI/checkpoint-engine);
-# the [p2p] extra pulls mooncake-transfer-engine>=0.3.5, which is exactly
-# the p2p store KimiP2PBackend wraps
-pip install "checkpoint-engine[p2p]"
-
-# mooncake backend — PyPI 'mooncake-transfer-engine' (github kvcache-ai/Mooncake)
-pip install mooncake-transfer-engine
-```
-
-* ⚠️ **do NOT `pip install mooncake`** — that PyPI name is an unrelated
-  project (a spoken-language tool). The transfer engine is
-  `mooncake-transfer-engine`.
-* Both adapters additionally need torch (checkpoint-engine's floor is
-  2.5.0), and verl's engine classes need ray plus vllm or sglang (kimi's
-  parameter server uses the vllm NCCL backend; mooncake's
-  `StatelessProcessGroup` import falls back to sglang).
-* mooncake transfers need RDMA — verl's engine hardcodes the `"rdma"`
-  protocol. For single-machine debugging without RDMA NICs, soft-RoCE
-  works: `sudo rdma link add rxe0 type rxe netdev <nic>` (then the
-  `device_name` argument selects it).
-* Wheels: mooncake-transfer-engine ships cp310–cp313 manylinux x86_64 /
-  aarch64.
-
-### L1: import checks
-
-```bash
-python -c "from mooncake.engine import TransferEngine; print('mooncake ok')"
-python -c "from checkpoint_engine.ps import ParameterServer; print('kimi ps ok')"
-python - <<'EOF'
-from verl.checkpoint_engine import CheckpointEngineRegistry
-for backend in ("kimi_ckpt_engine", "mooncake"):
-    try:
-        CheckpointEngineRegistry.get(backend)
-        print(backend, "registered")
-    except ValueError as e:
-        print(backend, "MISSING:", e)
-EOF
-```
-
-### L3: what only a cluster can validate
-
-1. **kimi per-replica topology** — `KimiP2PBackend.read_into` passes one
-   replica's own `ranks`/`ranks_group` to `receive_tensor`; the stock
-   manager builds a single group over actor + all rollout workers, so a
-   per-replica variant of `build_topology` must be built and exercised.
-2. **mooncake `unregister_memory`** — the name/semantics of the
-   TransferEngine unregister counterpart to `batch_register_memory`.
-3. **concurrent direct reads** — several replicas issuing
-   `transfer_sync_read` against the actor's registered memory at once.
-
-### Logging and breakpoints
-
-* `VERL_LOGGING_LEVEL=INFO` (or `DEBUG`) — the stock engines' knob;
-  the trajectory_async modules use standard `logging` too.
-* `store.snapshot()` (per-consumer version/lag/bytes),
-  `engine.stats.snapshot()`, `repack.stats.snapshot()` — call at any
-  await point.
-* Useful breakpoints: `VersionedWeightStore.publish` / `.pull`,
-  `KimiP2PBackend.stage` / `.read_into`, `MooncakeP2PBackend.stage` /
-  `.read_into`, `MultiReplicaEngine._drain_cycle` (the pull timing),
-  `RepackManager.repack_once` (the scheduling decision).
-
-## Real-engine wiring guide
-
-The data plane is engine-agnostic: `TrajectorySample.payload` is opaque and
-the rollouter only needs an object with
-`async generate(seed, prompt_tokens) -> (num_tokens, latency_s,
-model_version)`. To move from the mock to a real deployment:
-
-1. **Engine adapter.** Replace `MockRolloutEngine` with a thin wrapper over
-   `FullyAsyncAgentLoopManager` (`verl/experimental/fully_async_policy/fully_async_rollouter.py`).
-   The whole trajectory-level trick at the rollout side is submitting each
-   sibling as its own single-row request instead of one `n`-row request:
-
-   ```python
-   # per trajectory task (uid, traj_index):
-   gen_input = single_row_dataproto            # repeat(1), not repeat(n)
-   output = await manager.generate_sequences_single(gen_input)
-   traj = TrajectorySample(uid=uid, traj_index=i, group_size=n,
-                           payload=output,          # 1-row DataProto
-                           model_version=version_at_submit,
-                           num_tokens=response_len)
-   ```
-
-   Prefix caching makes the shared prompt cheap across the `n` requests.
-
-2. **Queue.** For multi-process deployment reuse
-   `fully_async_policy`'s `MessageQueue` Ray actor verbatim —
-   `put_sample`/`get_sample` are payload-agnostic; serialize
-   `TrajectorySample` with `ray.cloudpickle` exactly as `RolloutSample` is
-   today. `max_queue_size` then counts *trajectories* (n× finer units).
-
-3. **Group assembly.** A completed `GroupRecord` with `n` single-row
-   `DataProto` payloads is assembled with `DataProto.concat` — the same
-   shape `RolloutSample.full_batch` has after generation, so
-   `assemble_batch_from_rollout_samples`-style postprocessing applies
-   unchanged.
-
-4. **Rewards** stay rollouter-side per trajectory (already the
-   `AgentLoopWorker` behavior: per-row `_compute_score`).
-
-5. **Weight sync / partial rollout.** For multi-replica deployments the
-   weight path is the [multi-version store above](#multi-version-weight-management-the-real-path):
-   the trainer publishes each version to the P2P store (kimi registered
-   shards / mooncake staging buffers), each replica pulls at its own
-   batch boundary, and the repack manager decides when a released
-   replica refreshes. In verl terms this replaces
-   `CheckpointEngineManager.update_weights`'s global barrier
-   (`fully_async_policy`'s `ParameterSynchronizer` cadence included) with
-   one publisher + per-replica pulls. Note the interplay with
-   trajectory-level delivery: aborting in-flight work at a sync boundary
-   costs strictly less than at group granularity (already-safe
-   trajectories have already crossed the queue), and under pull-based
-   sync a replica never aborts for weights at all — it finishes its
-   batch first, then pulls. The `version_span` metric quantifies the
-   within-group mixing that the resulting version skew introduces.
-
-6. **Critic / replay / DAPO filters** attach at the mini-batch stage
-   (`MiniBatcher` output), where the data shape is identical to
-   `fully_async_policy`'s consumption point.
-
-## Relation to the async-RL literature
-
-This is the "group-preserving" corner of the design space: AReaL-style
-sample-level async training additionally decouples *advantage estimation*
-from the group (running baselines / decoupled PPO) so training can start
-before groups complete. That changes the algorithm; it is deliberately out
-of scope here. `GroupAggregator` is the seam where such an estimator would
-plug in — everything upstream (delivery, retries, versioning) already works
-at trajectory granularity.
-
-Laminar is the systems-side complement: it keeps group-based algorithms
-intact and buys throughput with cluster-level engineering — trajectory-level
-streaming, relay-based asynchronous weight sync, and KVCache-aware repack.
-The multi-replica layer above is a faithful mock of exactly that systems
-design; a real deployment would swap `WeightRelayService` for the actual
-parameter service and `MultiReplicaEngine` for rollout replicas behind a
-routing manager.
+| `types.py` | data model: `TrajectorySample` (one response: uid, traj_index, model_version, reward, attempts, payload), `GroupRecord`, `TrajectoryStatus` |
+| `group_aggregator.py` | trainer-side GRPO group reassembly from per-trajectory rows; FAILED-sentinel eviction protocol; late-arrival guard; buffer limits |
+| `group_collector.py` | consumption core: `TrajectoryBatchCollector` forms exact mini-batches of complete, fresh groups under staleness control, with full accounting (trained / evicted / dropped-stale / leftover / incomplete); `row_from_sample_batch` adapts verl `DataProto` rows (traj_index / model_version / rollout_failed / uid); `grpo_group_advantages` (group-preserving contract) |
+| `mini_batcher.py` | exact-size mini-batch formation over completed groups |
+| `async_trainer.py` | `TrajectoryAsyncTrainer(FullyAsyncTrainer)` — the real separate-deployment trainer (ray remote), overrides sample intake to route through the collector; emits `trajectory_async/*` metrics |
+| `versioned_weight_store.py` | multi-version, pull-based weight store over P2P checkpoint engines: `VersionedWeightStore` (registry, retention GC, per-consumer state/lag) + `KimiP2PBackend` / `MooncakeP2PBackend` adapters + `make_p2p_backend` factory (`--p2p-backend`) + `FakeP2PBackend` (CPU tests) |
+| `relay_tier.py` | hierarchical relay tier (Laminar §4): `RelayService` / `RelayNode` (one per rollout machine; master stage = the whole actor stall; background chunk-pipelined chain distribution; anytime local pull of the latest complete version); trainer-side `format_fn` (HF format) + `reshard_fn` (rollout TP layout) hooks. Also the repack execution seam: `RolloutRepackExecutor` over `RolloutReplicaHandle` replicas (recompute or KV-transfer prefill, pluggable `kv_transfer_fn`) |
+| `repack.py` | active scheduling (Laminar §5): `ReplicaState` idleness (KVCache ramp-down), Algorithm 1 `best_fit_consolidation` (pure function), `RepackManager` (periodic + post-update triggers, drives any `RepackExecutor`), `MigrationResult` |
+| `relay_controller.py` | the Ray-native control plane of the versioned pull path: `RelayController` (version registry, retention, pull policy, metrics — CPU-testable) + `build_relay_controller` / `make_relay_controller_actor` wiring it over a real `CheckpointEngineManager` |
+| `rollout_producer.py` | `TrajectoryLevelRollouter(FullyAsyncRollouter)` — the trajectory-level producer: one queue message per response (uid / traj_index / group_size / model_version stamped), FAILED rows on failure, batch-boundary weight pulls |
+| `trajectory_async_main.py` | the launcher: `TrajectoryAsyncTaskRunner` wiring `TrajectoryLevelRollouter` + `TrajectoryAsyncTrainer` + MessageQueue + the relay controller (mirrors `fully_async_main.py`) |
 
 ## Relation to the v1 separate-async stack (TransferQueue replay buffer)
 
-Recent upstream work moved the separate-async experience storage to
-[TransferQueue](https://github.com/Ascend/TransferQueue)
-(`verl/trainer/ppo/v1/`) — check before building on this package's
-trainer path, because parts of the Laminar data plane now exist upstream
-natively:
+verl's newer separate-async path (`verl/trainer/ppo/v1/`) stores
+experiences in a TransferQueue-backed `ReplayBuffer` (per-trajectory
+keys `{uid}_{session_id}_{index}`, group re-assembly, oldest-first
+sampling, staleness eviction `max_off_policy_threshold` drop/wait, DAPO
+filter, failure eviction, refill, custom-sampler hook) fed by
+`agent_loop_tq.py` (one `kv_put` per agent-loop output) — i.e. the
+Laminar experience buffer and the trajectory-level producer exist
+upstream on that path.
 
-| Laminar concept (§3.1) | v1 stack (TransferQueue) | this package |
-|---|---|---|
-| trajectory-level production | `agent_loop_tq.py`: one `kv_put` per agent-loop output, key `{uid}_{session_id}_{index}`; prompt-level tag tracks GRPO group status (pending/running/finished/failure) | `TrajectoryRollouter` (mock) + `TrajectoryBatchCollector`'s trajectory-level entry (contract-ready) |
-| experience buffer (writer/sampler/eviction) | `replay_buffer.py`: `ReplayBuffer`/`ReplayBufferAsync` polls TransferQueue, re-assembles GRPO groups, samples **oldest-global-steps-first**, evicts stale groups (`max_off_policy_threshold`, strategies `drop`/`wait`), DAPO-filters degenerate-reward groups, evicts failure groups, refills via `refill_fn`; pluggable custom sampler | `GroupAggregator` + `MiniBatcher` + collector: FIFO completion order, staleness refusal at mini-batch formation, FAILED-sentinel eviction — the MessageQueue-path equivalent |
-| prompt pool | streaming dataloader + `refill_fn` dispatch | `PromptRecord` list (mock) |
-| partial response pool (fault tolerance) | **still missing** | still missing (deferred) |
+Positioning: `TrajectoryAsyncTrainer` extends the `fully_async_policy`
+**MessageQueue** path, where the collector provides the group
+re-assembly + staleness control. On the v1 TransferQueue path the
+collector is redundant. What this package adds on EITHER path: the
+**relay tier** (weights) and the **repack** algorithm + executor, plus
+the alignment audit. Combining the relay tier + repack with the v1 stack
+is the most direct route to a full Laminar deployment.
 
-Positioning: `TrajectoryAsyncTrainer` extends the
-`fully_async_policy` **MessageQueue** path (group-level `RolloutSample`
-delivery; the collector re-splits rows to gain trajectory-level
-accounting). On the **v1 TransferQueue path the collector is redundant**
-— `ReplayBuffer` already re-assembles groups from per-trajectory keys
-with staleness eviction and refill. What this package adds on EITHER
-path: the multi-version **relay tier** (`relay_tier.py`, weights), the
-**repack** algorithm + executor seam, and the simulation/A-B harness
-with data-equivalence invariants. Combining the relay tier + repack with
-the v1 stack is the most direct route to a full Laminar deployment.
+## Real-engine wiring guide
 
-## Alignment audit vs the Laminar paper
+### Weights: multi-version pull (P0 wiring — implemented)
 
-Full re-read of arXiv 2510.12633 against this implementation. What is
-aligned, and the honest gaps:
+The stock `CheckpointEngineManager.update_weights` is a one-shot collective
+broadcast: every actor rank `send_weights` (register + gather + UNregister),
+every rollout rank receives, all in lockstep. The versioned pull path
+replaces it (kimi engine only for now):
 
-| Paper element | Status | Where / why missing |
-|---|---|---|
-| §3 trajectory-level asynchrony: per-trajectory generation/consumption, no lockstep (Fig. 3(e)) | ✅ mock + real path | delivery unit = one response; trainer-side `GroupAggregator`/`TrajectoryBatchCollector`; no static staleness bound — staleness emerges per trajectory (§6) |
-| §3.1 rollout manager: monitor + repack | ✅ mock | `RepackManager`; real-path counterpart is the AgentLoopManager (deployment) |
-| §3.1 **data module: prompt pool / partial response pool / experience buffer with pluggable sampling + eviction** | ✅ upstream (v1) / ⚠️ here | verl's v1 stack HAS the real one: `ReplayBuffer` over TransferQueue (oldest-first sampling, staleness eviction `max_off_policy_threshold` drop/wait, DAPO filter, failure eviction, refill, custom sampler hook) + streaming-dataloader prompt pool. This package's collector is the FIFO MessageQueue-path equivalent. Still missing everywhere: the **partial response pool** (fault-tolerance substrate) |
-| §3.2 workflow steps ①-⑦ (generate → buffer → train interleaved → publish → background distribute → anytime pull) | ✅ mock | `run_demo` pipeline; timing mock + `VersionedWeightStore` |
-| §3.3 + §4.3 **fault tolerance** (heartbeat failover, rollout re-init, machine eviction, interrupted-trajectory redirect to same-version rollouts, relay-chain O(1) rebuild, master failover, trainer ckpt recovery) | ❌ missing | only per-trajectory *retry from scratch* exists. The paper's redirect **reuses partial progress** via the partial response pool; not modeled in mock or real path. Biggest missing pillar |
-| §4.2 relay hierarchy: master relay + per-machine relays, **resharding by rollout TP**, chain-pipelined RDMA broadcast, PCIe local pull | ⚠️ mock only | `WeightRelayService` models the *timing*; the real path (`KimiP2PBackend`/`MooncakeP2PBackend`) has replicas read the actor's registered memory **directly** — no relay tier, no local copies (actor NIC becomes the bottleneck at scale), no resharding. Cluster engineering gap |
-| §4.2 actor stall = single push to master, training resumes immediately | ✅ both | mock: `publish()` blocks only `--actor-stall-s`; real: stage-only publish (register without unregister) |
-| §5 repack: triggers (periodic + post-update), version grouping, KVCache ramp-down idleness, Algorithm 1 Best-Fit + CanFit(`C_max` ∧ `B`), freed replicas pull fresh weights | ✅ mock | `repack.py` + `multi_replica_engine.py`, line-for-line Algorithm 1; per-round KV metrics (`repack/rounds`) |
-| §8 metrics: throughput, inherent staleness, avg KVCache utilization, repack overhead | ✅ mock | `trainer/tokens_per_s`, `inherent_staleness`, `engine/kv_util_*`, `repack/overhead_total_s`; end-to-end throughput in the sync A/B |
-| §8 headline: sync vs trajectory-async (Fig. 3(a) vs 3(e)) | ✅ mock | `examples/trajectory_async/run_vs_sync.sh`: 81s vs 45s wall, first update 69s vs 7s, +79% end-to-end tokens/s, staleness 0 vs 0.71 — the paper's trade-off shape |
-| §8 convergence guarantees / multi-iteration training | ❌ out of scope | this is a timing simulation: data equivalence is verified, learning quality is not (no model, no gradient step) |
-| real trajectory-level *producer* (rollout side emits one response per message) | ✅ upstream (v1) / ⚠️ here | v1's `agent_loop_tq.py` puts each agent-loop output separately (`{uid}_{session_id}_{index}`); on the fully_async_policy path the stock producer still emits whole groups — the collector accepts both |
+* **engine** (`kimi_checkpoint_engine.py`): `stage_version` registers the
+  actor's CPU shards under `"{ckpt}:v{version}"` and does NOT unregister —
+  the registered shards ARE the relay memory, pullable until retention
+  retires them (`unstage_version`). `gather_metas` is collective, so the
+  rollout ranks run `gather_version_metas` concurrently and every rank
+  snapshots the version's metas; `receive_weights_version` pulls from the
+  snapshot (anytime, repeatable, no re-gather).
+* **workers**: `TrainingWorker.stage_weights_version` (actor side) and
+  `CheckpointEngineWorker.gather_version_metas` / `pull_weights_version`
+  (rollout side) expose the engine methods to worker-group dispatch.
+* **controller** (`relay_controller.py`): a Ray actor holding version
+  registry + retention (`keep_last`) + pull sequencing. `publish` fires
+  the actor stage and the rollout gather CONCURRENTLY — that metadata
+  phase is the whole trainer-side stall; `pull` runs the stock
+  abort → release-kv → load → resume sequencing, but at a moment the
+  ROLLOUT side chooses.
+* **trainer** (`async_trainer.py`): with `async_training.weight_store`
+  set, `_setup_checkpoint_manager` builds the controller and injects it
+  into the rollouter; `_fit_update_weights` publishes per version
+  instead of the collective push.
+* **producer** (`rollout_producer.py`): before submitting each prompt
+  group, `_maybe_pull_weights` pulls if the trainer published a newer
+  version — the batch-boundary pull — and stamps every row with the
+  version it generates under.
 
-Gap priorities: (1) fault tolerance + partial response pool — a whole
-design pillar with no counterpart here; (2) relay-tier topology in the real
-backends (direct reads ≠ per-machine relays at scale); (3) experience
-buffer sampling/eviction strategies; (4) the trajectory-level producer on
-the rollout side.
+P0 topology (known limit, next cluster item): the stock kimi engine group
+spans actor + ALL rollout ranks and `receive_tensor` barriers on it, so
+pulls are fleet-synchronized (every replica pulls the same version at the
+same moment, chosen by the rollout side — with ONE rollout replica this is
+exactly per-replica anytime pulling). Per-replica process groups — true
+per-replica, any-version pulls — plus chunk-pipelined distribution are
+what `relay_tier.py` (the CPU-verified tier) models and the remaining
+cluster work; all engine-group traffic is serialized behind one lock until
+then. The mooncake engine raises `NotImplementedError` on `stage_version`
+(per-version RDMA staging buffers still to design — TODO below).
 
-## Real-path-only status (mocks stripped) + cluster TODO
+Run it (see `examples/trajectory_async/`):
 
-Strict view for real-machine work: **everything that is a mock counts as
-not implemented.** What survives that filter:
+```bash
+python -m verl.experimental.trajectory_async.trajectory_async_main \
+    async_training.weight_store.backend=kimi \
+    rollout.checkpoint_engine.backend=kimi_ckpt_engine \
+    [examples/trajectory_async/dapo_qwen25_math_7b_traj_async.sh for the full recipe]
+```
 
-| Component | Real? | State |
-|---|---|---|
-| `GroupAggregator`, `GroupRecord`, `TrajectorySample` | ✅ real logic | pure stdlib, 13 unit tests; usable as-is on a real trainer |
-| `TrajectoryBatchCollector` + `row_from_sample_batch` | ✅ real logic | consumption core of the real trainer; accepts group- AND trajectory-level messages; 8 tests. Runtime behavior on real DataProto rows unverified |
-| `TrajectoryAsyncTrainer(FullyAsyncTrainer)` | ✅ real code, never run | separate deployment (SeparateRayPPOTrainer lineage), `_get_samples_from_queue` overridden; only syntax-checked (no ray/torch on the dev machine); **no launcher script** |
-| `VersionedWeightStore` control plane | ✅ real logic | version registry, retention GC, per-consumer accounting; engine-agnostic |
-| `RelayService` tier (master + per-machine relays, chain broadcast, reshard, local pull) | ✅ real orchestration, untested on cluster | one backend per rollout machine (kimi/mooncake adapter wrapping that machine's engine); chunk-pipelined chain verified on CPU (0.6×(chunks+hops−1) vs sequential); HF-format + TP-reshard hooks; what remains cluster work is one real engine instance per relay node |
-| `KimiP2PBackend` / `MooncakeP2PBackend` | ✅ real code, never run | written against the checked-in engine classes; known issues below |
-| `best_fit_consolidation` (Algorithm 1) | ✅ real logic | pure function on `ReplicaState`; executor-agnostic |
-| `RepackExecutor` protocol + `RolloutRepackExecutor` | ✅ real code, untested on cluster | real-rollout binding: `RolloutReplicaHandle` interface (vLLM-stats mapping documented), migrate = remove/admit with recompute or KV-transfer prefill, freed sources pull fresh weights; `RepackManager` no longer reaches into the engine config |
-| rollout engine, multi-replica engine, weight relay, rollouter, demo trainer, all A/B numbers | 🧪 mock | **treat as not implemented** |
-| trajectory-level producer (rollout side) | ❌ missing | nothing emits one-response-per-message today |
-| experience buffer w/ sampling+eviction | ❌ missing | collector is in-memory FIFO |
-| relay tier (master + per-machine relays, resharding, chain, PCIe pull) | ✅ `relay_tier.py` | `RelayService` over per-node kimi/mooncake adapters; the demo's `--weight-store p2p` now runs this topology end to end (was: direct reads from actor memory) |
-| fault tolerance / partial response pool | ❌ missing | — |
-| repack executor on real replicas (KV transfer) | ❌ missing | — |
+`async_training.weight_store=null` falls back to the stock push path;
+`async_training.trajectory_group_assembly=False` falls back to stock
+group-level consumption (either producer granularity works on the
+trainer side either way).
 
-### Cluster TODO list (ordered)
+### Repack: active scheduling over real rollouts
 
-**P0 — make the real path runnable at all**
+`RolloutRepackExecutor` binds Algorithm 1 to replicas that implement
+`RolloutReplicaHandle` (vLLM-stats mapping: `kv_cache_usage` × capacity →
+`kv_used_tokens`, `max_num_seqs` → `batch_limit`, scheduler request
+states → `running_requests` / `remove_request` / `admit_request`, a
+collective-rpc weight reload → `pull_weights`). Migration semantics:
+move each running request to its destination — recompute prefill
+(portable: resend prompt + partial response) or `kv_transfer_fn` (real
+KV movement); freed sources immediately pull the latest weights.
 
-1. **Launcher**: mirror `verl/experimental/fully_async_policy/fully_async_main.py`
-   wiring `FullyAsyncRollouter` + MessageQueue + `TrajectoryAsyncTrainer`.
-   With the stock producer this validates the group-level path end to end
-   (collector splits rows, re-aggregates, exact mini-batches, metrics).
-2. **Trajectory-level producer**: SOLVED upstream for the v1 stack —
-   `agent_loop_tq.py` emits one `kv_put` per agent-loop output. What
-   remains here is a decision, not an implementation: either extend the
-   fully_async_policy producer to emit 1-row DataProto messages
-   (`traj_index`/`model_version`/`rollout_failed` in `non_tensor_batch`)
-   for the MessageQueue path, or re-target the deployment recipe at the
-   v1 stack (where the collector is redundant and only the relay tier +
-   repack need porting).
-3. **kimi read side placement**: `KimiP2PBackend.read_into` currently
-   calls `self.engine.parameter_server.receive_tensor` on the
-   constructor's engine (actor-side). Stock semantics: the RECEIVER's
-   engine calls `receive_tensor` with its own `rollout_group`/`ranks`.
-   Fix: take the consumer's engine from `consumer_ctx["engine"]` (as
-   `MooncakeP2PBackend` already does).
+## Cluster TODO list (ordered)
+
+**P0 — make the real path runnable** ✅ DONE (this branch)
+
+1. ~~Launcher~~ — `trajectory_async_main.py` + hydra config
+   (`examples/trajectory_async/config/`) + run script
+   (`examples/trajectory_async/dapo_qwen25_math_7b_traj_async.sh`).
+2. ~~Deployment-path decision~~ — MessageQueue path (`fully_async_policy`):
+   `TrajectoryLevelRollouter` emits 1-row messages (per-row generation
+   tasks, per-row delivery, FAILED rows); re-targeting the v1
+   TransferQueue stack (where only the relay tier + repack would port)
+   remains a documented alternative, not needed for this path.
+3. ~~Worker-side stage_version~~ — kimi engine `stage_version` /
+   `gather_version_metas` / `receive_weights_version` / `unstage_version` /
+   `drop_version` + `TrainingWorker.stage_weights_version`.
+4. ~~Replica-side pull driver~~ —
+   `CheckpointEngineWorker.pull_weights_version` + `RelayControllerActor.pull`
+   (abort → release-kv → load → resume), invoked at group-submission
+   boundaries by `TrajectoryLevelRollouter._maybe_pull_weights`.
+5. ~~kimi read-side placement~~ — `KimiP2PBackend.read_into` now uses
+   `consumer_ctx["engine"]` (the receiver's parameter server drives the
+   pull), matching the mooncake adapter and stock semantics.
 
 **P1 — validate the written code on a real machine**
 
-4. Import chain: `async_trainer.py` under a full install (only
-   `py_compile`'d so far); config keys `async_training.staleness_drop` /
-   `trajectory_group_assembly` accepted by hydra.
-5. `row_from_sample_batch` against real DataProto: `union(position)`
-   slicing semantics, `non_tensor_batch` field types (`.item()` paths).
-6. Adapter smokes: `python -m unittest
-   tests.experimental.trajectory_async.test_adapter_smoke -v`
-   (torch-gated; runs the real kimi/mooncake adapter code over stub
-   engines).
-7. mooncake `unregister_memory` — exact name/semantics vs
-   `batch_register_memory`; verify against the installed
-   mooncake-transfer-engine version.
-8. kimi per-replica process-group topology — stock
-   `build_topology` creates ONE group over actor + all rollout workers;
-   versioned pulls need one group PER REPLICA (or receiver-side
-   `receive_tensor` with per-replica ranks, which item 3 enables).
-9. Concurrent `transfer_sync_read` from several replicas against the
-   actor's registered memory.
-10. Collector behavior under real queue semantics (cloudpickle'd
-    samples, `put_sample(None)` termination) — `_get_samples_from_queue`
-    interaction with `required_samples`/`require_batches` bookkeeping.
+6. Full-run of `examples/trajectory_async/dapo_qwen25_math_7b_traj_async.sh`:
+   the launcher, the producer's per-row messages against a real ALM/vLLM,
+   the kimi stage/gather/pull collectives, and the trainer's group
+   re-assembly end to end (syntax + CPU logic verified; the cluster run
+   is the actual gate).
+7. `row_from_sample_batch` against real DataProto (`union(position)`
+   slicing, `non_tensor_batch` `.item()` paths) — including the FAILED
+   row shape (`DataProto(non_tensor_batch=...)` with no tensor batch).
+8. Pinned-memory accounting of `keep_last` versions on the actor ranks
+   (each version pins a full CPU shard copy per rank).
+9. mooncake `stage_version`: per-version RDMA staging buffers + runtime
+   `batch_register_memory`/`unregister_memory` semantics + per-version
+   buffer descriptor distribution (the engine currently raises
+   NotImplementedError by design).
+10. kimi per-replica process-group topology: today pulls are
+   fleet-synchronized on the single engine group; one group per replica
+   (plus serialized-but-per-replica receive) gives true per-replica,
+   any-version pulls — the P0 controller serializes behind one lock
+   until then.
+11. Concurrent collective safety: publish while a pull is in flight
+   (gather_metas vs receive_tensor on the same group) — currently
+   prevented by the controller lock; verify whether the kimi store
+   tolerates overlap before relaxing it.
+12. Relay-tier chain distribution (`relay_tier.py`, CPU-verified) on real
+   transports: one relay engine per rollout machine, master-side
+   format/reshard hooks, chunk-pipelined chain — replaces the flat
+   fleet pull once multi-machine.
+13. Collector behavior under real queue semantics (cloudpickle'd
+   samples, `put_sample(None)` termination).
 
-**P2 — close the architectural gaps vs the paper**
+**P2 — close the remaining gaps vs the paper**
 
-11. Relay tier on a cluster: `relay_tier.py` is the real orchestration
-    (master stage = actor stall, chunk-pipelined chain, anytime local
-    pull, HF-format + TP-reshard hooks — CPU-verified). Remaining
-    cluster work: one engine instance per relay node
-    (`make_p2p_backend("kimi"|"mooncake", engine=engine_i)`), the
-    worker-side `stage_version` feeding `RelayService.publish`, and
-    `node_for_replica` wired to the actual rollout placement.
-12. Experience buffer: pluggable sampling (FIFO today; prioritized /
-    freshness-weighted) + capacity eviction at the collector seam.
-13. Partial response pool + fault tolerance: stream in-progress
-    trajectories centrally; on replica failure redirect to a
-    same-version replica reusing partial progress.
-14. Repack on real replicas: the algorithm/executor split is done
-    (`RepackExecutor` protocol + `RolloutRepackExecutor` with recompute
-    or KV-transfer prefill). Remaining: implement `RolloutReplicaHandle`
-    against the real rollout stack (vLLM scheduler metrics →
-    `kv_used_tokens`/`batch_limit`; request states →
-    `running_requests`/`remove_request`/`admit_request`; a collective-rpc
-    weight reload → `pull_weights`) and a real `kv_transfer_fn`.
+14. `RolloutReplicaHandle` implementation against the real rollout stack
+    (vLLM/sglang scheduler APIs) + a real `kv_transfer_fn`; wire
+    `RepackManager` + `RolloutRepackExecutor` into the trainer's update
+    path (post-publish trigger) and the rollout side.
+15. Relay tier elasticity: per the paper's §4.3, O(1) chain rebuild on
+    relay failure, master failover (deliberately deferred with fault
+    tolerance as a whole).
+16. Partial response pool + fault tolerance (paper §3.3): stream
+    in-progress trajectories centrally; on replica failure redirect to a
+    same-version replica reusing partial progress. The single biggest
+    remaining design pillar with no counterpart here. (FAILED-row
+    delivery at trajectory granularity already landed with the producer;
+    the pool + redirect is the missing part.)
+
+## Relation to the Laminar paper (alignment status)
+
+| Paper element | Status |
+|---|---|
+| §3 trajectory-level asynchrony, no lockstep; emergent per-trajectory staleness (§6, no static k) | ✅ collector + trainer (MessageQueue path); ✅ upstream v1 (TransferQueue) |
+| §3.1 experience buffer (sampling/eviction) | ✅ upstream v1 `ReplayBuffer`; ⚠️ here: collector is FIFO + staleness refusal only |
+| §3.1 prompt pool | ✅ upstream v1 (streaming dataloader + refill) |
+| §3.1 partial response pool (fault-tolerance substrate) | ❌ TODO-16 |
+| §3.2 workflow steps ④-⑦ (interleaved train/publish/background distribute/anytime pull) | ✅ P0 wiring (`relay_controller.py` + `rollout_producer.py` batch-boundary pulls); chain distribution = TODO-12 |
+| §3.3 + §4.3 fault tolerance (heartbeat failover, chain rebuild, master failover, checkpoint recovery) | ❌ TODO-15 (deferred) |
+| §4.2 relay hierarchy: master + per-machine relays, resharding, chain-pipelined broadcast, PCIe local pull | ⚠️ P0 flat path via `relay_controller.py` (versioned stage + fleet pull, live); per-machine chain tier = `relay_tier.py` (CPU-verified) = TODO-12 |
+| §4.2 actor stall = single push to master | ✅ `publish` returns after the master stage |
+| §5 repack: triggers, version grouping, KVCache idleness, Algorithm 1 Best-Fit + CanFit(`C_max` ∧ `B`), freed sources pull fresh weights | ✅ `repack.py` + `RolloutRepackExecutor`; real-stack handle TODO-14 |
+| §8 convergence guarantees / multi-iteration training | ❌ out of scope here (no model, no gradient step) |
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (100 tests; 98 stdlib-only + 2
-torch-gated adapter smokes that skip without torch and run the real
-kimi/mooncake adapter code over stub engines on a full machine):
+`tests/experimental/trajectory_async/` (87 tests; 80 stdlib-only + 2
+torch-gated adapter smokes + 4 ray-gated wiring smokes + 1 torch-gated
+kimi read-placement smoke, all skipping gracefully without their deps):
 
 * aggregator: completion order, duplicates, FAILED-eviction protocol,
   late-arrival guard, buffer limits, record invariants;
-* mini-batcher: exact batch emission, eviction passthrough, drain;
-* rollouter: trajectory-mode early delivery vs group-mode held delivery
-  (scripted-engine timing asserts), cross-mode data equivalence, retry
-  semantics, all-or-nothing baseline comparison, sentinel accounting;
-* end-to-end: cross-mode trained-data equivalence, accounting identities,
-  staleness-drop path, failed-group exclusion, both preprocess policies;
-* Laminar scheduling layer: relay timing (actor stall = master hop only,
-  chain propagation, PCIe-only late pulls, divergent per-relay versions),
-  engine lifecycle (batch-quota gating, KVCache plateau/ramp-down
-  detection, drain-triggered weight pulls, migration incl. CanFit and
-  capacity rejection), Algorithm 1 (smallest-source/fullest-destination
-  packing, roofline and KV capacity constraints, busy/empty replica
-  exclusion), manager loop (periodic + post-update triggers, straggler
-  consolidation end-to-end, exception survival);
-* multi-version weight store: publish/manifest/latest invariants
-  (monotonic, unique), retention eviction (unstage + failed reads of
-  evicted versions), independent per-consumer pulls with lag accounting,
-  pinned pulls, concurrent publish/pull interleavings, byte accounting,
-  fake-backend registered-memory lifecycle, the demo-engine relay
-  contract over the real store orchestration, and the backend-selection
-  factory (dispatch, name normalization, engine requirement errors);
-* relay tier: chain distribution to every node, chunk pipelining faster
-  than sequential hops, actor stall = master stage only, anytime local
-  pull takes the previous complete version during a broadcast, startup
-  edge wait, per-node retention, HF-format + TP-reshard hooks, version
-  monotonicity, demo adapter contract;
-* rollout repack executor: snapshot maps handle stats into
-  `ReplicaState`, migrate moves requests (recompute vs KV-transfer
-  prefill), freed sources pull fresh weights, `RepackManager` drives the
-  executor end to end, Algorithm 1 accepts executor snapshots;
-* adapter smokes (torch-gated, run on a full machine): the real
-  KimiP2PBackend / MooncakeP2PBackend against duck-typed stub engines —
-  register-without-unregister retention, per-version staging buffers,
-  pinned pulls through the stub `receive_tensor` / `transfer_sync_read`,
-  chunk accounting, and eviction unregistering exactly the evicted
-  version.
+* collector: group/trajectory/mixed granularity, eviction accounting,
+  staleness refusal, reconciliation identity, DataProto row adapter;
+* mini-batcher: exact sizes, group advantages preserved;
+* weight store: publish/manifest, retention GC, pinned/latest pulls,
+  concurrent pulls, per-consumer accounting, backend factory switching;
+* relay tier: chain distribution, chunk pipelining faster than
+  sequential hops, actor stall = master stage only, anytime local pull,
+  startup-edge wait, retention, HF-format/TP-reshard hooks, version
+  monotonicity;
+* repack: Algorithm 1 pure-function tests (Best-Fit, CanFit, busy/empty
+  exclusion), manager triggers, consolidation over the real executor,
+  exception survival;
+* relay controller (stdlib): version registry, duplicate-publish
+  idempotence, keep_last retention (never retires the latest), pull
+  defaults + explicit older versions + retired-version LookupError,
+  publish-failure cleanliness, strict publish/pull serialization;
+* adapter smokes (torch-gated, full machine): the real
+  KimiP2PBackend / MooncakeP2PBackend against duck-typed stub engines,
+  including the consumer-engine placement of kimi `read_into`;
+* wiring smoke (ray-gated, full install): the P0 launch path imports
+  (producer/trainer/launcher/engine-worker methods) and the FAILED-row
+  message contract round-trips through `row_from_sample_batch`.
+
+```bash
+python3 -m unittest discover -s tests/experimental/trajectory_async -t .
+```

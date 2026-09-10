@@ -61,8 +61,10 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from verl.experimental.trajectory_async.multi_replica_engine import (
+from verl.experimental.trajectory_async.repack import (
     MigrationResult,
+    RepackExecutor,
+    ReplicaState,
 )
 from verl.experimental.trajectory_async.versioned_weight_store import (
     ConsumerState,
@@ -78,7 +80,6 @@ __all__ = [
     "RelayNode",
     "RelayService",
     "RelayTierAdapter",
-    "RepackExecutor",
     "RolloutReplicaHandle",
     "RunningRequest",
     "RolloutRepackExecutor",
@@ -607,8 +608,7 @@ class RelayTierAdapter:
 #
 # The repack ALGORITHM (repack.best_fit_consolidation + ReplicaState
 # idleness) is engine-agnostic; the executor seam below binds it to real
-# rollout replicas. MultiReplicaEngine satisfies the protocol structurally
-# (the demo path); RolloutRepackExecutor is the real-rollout binding.
+# rollout replicas (see RolloutRepackExecutor below).
 
 
 class RepackExecutor(Protocol):
@@ -702,10 +702,8 @@ class RolloutRepackExecutor:
 
     # ------------------------------------------------------------ probe
 
-    def snapshot(self) -> list:
+    def snapshot(self) -> list[ReplicaState]:
         """Build the algorithm's :class:`ReplicaState` view from handles."""
-        from verl.experimental.trajectory_async.multi_replica_engine import ReplicaState
-
         states = []
         for handle in self.handles.values():
             running = handle.running_requests()

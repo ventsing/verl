@@ -311,3 +311,22 @@ def row_from_sample_batch(
         "payload": payload,
         "_time": time.monotonic(),
     }
+
+
+def grpo_group_advantages(rewards: list[float], eps: float = 1e-6) -> list[float]:
+    """Group-normalized advantages (GRPO/DAPO style): zero mean, unit std
+    within each prompt group. Degenerate groups (all-equal rewards) get
+    zero advantages. The group-preserving contract the collector serves:
+    a group is only trainable once ALL its trajectories are present —
+    this is what group reassembly protects (the real training path
+    computes this inside the actor workers; this stdlib twin is for
+    metrics and tests)."""
+    if not rewards:
+        return []
+    import statistics
+
+    mean = statistics.fmean(rewards)
+    std = statistics.pstdev(rewards)
+    if std < eps:
+        return [0.0] * len(rewards)
+    return [(r - mean) / std for r in rewards]

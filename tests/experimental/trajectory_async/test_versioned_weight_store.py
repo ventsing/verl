@@ -33,7 +33,6 @@ from verl.experimental.trajectory_async.versioned_weight_store import (  # noqa:
     KimiP2PBackend,
     MooncakeP2PBackend,
     P2P_BACKENDS,
-    VersionedStoreRelayAdapter,
     VersionedWeightStore,
     make_p2p_backend,
 )
@@ -197,72 +196,6 @@ class TestVersionedWeightStore(unittest.TestCase):
             store = VersionedWeightStore(FakeP2PBackend())
             with self.assertRaises(LookupError):
                 await store.pull("r0")
-
-        asyncio.run(scenario())
-
-
-class TestRelayAdapterWithEngine(unittest.TestCase):
-    def test_adapter_contract_with_multi_replica_engine(self):
-        """The store adapter satisfies the relay interface the engine uses,
-        and a real engine run pulls versions through the store."""
-        from verl.experimental.trajectory_async.multi_replica_engine import (
-            MultiReplicaEngine,
-            MultiReplicaEngineConfig,
-        )
-
-        async def scenario():
-            backend = FakeP2PBackend(stage_latency_s=0.02, read_latency_s=0.02)
-            store = VersionedWeightStore(backend, keep_last=2)
-            relay = VersionedStoreRelayAdapter(store, weight_mb=1.0 / 1024)  # 1 KB payloads
-            engine = MultiReplicaEngine(
-                config=MultiReplicaEngineConfig(
-                    seed=3,
-                    length_mean_tokens=400.0,
-                    length_sigma=0.3,
-                    max_tokens=1500,
-                    num_replicas=2,
-                    batch_per_replica=4,
-                    max_running_requests=4,
-                    kv_capacity_tokens=8192,
-                    decode_rate_tok_s=4000.0,
-                    decode_tick_s=0.01,
-                ),
-                relay=relay,
-            )
-            tasks = [asyncio.create_task(engine.generate(900 + i)) for i in range(8)]
-            await asyncio.sleep(0.03)
-            # trainer publishes two versions while generation is in flight
-            await relay.publish(1)
-            await relay.publish(2)
-            self.assertEqual(relay.latest_published_version(), 2)
-            results = await asyncio.gather(*tasks)
-            await engine.stop()
-
-            self.assertEqual(len(results), 8)
-            self.assertGreaterEqual(engine.stats.weight_pulls, 1)
-            # requests routed before any publish ran under v0
-            for r in results:
-                self.assertIn(r.model_version, (0, 1, 2))
-            # the store saw per-replica consumers
-            snap = store.snapshot()
-            self.assertEqual(snap["store/publishes"], 2)
-            self.assertTrue(any(c.startswith("replica-") for c in snap["store/consumers"]))
-            self.assertEqual(snap["store/backend"], "fake")
-
-        asyncio.run(scenario())
-
-    def test_adapter_stats_shape(self):
-        async def scenario():
-            store = VersionedWeightStore(FakeP2PBackend(stage_latency_s=0.01, read_latency_s=0.01))
-            relay = VersionedStoreRelayAdapter(store, weight_mb=1.0 / 1024)
-            await relay.publish(1)
-            await relay.pull(0)
-            snap = relay.stats.snapshot()
-            self.assertEqual(snap["relay/publishes"], 1)
-            self.assertEqual(snap["relay/pulls"], 1)
-            self.assertAlmostEqual(snap["relay/actor_stall_total_s"], 0.01, places=3)
-            self.assertAlmostEqual(snap["relay/pcie_total_s"], 0.01, places=3)
-            self.assertEqual(snap["relay/pull_wait_total_s"], 0.0)
 
         asyncio.run(scenario())
 

@@ -13,9 +13,8 @@
 # limitations under the License.
 """Multi-version, pull-based weight management over P2P checkpoint engines.
 
-This replaces the timing mock (:mod:`weight_relay`) with a deployable
-design built on verl's checkpoint engines — specifically the two engines
-that already speak peer-to-peer:
+The deployable design built on verl's checkpoint engines — specifically
+the two engines that already speak peer-to-peer:
 
 * ``kimi_ckpt_engine`` (:class:`KIMICheckpointEngine`,
   ``verl/checkpoint_engine/kimi_checkpoint_engine.py``) — actor ranks
@@ -442,60 +441,6 @@ class FakeP2PBackend(P2PWeightBackend):
         self.stats.unstages += 1
 
 
-# ------------------------------------------------------- demo relay adapter
-
-
-class _RelayStatsView:
-    """Expose store/backend stats under the demo's ``relay/*`` keys."""
-
-    def __init__(self, store: VersionedWeightStore, backend: FakeP2PBackend) -> None:
-        self._store = store
-        self._backend = backend
-
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "relay/publishes": self._store.stats.publishes,
-            "relay/actor_stall_total_s": round(self._backend.stats.stage_total_s, 4),
-            "relay/pulls": self._store.stats.pulls,
-            # direct P2P read: no chain propagation wait
-            "relay/pull_wait_total_s": 0.0,
-            "relay/pcie_total_s": round(self._backend.stats.read_total_s, 4),
-        }
-
-
-class VersionedStoreRelayAdapter:
-    """Make a :class:`VersionedWeightStore` quack like the demo's relay.
-
-    The multi-replica demo engine only needs ``publish(version)``,
-    ``latest_published_version()`` and ``pull(replica_id)`` — this adapter
-    routes them through the *real* store orchestration (retention,
-    per-consumer state, staleness) over the fake transport, so the CPU
-    demo exercises exactly the code a deployment would run.
-    """
-
-    def __init__(self, store: VersionedWeightStore, weight_mb: float = 8.0) -> None:
-        self.store = store
-        self._bytes = int(weight_mb * (1 << 20))
-        self.stats = _RelayStatsView(store, store.backend)  # type: ignore[arg-type]
-
-    async def publish(self, version: int) -> float:
-        shards = 4
-
-        def weights():
-            per = self._bytes // shards
-            for i in range(shards):
-                yield f"shard.{i}", b"w" * per
-
-        await self.store.publish(version, weights())
-        return time.monotonic()
-
-    def latest_published_version(self) -> int:
-        return self.store.latest_version()
-
-    async def pull(self, replica_id: int) -> int:
-        return await self.store.pull(f"replica-{replica_id}")
-
-
 # ---------------------------------------------------------- real backends
 #
 # The two adapters below isolate every call into verl's checkpoint
@@ -571,10 +516,15 @@ class KimiP2PBackend(P2PWeightBackend):
         manifest: WeightManifest,
         sink: Sink,
     ) -> ReadStats:
-        ps = self.engine.parameter_server
+        # The RECEIVER's engine drives the pull (stock semantics: the
+        # consumer's parameter server calls receive_tensor on its own
+        # process group). The constructor-side engine is the STAGER — using
+        # it here (the historical bug) executed the receive on the actor.
+        engine = consumer_ctx.get("engine", self.engine)
+        ps = engine.parameter_server
         ranks_group = consumer_ctx["ranks_group"]  # this replica's own process group
         ranks = consumer_ctx["ranks"]
-        bucket_size = consumer_ctx.get("bucket_size", self.engine.bucket_size)
+        bucket_size = consumer_ctx.get("bucket_size", engine.bucket_size)
 
         start = time.monotonic()
         nbytes = tensors = 0

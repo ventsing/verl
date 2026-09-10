@@ -244,6 +244,8 @@ class KIMICheckpointEngine(CheckpointEngine):
         self.is_master = is_master
         self.initialized = False
         self.checkpoint_name = "kimi_checkpoint_engine"
+        # version -> gathered metas snapshot (multi-version pull path)
+        self._versioned_metas: dict[int, dict] = {}
 
     def prepare(self) -> MasterMetadata:
         if self.is_master:
@@ -389,3 +391,145 @@ class KIMICheckpointEngine(CheckpointEngine):
             f"Rank {self.rank} receive weights done, total_params: {total_params}, "
             f"time cost: {time_cost:.2f}s, bandwidth: {bandwidth:.2f} GB/s"
         )
+
+    # ------------------------------------------------- multi-version pull path
+    #
+    # Laminar-style versioned weight store (consumed by
+    # verl/experimental/trajectory_async). ``stage_version`` registers the
+    # actor's current shards under a VERSION-SCOPED checkpoint name and — the
+    # one behavioral difference from ``send_weights`` — does NOT unregister:
+    # the registered CPU/pinned shards remain readable in the P2P store, so
+    # rollout replicas can pull the version at any later time via
+    # ``receive_weights_version`` (repeatedly; e.g. a restarted or late
+    # replica re-pulls). ``unstage_version`` retires a version (driver-side
+    # retention policy); frees the pinned CPU memory on every actor rank.
+    #
+    # ``gather_metas`` is an all_gather_object over the whole engine process
+    # group (actor + rollout ranks), so the metadata phase stays synchronized:
+    # the driver fires ``stage_weights_version`` on the actor worker group and
+    # ``gather_version_metas`` on the rollout worker groups CONCURRENTLY, and
+    # every rank snapshots the gathered metas per version. The expensive part
+    # (tensor transfer) is what becomes pull-based.
+    #
+    # Topology note (cluster TODO): ``rollout_group`` spans ALL rollout ranks,
+    # and ``receive_tensor`` barriers on it — so with the stock single process
+    # group, pulls are fleet-synchronized (every replica pulls the same
+    # version together). Per-replica process groups (true per-replica,
+    # any-version pulls) are the remaining cluster item; with a single rollout
+    # replica the two are equivalent.
+
+    def _versioned_checkpoint_name(self, version: int) -> str:
+        return f"{self.checkpoint_name}:v{version}"
+
+    @torch.no_grad()
+    async def stage_version(
+        self,
+        version: int,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        global_steps: int | None = None,
+    ):
+        """Register this rank's current weights as a pullable version.
+
+        Actor-side counterpart of ``send_weights``: same CPU offload path,
+        same registration — but under ``"{checkpoint_name}:v{version}"`` and
+        WITHOUT the trailing unregister, and with the gathered metas snapshotted
+        per version so later pulls need no further collective.
+
+        The rollout ranks must run ``gather_version_metas(version)`` at the
+        same time (gather_metas is collective over the whole group).
+        """
+        checkpoint_name = self._versioned_checkpoint_name(version)
+
+        def offload_cpu(name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor]:
+            return name, tensor.to("cpu", non_blocking=True)
+
+        start_time = time.time()
+        named_tensors = {}
+        for named_tensors_gpu in ckpt_get_named_tensor_buckets(
+            weights, self.bucket_size, self.actor_wg_world_size, self.rank, self.rollout_dtype
+        ):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+                futures = [executor.submit(offload_cpu, name, tensor) for name, tensor in named_tensors_gpu.items()]
+            for future in concurrent.futures.as_completed(futures):
+                name, tensor_cpu = future.result()
+                named_tensors[name] = tensor_cpu
+
+        get_torch_device().synchronize()
+
+        # register + KEEP registered: these pinned CPU shards are the relay
+        # memory for this version until unstage_version retires it
+        self.parameter_server.register_checkpoint(checkpoint_name, named_tensors=named_tensors)
+        named_tensors = {}
+        get_torch_device().empty_cache()
+        logger.info(f"Rank {self.rank} stage v{version}: offload+register, {time.time() - start_time:.2f}s")
+
+        self.parameter_server.gather_metas(checkpoint_name)
+        # snapshot the gathered metas per version — receive_tensor reads the
+        # single-slot _current_global_parameter_metas, so later pulls restore
+        # this snapshot instead of re-gathering (which would be collective)
+        self._versioned_metas[version] = self.parameter_server.get_metas()
+        logger.info(f"Rank {self.rank} stage v{version} done, {time.time() - start_time:.2f}s")
+
+    def gather_version_metas(self, version: int):
+        """Rollout-side participation in a version's metadata gather.
+
+        Must run CONCURRENTLY with the actor ranks' ``stage_version`` —
+        ``gather_metas`` is an all_gather_object over the whole engine group.
+        """
+        checkpoint_name = self._versioned_checkpoint_name(version)
+        self.parameter_server.gather_metas(checkpoint_name)
+        self._versioned_metas[version] = self.parameter_server.get_metas()
+
+    @torch.no_grad()
+    async def receive_weights_version(
+        self,
+        version: int,
+    ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        """Pull a staged version into this rollout rank (anytime, repeatable).
+
+        Same transfer path as ``receive_weights`` but scoped to the version's
+        checkpoint name and driven by the snapshotted metas (no re-gather, so
+        no collective beyond receive_tensor's own rollout-group barriers).
+        """
+        checkpoint_name = self._versioned_checkpoint_name(version)
+        metas = self._versioned_metas.get(version)
+        if metas is None:
+            raise LookupError(
+                f"version {version} was never staged on this rank "
+                f"(known versions: {sorted(self._versioned_metas)})"
+            )
+
+        ps = self.parameter_server
+        # single-slot restore around the transfer: concurrent pulls of other
+        # versions must not observe this version's metas
+        previous_metas = ps._current_global_parameter_metas
+        ps._current_global_parameter_metas = metas
+        try:
+            start_time = time.time()
+            total_bytes, total_params = 0, 0
+            async for name, tensor in ps.receive_tensor(
+                checkpoint_name, self.rollout_group, self.rollout_ranks, self.bucket_size
+            ):
+                total_bytes += tensor.element_size() * tensor.nelement()
+                total_params += 1
+                yield name, tensor
+            dist.barrier()
+        finally:
+            ps._current_global_parameter_metas = previous_metas
+        time_cost = time.time() - start_time
+        bandwidth = total_bytes / time_cost / (1024 * 1024 * 1024)
+        logger.info(
+            f"Rank {self.rank} receive v{version} done, total_params: {total_params}, "
+            f"time cost: {time_cost:.2f}s, bandwidth: {bandwidth:.2f} GB/s"
+        )
+
+    def unstage_version(self, version: int):
+        """Retire a staged version (actor side): unregister from the P2P store
+        and drop the metas snapshot. Frees this rank's pinned CPU shard copy."""
+        checkpoint_name = self._versioned_checkpoint_name(version)
+        self.parameter_server.unregister_checkpoint(checkpoint_name)
+        self._versioned_metas.pop(version, None)
+
+    def drop_version(self, version: int):
+        """Drop a retired version's metas snapshot (rollout side)."""
+        self._versioned_metas.pop(version, None)

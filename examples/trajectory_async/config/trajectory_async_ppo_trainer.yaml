@@ -1,0 +1,124 @@
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Trajectory-level async RL (Laminar-style):
+#   producer  = TrajectoryLevelRollouter — one queue message per response
+#               (uid/traj_index/group_size/model_version stamped; FAILED rows
+#               on generation failure)
+#   consumer  = TrajectoryAsyncTrainer — re-assembles GRPO groups from
+#               per-trajectory rows; trains on complete, fresh groups only
+#   weights   = optional multi-version pull path (async_training.weight_store):
+#               the trainer publishes stage-only versions; the rollout side
+#               pulls at its batch boundaries. Requires the kimi engine.
+
+async_training:
+
+  # Maximum samples staleness threshold
+  staleness_threshold: 0.1
+
+  # Frequency of parameter synchronization between rollouter and trainer,
+  # One step means trainer obtains a batch of required samples
+  trigger_parameter_sync_step: 4
+
+  # The number of ppo_mini_batches that the trainer obtains once
+  require_batches: 1
+
+  # When synchronizing parameters, whether to resume generation when rollout is interrupted.
+  # If True, LLMServerClient auto resume generation, making rollout interruption invisible to the AgentLoop.
+  partial_rollout: True
+
+  # whether to use trainer do_validate
+  use_trainer_do_validate: False
+
+  # Whether to enable dynamic resource scheduling.
+  use_dynamic_resource_scheduling: False
+
+  # Name of the dynamic scheduling policy ("default" or custom registered name).
+  dynamic_schedule_policy: "default"
+
+  # Sample-collection ratio threshold for deactivating hybrid replicas.
+  dynamic_schedule_deactivate_ratio: 0.3
+
+  # Whether to rebalance (abort + clear sticky cache + resume) in-flight requests
+  # across newly activated hybrid replicas via least-loaded routing.
+  dynamic_schedule_enable_rebalance: True
+
+  # Maximum number of concurrent generation requests per replica.
+  concurrent_samples_per_replica: 16
+
+  # ---- trajectory-level async (this package) ----
+
+  # Trainer-side GRPO group re-assembly from per-trajectory messages.
+  # False = stock group-level consumption (whole-group messages).
+  trajectory_group_assembly: True
+
+  # Per-trajectory staleness refusal: a trajectory generated more than this
+  # many trainer versions behind the current one is dropped (its group goes
+  # incomplete and is eventually evicted). null = no refusal (paper: emergent
+  # staleness, no static cap — rely on staleness_threshold instead).
+  staleness_drop: null
+
+  # Multi-version, pull-based weight path (the relay tier's P0 wiring):
+  #   publish = stage-only (actor ranks register per-version CPU shards in
+  #             the kimi P2P store; the metadata gather is the whole
+  #             trainer-side stall)
+  #   pull    = rollout-driven, at group-submission batch boundaries
+  # Requires rollout.checkpoint_engine.backend=kimi_ckpt_engine.
+  # null = stock push-based sync through the CheckpointEngineManager.
+  weight_store:
+    backend: kimi
+    keep_last: 2
+
+# Rollout config
+rollout:
+
+  # Number of nodes used in the rollout
+  nnodes: 1
+
+  # Number of GPUs per node
+  n_gpus_per_node: 8
+
+  # number of responses (i.e. num sample times). > 1 for grpo — this is the
+  # GRPO group size the trainer re-assembles from per-trajectory messages
+  n: 4
+
+  # total rollout samples
+  total_rollout_steps: 100
+
+data:
+  # Number of samples generated, currently only support 1
+  gen_batch_size: 1
+
+actor_rollout_ref:
+
+  rollout:
+    # Must be enabled! Otherwise, log_probs cannot be calculated.
+    calculate_log_probs: True
+
+    standalone_gpu_memory_utilization: null
+
+    # kimi engine required for the versioned pull path
+    # (async_training.weight_store); use "nccl" for the stock push path
+    # together with weight_store: null
+    checkpoint_engine:
+      backend: "kimi_ckpt_engine"
+
+  actor:
+    # Must use rollout log probs for training
+    use_rollout_log_probs: True
+
+  model:
+    # To use remove padding (thd)
+    use_remove_padding: True
+
+
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True

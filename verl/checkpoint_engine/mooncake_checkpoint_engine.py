@@ -319,3 +319,24 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         logger.info(
             f"Rank {self.rank} receive weights done, time cost: {time_cost:.2f}s, bandwidth: {bandwidth:.2f} GB/s"
         )
+
+    # ------------------------------------------------- multi-version pull path
+    #
+    # NOT IMPLEMENTED for this engine (cluster TODO; see
+    # verl/experimental/trajectory_async/README.md). The stock flow streams
+    # buckets through ONE double-buffered registered buffer along the rank
+    # chain and reuses it immediately — nothing is retained to pull from.
+    # A versioned stage needs: (a) a per-version pinned staging buffer on the
+    # actor rank(s), (b) runtime RDMA (un)registration of those buffers
+    # (``batch_register_memory`` — exact semantics differ across
+    # mooncake-transfer-engine versions), and (c) a way to publish each
+    # version's buffer descriptor (session_id + ptr + len) to consumers.
+    # Sketch only; validated implementations welcome.
+
+    async def stage_version(self, version, weights, global_steps=None):
+        raise NotImplementedError(
+            "mooncake checkpoint engine does not implement the multi-version "
+            "pull path yet (per-version RDMA staging buffers); use the kimi "
+            "backend for async_training.weight_store, or see the TODO in "
+            "verl/experimental/trajectory_async/README.md"
+        )
