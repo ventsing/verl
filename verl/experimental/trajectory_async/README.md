@@ -182,7 +182,15 @@ KV movement); freed sources immediately pull the latest weights.
 12. Relay-tier chain distribution (`relay_tier.py`, CPU-verified) on real
    transports: one relay engine per rollout machine, master-side
    format/reshard hooks, chunk-pipelined chain — replaces the flat
-   fleet pull once multi-machine.
+   fleet pull once multi-machine. Deadlock-safety rules for the binding:
+   (i) LINEAR chain only, never a ring (no wait-for cycles); (ii) bounded
+   in-flight per hop with an explicit completion signal before buffer
+   reuse (the stock mooncake engine's magic-word double-buffering is the
+   reference pattern); (iii) retire a version's staged chunks only after
+   per-version completion tracking (a downstream RDMA read of an evicted
+   buffer is an error, not a stall); (iv) keep the controller's
+   stable-id lock ordering and never call back into a lock holder from
+   inside a locked section.
 13. Collector behavior under real queue semantics (cloudpickle'd
    samples, `put_sample(None)` termination).
 
