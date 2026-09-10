@@ -326,6 +326,7 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
                 server_ids=list(server_ids) if server_ids else None,
                 config=manager_cfg,
             )
+            self._repack_server_ids = list(server_ids) if server_ids else []
             logger.info(
                 "repack controller attached (check_interval_s=%.1f, replicas=%d, "
                 "hard_drain=%s, B=%s): idle refresh per-replica after each publish; "
@@ -334,6 +335,114 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
                 len(server_ids) if server_ids else 0,
                 manager_cfg.hard_drain,
                 manager_cfg.batch_bound,
+            )
+
+        # partial response pool (§3.1 substrate): the trainer owns the
+        # central store; the producer consults it on row retries
+        pool_cfg = self.config.async_training.get("partial_pool", None)
+        if pool_cfg is not None and pool_cfg.get("enabled", False):
+            from verl.experimental.trajectory_async.partial_pool import make_partial_pool_actor
+
+            pool_cls = make_partial_pool_actor()
+            self.partial_pool = pool_cls.remote(
+                max_entries=int(pool_cfg.get("max_entries", 4096)),
+                max_bytes=pool_cfg.get("max_bytes", None),
+                ttl_s=pool_cfg.get("ttl_s", None),
+            )
+            ray.get(self.rollouter.set_partial_pool.remote(self.partial_pool))
+            logger.info(
+                "partial response pool attached (max_entries=%d): row retries "
+                "consult it for same-version partials",
+                int(pool_cfg.get("max_entries", 4096)),
+            )
+
+        # fault tolerance (§3.3 + §4.3): heartbeat the relay controller
+        # (master failover) and the rollout replicas (retire dead ones
+        # from routing; revive restarted ones)
+        ft_cfg = self.config.async_training.get("fault_tolerance", None)
+        if ft_cfg is not None and ft_cfg.get("enabled", True):
+            from verl.experimental.trajectory_async.fault_tolerance import RelaySupervisor
+
+            keep_last_v = int(weight_store_cfg.get("keep_last", 2))
+            controller_factory_kwargs = dict(
+                keep_last=keep_last_v, max_staged_bytes=max_staged_bytes
+            )
+
+            def _controller_factory():
+                cls = make_relay_controller_actor()
+                return cls.remote(self.checkpoint_manager, **controller_factory_kwargs)
+
+            async def _recover_controller(new_controller) -> None:
+                # state recovery: the trainer is the authority on the
+                # published version; engines keep their shards. Replica
+                # versions re-sync on the next pull.
+                new_controller.recover(self.current_param_version)
+                # re-attach every consumer
+                ray.get(
+                    self.rollouter.set_relay_controller.remote(
+                        new_controller, self.row_max_attempts
+                    )
+                )
+                repack = getattr(self, "repack_controller", None)
+                if repack is not None:
+                    await repack.stop.remote()
+                if getattr(self, "_repack_server_ids", None):
+                    from verl.experimental.trajectory_async.repack_bridge import (
+                        make_repack_controller_actor,
+                    )
+                    from verl.experimental.trajectory_async.repack import RepackConfig
+
+                    repack_cfg = self.config.async_training.get("repack", None)
+                    field_names = RepackConfig.__dataclass_fields__
+                    manager_cfg2 = RepackConfig(
+                        **{k: v for k, v in dict(repack_cfg).items() if k in field_names}
+                    )
+                    rollout_cfg = self.config.actor_rollout_ref.rollout
+                    if manager_cfg2.batch_bound is None:
+                        manager_cfg2.batch_bound = int(getattr(rollout_cfg, "max_num_seqs", 0)) or None
+                    cls = make_repack_controller_actor()
+                    self.repack_controller = cls.remote(
+                        new_controller,
+                        rollouter=self.rollouter,
+                        server_ids=list(self._repack_server_ids),
+                        config=manager_cfg2,
+                    )
+                self.relay_controller = new_controller
+
+            async def _ping_controller() -> bool:
+                return bool(await self.relay_controller.ping.remote())
+
+            async def _probe_replicas() -> dict:
+                return await self.rollouter.replica_probe_all.remote()
+
+            async def _retire_replicas(server_ids) -> None:
+                await self.rollouter.replica_retire.remote(server_ids)
+                repack = getattr(self, "repack_controller", None)
+                if repack is not None:
+                    repack.retire.remote(server_ids)  # fire-and-forget
+
+            async def _revive_replicas(server_ids) -> None:
+                await self.rollouter.replica_revive.remote(server_ids)
+                repack = getattr(self, "repack_controller", None)
+                if repack is not None:
+                    repack.revive.remote(server_ids)  # fire-and-forget
+
+            self.relay_supervisor = RelaySupervisor(
+                ping_fn=_ping_controller,
+                factory=_controller_factory,
+                recover_fn=_recover_controller,
+                probe_fn=_probe_replicas,
+                retire_fn=_retire_replicas,
+                revive_fn=_revive_replicas,
+                heartbeat_s=float(ft_cfg.get("heartbeat_s", 10.0)),
+                failure_threshold=int(ft_cfg.get("failure_threshold", 3)),
+            )
+            self.relay_supervisor.start(self.relay_controller)
+            logger.info(
+                "fault tolerance attached (heartbeat %.1fs, failure threshold %d): "
+                "controller failover + replica retire/revive",
+                float(ft_cfg.get("heartbeat_s", 10.0)),
+                int(ft_cfg.get("failure_threshold", 3)),
             )
 
     def _fit_compute_advantage(self, batch):
@@ -437,6 +546,12 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
         try:
             return await super().fit()
         finally:
+            supervisor = getattr(self, "relay_supervisor", None)
+            if supervisor is not None:
+                try:
+                    await supervisor.stop()
+                except Exception:  # noqa: BLE001 — teardown must not mask results
+                    logger.warning("relay supervisor stop failed", exc_info=True)
             repack = getattr(self, "repack_controller", None)
             if repack is not None:
                 try:

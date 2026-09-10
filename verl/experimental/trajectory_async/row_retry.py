@@ -33,7 +33,11 @@ Policy (:func:`generate_row_with_retry`):
   what version_span + the loss-side staleness correction handle);
 * a terminal failure (budget exhausted) is delivered as the producer's
   FAILED sentinel with the attempts consumed — the trainer-side group
-  policy (strict eviction vs. survivor delivery) then decides.
+  policy (strict eviction vs. survivor delivery) then decides;
+* with ``pool_consult_fn`` (the partial response pool, ``partial_pool.py``),
+  retries consult it for a same-version partial — a hit resumes the
+  trajectory from its saved progress instead of restarting from the
+  prompt (paper §3.1/§3.3); a miss restarts clean.
 
 The function is stdlib-pure (injected async callables) so the retry
 policy is CPU-testable; ``rollout_producer.py`` wires it to the real
@@ -47,10 +51,13 @@ from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
-GenerateFn = Callable[[Any], Awaitable[Any]]
+GenerateFn = Callable[[Any, Any], Awaitable[Any]]  # (row, resume_hint | None)
 DeliverFn = Callable[[Any, int, int], Awaitable[None]]  # (row_result, attempts, version)
 FailedRowFn = Callable[[], Any]
 VersionForAttemptFn = Callable[[int], int]
+# partial-pool consult hook (attempt > 1): returns a resume hint (e.g.
+# partial tokens) for this attempt's version, or None for a clean restart
+PoolConsultFn = Callable[[int, int], Awaitable[Any]]  # (attempt, version) -> hint | None
 
 
 async def generate_row_with_retry(
@@ -60,6 +67,7 @@ async def generate_row_with_retry(
     deliver_fn: DeliverFn,
     failed_row_fn: FailedRowFn,
     version_for_attempt: VersionForAttemptFn,
+    pool_consult_fn: PoolConsultFn | None = None,
     max_attempts: int = 2,
     label: str = "",
 ) -> bool:
@@ -67,7 +75,11 @@ async def generate_row_with_retry(
 
     Args:
         row: the 1-row generation input.
-        generate_fn: runs one generation attempt; raises on failure.
+        generate_fn: runs one generation attempt, ``(row, resume_hint)``;
+            raises on failure. ``resume_hint`` is None on the first attempt
+            and whatever ``pool_consult_fn`` returned on retries (the
+            producer's closure decides how to attach it — e.g. a
+            ``resume_tokens`` field on the row).
         deliver_fn: async ``(result, attempts, version)`` — delivers a
             row (successful or FAILED sentinel) with its attempts count
             and the model version ``version_for_attempt(attempts)`` says
@@ -76,6 +88,12 @@ async def generate_row_with_retry(
         version_for_attempt: the model version to stamp for attempt ``k``
             (attempt 1 typically the group's submission snapshot; retries
             the CURRENT fleet version — see module docstring).
+        pool_consult_fn: optional partial-pool hook — called before every
+            RETRY (attempt >= 2) with ``(attempt, version_for_this_attempt)``;
+            a truthy return value is a resume hint (same-version partial
+            progress) the caller attaches to the generation input, turning
+            the retry into a resume instead of a restart. None/absent =
+            clean restart (the documented no-pool behavior).
         max_attempts: total attempts budget (>= 1; 1 = single-shot).
         label: logging context (uid[idx]).
 
@@ -86,10 +104,11 @@ async def generate_row_with_retry(
     """
     max_attempts = max(1, int(max_attempts))
     attempts = 0
+    hint = None  # resume hint for the NEXT attempt (None on the first)
     while True:
         attempts += 1
         try:
-            result = await generate_fn(row)
+            result = await generate_fn(row, hint)
         except Exception:  # noqa: BLE001 — any attempt failure is retryable
             if attempts >= max_attempts:
                 logger.exception(
@@ -107,6 +126,21 @@ async def generate_row_with_retry(
                 max_attempts,
                 exc_info=True,
             )
+            # partial-pool consult: a same-version partial turns the retry
+            # into a resume (the hint flows to generate_fn; the producer's
+            # closure decides what it means for its row format)
+            hint = None
+            if pool_consult_fn is not None:
+                try:
+                    hint = await pool_consult_fn(attempts + 1, version_for_attempt(attempts + 1))
+                except Exception:  # noqa: BLE001 — the pool must never break retries
+                    hint = None
+            if hint:
+                logger.info(
+                    "trajectory %s retry %d resumes from pooled partial progress",
+                    label,
+                    attempts + 1,
+                )
             continue
         await deliver_fn(result, attempts, version_for_attempt(attempts))
         return True

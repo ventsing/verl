@@ -63,6 +63,26 @@ async_training:
   # staleness, no static cap — rely on staleness_threshold instead).
   staleness_drop: null
 
+  # Partial response pool (§3.1 substrate): central version-gated store
+  # of in-progress trajectories. The producer's row retries consult it —
+  # a same-version partial turns a retry into a resume instead of a
+  # restart. Token-level WRITERS (the LLM client seam / resume-aware
+  # agent loops) are the documented external seam — see README TODO-16.
+  partial_pool:
+    enabled: false
+    max_entries: 4096
+    # max_bytes: null
+    # ttl_s: null          # e.g. 3600: partials of retired versions age out
+
+  # Fault tolerance (§3.3 heartbeat + §4.3 master failover): heartbeat the
+  # relay controller (recreate + recover + re-attach consumers on death);
+  # probe replica liveness (retire dead servers from routing — retries
+  # then redirect to healthy replicas; revive restarted ones).
+  fault_tolerance:
+    enabled: true
+    heartbeat_s: 10.0
+    failure_threshold: 3   # consecutive probe failures before retire
+
   # Long-tail mitigation (one straggler must not poison its group):
   # row_max_attempts: bounded per-row generation retries (producer-side;
   #   2 = one retry; 1 = single-shot). Retried rows re-stamp the version

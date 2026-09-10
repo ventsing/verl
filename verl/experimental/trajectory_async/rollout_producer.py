@@ -91,6 +91,81 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
         counts = await asyncio.gather(*[lb.get_inflight_count.remote(sid) for sid in server_ids])
         return dict(zip(server_ids, counts))
 
+    async def set_partial_pool(self, pool_actor) -> None:
+        """Attach the partial-response pool actor (optional; enables
+        pool-consulting row retries — a same-version partial turns a
+        retry into a resume instead of a restart)."""
+        self.partial_pool = pool_actor
+        self.pool_resume_hits = getattr(self, "pool_resume_hits", 0)
+
+    def async_stats(self) -> dict:
+        """Producer-side counters (the trainer folds these into metrics)."""
+        return {
+            "producer/pool_resume_hits": getattr(self, "pool_resume_hits", 0),
+        }
+
+    async def replica_probe_all(self) -> dict[str, bool]:
+        """Liveness probe of every LB server (the fault-tolerance
+        heartbeat, §3.3): a harmless RPC against each server handle —
+        ``abort_request`` on a nonexistent id is a committed no-op that
+        returns a not-found dict on a LIVE actor and raises on a dead
+        one. Returns server_id -> alive; servers that cannot even be
+        enumerated report alive (conservative — never retire on our own
+        bookkeeping failure)."""
+        mgr = getattr(self, "llm_server_manager", None)
+        if mgr is None:
+            return {}
+        out: dict[str, bool] = {}
+        try:
+            addresses = list(mgr.get_addresses())
+            handles = list(mgr.server_handles)
+        except Exception:  # noqa: BLE001 — enumeration failure -> no verdicts
+            logger.exception("replica_probe_all: server enumeration failed")
+            return {}
+        for sid, handle in zip(addresses, handles):
+            try:
+                await handle.abort_request.remote("__fault_tolerance_probe__")
+                out[sid] = True
+            except Exception:  # noqa: BLE001 — a dead actor raises
+                out[sid] = False
+        return out
+
+    async def replica_retire(self, server_ids: list[str]) -> list[str]:
+        """Remove dead servers from the load balancer's routing pool
+        (§3.3 redirect: new work and retries route to healthy replicas).
+        Returns the servers actually removed."""
+        lb = await self._lb()
+        if lb is None:
+            return []
+        try:
+            await lb.remove_servers.remote(server_ids=list(server_ids))
+            logger.warning("retired servers %s from routing (dead)", list(server_ids))
+            return list(server_ids)
+        except Exception:  # noqa: BLE001
+            logger.exception("replica_retire failed for %s", server_ids)
+            return []
+
+    async def replica_revive(self, server_ids: list[str]) -> list[str]:
+        """Re-add restarted servers to the load balancer's routing pool
+        (elasticity: a revived replica re-enters with zero in-flight —
+        least-loaded routing favors it until it fills)."""
+        mgr = getattr(self, "llm_server_manager", None)
+        lb = await self._lb()
+        if mgr is None or lb is None:
+            return []
+        try:
+            addresses = list(mgr.get_addresses())
+            handles = list(mgr.server_handles)
+            by_addr = dict(zip(addresses, handles))
+            servers = {sid: by_addr[sid] for sid in server_ids if sid in by_addr}
+            if servers:
+                await lb.add_servers.remote(servers=servers)
+                logger.info("revived servers %s back into routing", sorted(servers))
+            return sorted(servers)
+        except Exception:  # noqa: BLE001
+            logger.exception("replica_revive failed for %s", server_ids)
+            return []
+
     async def replica_drain(self, server_ids: list[str], on: bool) -> bool:
         """Begin/end a soft drain of the given LB servers (migration
         steering): drained servers stop acquiring NEW requests; in-flight
@@ -197,6 +272,33 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
     ):
         from verl.experimental.trajectory_async.row_retry import generate_row_with_retry
 
+        pool = getattr(self, "partial_pool", None)
+
+        async def generate(row_in, resume_hint):
+            if resume_hint is None:
+                return await self.async_rollout_manager.generate_sequences_single(row_in)
+            # same-version pooled partial: attach as a resume hint on the
+            # row (a ntb field the generation path may honor — the stock
+            # agent loops ignore unknown fields; a resume-aware rollout
+            # path continues from it instead of re-prefilling the prompt)
+            try:
+                row_in.non_tensor_batch["resume_tokens"] = np.array([resume_hint], dtype=object)
+            except Exception:  # noqa: BLE001 — a hint that cannot attach restarts clean
+                logger.exception("attaching resume hint failed; restarting clean")
+            return await self.async_rollout_manager.generate_sequences_single(row_in)
+
+        async def pool_consult(attempt: int, version_for_attempt: int):
+            if pool is None:
+                return None
+            try:
+                hint = await pool.get.remote(uid, traj_index, version_for_attempt)
+            except Exception:  # noqa: BLE001 — the pool must never break retries
+                return None
+            if hint is not None:
+                self.pool_resume_hits += 1
+                return hint.get("tokens")
+            return None
+
         async def deliver(result, attempts: int, stamped_version: int) -> None:
             # the retry policy computes the version per attempt: attempt 1
             # carries the group's submission snapshot; retries re-stamp
@@ -210,10 +312,11 @@ class TrajectoryLevelRollouter(FullyAsyncRollouter):
 
         await generate_row_with_retry(
             row,
-            generate_fn=self.async_rollout_manager.generate_sequences_single,
+            generate_fn=generate,
             deliver_fn=deliver,
             failed_row_fn=lambda: self._failed_row(uid, traj_index, group_size, version),
             version_for_attempt=lambda attempt: version if attempt == 1 else self._pull_version,
+            pool_consult_fn=pool_consult if pool is not None else None,
             max_attempts=getattr(self, "row_max_attempts", 2),
             label=f"{uid}[{traj_index}]",
         )

@@ -59,6 +59,16 @@ from verl.experimental.trajectory_async.repack_bridge import (
     RolloutReplicaView,
     build_repack_controller,
 )
+from verl.experimental.trajectory_async.fault_tolerance import (
+    RelaySupervisor,
+    ReplicaHealthMonitor,
+    rebuild_chain,
+)
+from verl.experimental.trajectory_async.partial_pool import (
+    PartialResponsePool,
+    PartialProgress,
+    make_partial_pool_actor,
+)
 from verl.experimental.trajectory_async.row_retry import generate_row_with_retry
 from verl.experimental.trajectory_async.staleness_correction import (
     StalenessCorrectionConfig,
@@ -131,6 +141,14 @@ __all__ = [
     "FleetRepackExecutor",
     "RolloutReplicaView",
     "build_repack_controller",
+    # fault tolerance (§3.3 heartbeat/retire + §4.3 failover/chain rebuild)
+    "RelaySupervisor",
+    "ReplicaHealthMonitor",
+    "rebuild_chain",
+    # partial response pool (§3.1 substrate)
+    "PartialResponsePool",
+    "PartialProgress",
+    "make_partial_pool_actor",
     # bounded row-generation retry (long-tail mitigation)
     "generate_row_with_retry",
     # loss-side staleness correction (version-aware off-policy layer)

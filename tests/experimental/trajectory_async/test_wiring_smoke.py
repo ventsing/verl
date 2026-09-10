@@ -127,6 +127,32 @@ class TestP0Wiring(unittest.TestCase):
         for method in ("pull_weights", "running_requests", "remove_request", "admit_request"):
             self.assertTrue(hasattr(RolloutReplicaView, method), f"replica view missing {method}")
 
+    def test_fault_tolerance_wiring(self):
+        """§3.3/§4.3 wiring: producer lifecycle RPCs, controller
+        ping/recover, pool actor factory, supervisor + pool exports."""
+        from verl.experimental.trajectory_async import (
+            PartialResponsePool,
+            RelaySupervisor,
+            ReplicaHealthMonitor,
+            generate_row_with_retry,
+        )
+        from verl.experimental.trajectory_async.partial_pool import make_partial_pool_actor
+        from verl.experimental.trajectory_async.relay_controller import make_relay_controller_actor
+        from verl.experimental.trajectory_async.rollout_producer import TrajectoryLevelRollouter
+
+        import inspect
+
+        for rpc in ("replica_probe_all", "replica_retire", "replica_revive", "set_partial_pool"):
+            self.assertTrue(hasattr(TrajectoryLevelRollouter, rpc), rpc)
+
+        # the retry policy consults the pool on retries (§3.1 consumer)
+        src = inspect.getsource(generate_row_with_retry)
+        self.assertIn("pool_consult_fn", src)
+
+        # actor factories exist
+        self.assertTrue(callable(make_partial_pool_actor))
+        self.assertTrue(callable(make_relay_controller_actor))
+
     def test_drain_lifecycle_wiring(self):
         """Migration execution path: the producer exposes the drain
         lifecycle RPCs the repack bridge drives."""

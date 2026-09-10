@@ -103,6 +103,12 @@ repack_interval_s=5.0
 # elsewhere — requires abort-resume semantics on the rollout stack)
 repack_hard_drain="False"
 
+# fault tolerance: controller failover + replica retire/revive on;
+# partial response pool off until a token-level writer seam lands
+ft_enabled="True"
+ft_heartbeat_s=10.0
+pool_enabled="False"
+
 # long-tail mitigation: row retries on, strict groups otherwise
 row_max_attempts=2
 min_group_survivors=""   # e.g. 4: deliver survivors of failed groups
@@ -200,5 +206,8 @@ python -m verl.experimental.trajectory_async.trajectory_async_main \
     async_training.repack.enabled="${repack_enabled}" \
     async_training.repack.check_interval_s="${repack_interval_s}" \
     async_training.repack.hard_drain="${repack_hard_drain}" \
+    async_training.fault_tolerance.enabled="${ft_enabled}" \
+    async_training.fault_tolerance.heartbeat_s="${ft_heartbeat_s}" \
+    async_training.partial_pool.enabled="${pool_enabled}" \
     async_training.row_max_attempts="${row_max_attempts}" \
     rollout.checkpoint_engine.backend="kimi_ckpt_engine"

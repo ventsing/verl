@@ -231,6 +231,32 @@ class RelayController:
 
     # ---------------------------------------------------------------- pull
 
+    def recover(self, latest_version: int, replica_versions: dict[int, int] | None = None) -> None:
+        """Master-failover state recovery (§4.3): a resurrected controller
+        rebuilds its registry from the authority that survives it — the
+        trainer knows the published version; engines keep their staged
+        shards. The synthetic ``_versions`` entry carries ``recovered``
+        (staged_bytes=0 — quota retirement under-counts until the next
+        publish re-stages, the conservative direction: over-retention is
+        bounded by ``keep_last``). Per-replica versions default unknown:
+        the next ``pull_replica`` re-syncs each one from engine truth."""
+        self._versions = {
+            latest_version: {
+                "staged_bytes": 0,
+                "staged_params": 0,
+                "retired": False,
+                "recovered": True,
+            }
+        }
+        self._replica_versions = dict(replica_versions) if replica_versions else {}
+        self.recoveries = getattr(self, "recoveries", 0) + 1
+        logger.warning(
+            "relay controller recovered: latest=v%s, %d/%d replica versions known",
+            latest_version,
+            len(self._replica_versions),
+            self._num_replicas,
+        )
+
     @property
     def latest_version(self) -> int | None:
         live = [v for v, info in self._versions.items() if not info["retired"]]
@@ -335,6 +361,7 @@ class RelayController:
             "relay/publishes": self._publishes,
             "relay/pulls": self._pulls,
             "relay/replica_pulls": self._replica_pulls,
+            "relay/recoveries": getattr(self, "recoveries", 0),
             "relay/quota_retires": self._quota_retires,
             "relay/staged_bytes": sum(self._versions[v]["staged_bytes"] for v in live),
             "relay/publish_seconds_total": self._publish_seconds,
@@ -479,5 +506,11 @@ def make_relay_controller_actor():
 
         def snapshot(self) -> dict:
             return self._controller.snapshot()
+
+        def ping(self) -> bool:
+            return True
+
+        def recover(self, latest_version: int, replica_versions=None) -> None:
+            self._controller.recover(latest_version, replica_versions)
 
     return RelayControllerActor

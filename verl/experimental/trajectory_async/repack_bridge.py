@@ -163,6 +163,7 @@ class FleetRepackExecutor:
         # drain lifecycle state
         self._draining: dict[int, str] = {}  # replica_id -> server_id
         self._pulling: set[int] = set()  # replica_ids with a pull in flight
+        self._retired: set[str] = set()  # server_ids removed from routing (dead)
         self._prev_inflight: dict[int, int] = {}  # replica_id -> last tick's count
         self._cache: list[ReplicaState] = []
 
@@ -174,6 +175,7 @@ class FleetRepackExecutor:
         self.migrations_started = 0
         self.migrations_completed = 0  # sources fully freed (pulled + undrained)
         self.requests_aborted_redirected = 0
+        self.retired_replicas = 0
 
     # ------------------------------------------------------------ probes
 
@@ -208,7 +210,7 @@ class FleetRepackExecutor:
                     batch_quota=batch_bound or 0,
                     max_running=batch_bound or 0,
                     pulling=view.replica_id in self._pulling,
-                    routable=view.replica_id not in self._draining,
+                    routable=view.replica_id not in self._draining and not self._is_retired(view),
                 )
             )
         self._prev_inflight = {
@@ -243,7 +245,7 @@ class FleetRepackExecutor:
         # (a) drain completion watcher
         for replica_id in list(self._draining):
             view = self.handles.get(replica_id)
-            if view is None:
+            if view is None or self._is_retired(view):
                 self._draining.pop(replica_id, None)
                 continue
             running = await view.running_count()
@@ -280,7 +282,7 @@ class FleetRepackExecutor:
         # (b) idle refresh (never touches draining replicas — the watcher
         # above owns their lifecycle — nor replicas it just resolved)
         for view, version, running in await self._snapshot_states():
-            if view.replica_id in self._draining or view.replica_id in handled:
+            if view.replica_id in self._draining or view.replica_id in handled or self._is_retired(view):
                 continue
             if version is None or running is None or running > 0:
                 continue  # unknown version, unknown load, or busy -> skip
@@ -295,6 +297,33 @@ class FleetRepackExecutor:
                 logger.exception("repack refresh failed for replica %d", view.replica_id)
         self.refreshes += refreshed
         return refreshed
+
+    def retire(self, server_ids: list[str]) -> int:
+        """Mark replicas dead (removed from LB routing by the supervisor):
+        never refreshed (a pull onto a dead replica is wasted), never
+        routable, never a migration party. Returns the count newly
+        retired."""
+        dead = set(server_ids)
+        newly = dead - self._retired
+        self._retired |= newly
+        if newly:
+            self.retired_replicas += len(newly)
+            # a retired replica cannot complete a drain — release it from
+            # the lifecycle so the counters stay honest
+            for replica_id in [rid for rid, sid in self._draining.items() if sid in dead]:
+                self._draining.pop(replica_id, None)
+            logger.warning("repack: replicas %s retired (dead) — excluded from all lifecycle paths", sorted(newly))
+        return len(newly)
+
+    def revive(self, server_ids: list[str]) -> int:
+        """Re-admit restarted replicas: back to routing (the supervisor
+        re-added them to the LB), eligible for refresh again."""
+        revived = set(server_ids) & self._retired
+        self._retired -= revived
+        return len(revived)
+
+    def _is_retired(self, view: RolloutReplicaView) -> bool:
+        return view.server_id in self._retired
 
     async def _pull_tracked(self, view: RolloutReplicaView, version: int) -> None:
         """Pull with in-flight tracking (the planner's ``pulling`` flag)."""
@@ -338,7 +367,7 @@ class FleetRepackExecutor:
         for src, dst in plan:
             src_view = self.handles.get(src)
             dst_view = self.handles.get(dst)
-            if src_view is None or dst_view is None:
+            if src_view is None or dst_view is None or self._is_retired(src_view) or self._is_retired(dst_view):
                 self.migration_pairs_declined += 1
                 continue
             if src in self._draining or dst in self._draining or dst in self._pulling:
@@ -433,6 +462,7 @@ class FleetRepackExecutor:
             "repack/migrations_completed": self.migrations_completed,
             "repack/requests_aborted_redirected": self.requests_aborted_redirected,
             "repack/draining_replicas": len(self._draining),
+            "repack/retired_replicas": len(self._retired),
         }
 
 
@@ -585,6 +615,12 @@ def make_repack_controller_actor():
 
         def notify_update(self) -> None:
             self._manager.notify_update()
+
+        def retire(self, server_ids) -> int:
+            return self._executor.retire(list(server_ids))
+
+        def revive(self, server_ids) -> int:
+            return self._executor.revive(list(server_ids))
 
         def snapshot(self) -> dict:
             snap = dict(self._manager.stats.snapshot())

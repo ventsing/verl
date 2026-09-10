@@ -28,6 +28,8 @@ the kimi/mooncake adapters).
 | `relay_controller.py` | the Ray-native control plane of the versioned pull path: `RelayController` (version registry, retention + staged-bytes quota, fleet AND per-replica pull drivers with per-replica locking, metrics — CPU-testable) + `derive_replica_partition` + `build_relay_controller` / `make_relay_controller_actor` wiring it over a real `CheckpointEngineManager` |
 | `rollout_producer.py` | `TrajectoryLevelRollouter(FullyAsyncRollouter)` — the trajectory-level producer: one queue message per response (uid / traj_index / group_size / model_version / attempts stamped), bounded row retries (`row_retry.py` policy; retried rows re-stamp the version they actually generated under), FAILED rows on budget exhaustion, batch-boundary weight pulls |
 | `row_retry.py` | bounded per-row generation retry policy (stdlib-pure, CPU-testable): attempt budget, per-attempt version stamping, FAILED-sentinel delivery on exhaustion — the cheapest long-tail mitigation (a transient single-response failure stops terminating whole groups) |
+| `partial_pool.py` | Partial Response Pool (paper §3.1 substrate): central, version-gated store of in-progress trajectories (same-version redirect rule enforced on every read; TTL + LRU + byte-quota bounded) — the producer's row retries consult it; token-level writers are the documented external seam |
+| `fault_tolerance.py` | fleet + relay fault tolerance (§3.3 heartbeat + §4.3 master failover): `ReplicaHealthMonitor` (consecutive-failure strikes, hysteresis), `RelaySupervisor` (controller heartbeat → recreate + recover + re-attach every consumer; replica probes → retire from routing / revive), `rebuild_chain` (O(dead) relay-chain splice, pure core) |
 | `repack_bridge.py` | the repack closed loop over the real rollout fleet (paper §5): `RolloutReplicaView` (LB in-flight probe + per-replica pull), `FleetRepackExecutor` — idle-replica refresh after each publish PLUS cross-replica migration as the DRAIN LIFECYCLE (`begin_drain` steering → optional hard abort with client-side transparent resume → completion watcher pulls fresh weights into emptied sources and `end_drain`s them back to routing), real async fleet snapshots feeding the Best-Fit planner, `build_repack_controller` / `make_repack_controller_actor` |
 | `staleness_correction.py` | loss-side version-staleness correction: per-trajectory reweighting by version age (`staleness_weights`), adaptive clip scaling (`adaptive_clip_scale`), version-cohort GRPO baselines (`cohort_advantages`), cohort diagnostics; `apply_staleness_correction` attaches `staleness_weights` / `cliprange_scale` batch columns consumed by the policy loss (see below) |
 | `trajectory_async_main.py` | the launcher: `TrajectoryAsyncTaskRunner` wiring `TrajectoryLevelRollouter` + `TrajectoryAsyncTrainer` + MessageQueue + the relay controller (mirrors `fully_async_main.py`) |
@@ -229,13 +231,30 @@ KV movement); freed sources immediately pull the latest weights.
     count, CanFit collapses onto the true batch bound
     `rollout.max_num_seqs`); a real `kv_transfer_fn` (KV blocks never
     travel — recompute prefill is the accepted default).
-15. Relay tier elasticity: per the paper's §4.3, O(1) chain rebuild on
-    relay failure, master failover (deliberately deferred with fault
-    tolerance as a whole).
-16. Partial response pool + fault tolerance (paper §3.3): stream
-    in-progress trajectories centrally; on replica failure redirect to a
-    same-version replica reusing partial progress. Necessity scoping
-    (deliberate deferral): the pool is a RELIABILITY substrate, not a
+15. Relay tier elasticity — LANDED (§4.3 + §3.3): master failover is
+    `RelaySupervisor` (fault_tolerance.py): heartbeats the
+    RelayControllerActor; on actor death it recreates the controller
+    via a factory, RECOVERS state (`RelayController.recover`: the
+    trainer is the authority on the published version; engines keep
+    their staged shards; per-replica versions re-sync on the next
+    pull — the registry is derived data by design, no async
+    checkpoint needed), and re-attaches every consumer (producer
+    batch-boundary pulls, the repack controller actor). Replica-level
+    fault tolerance: liveness probes (a harmless `abort_request` RPC
+    per server handle — dead actors raise, live ones no-op) with
+    consecutive-failure strikes; dead replicas are RETIRED from LB
+    routing (`remove_servers`, a committed socket) and from every
+    repack lifecycle path; restarted replicas REVIVE (re-added with
+    zero in-flight, least-loaded routing refills them). Chain rebuild:
+    `rebuild_chain` implements the O(dead) splice (exclude dead ranks,
+    neighbors reconnect, live ranks never re-receive) — engine-side
+    RDMA re-registration for the mooncake rank chain is the remaining
+    cluster-validated TODO; the kimi path needs no chain (per-rank
+    P2P reads are already failure-isolated per replica).
+16. Partial response pool (paper §3.1/§3.3) — SUBSTRATE LANDED,
+    WRITER SEAM EXTERNAL: stream in-progress trajectories centrally; on
+    replica failure redirect to a same-version replica reusing partial
+    progress. Scoping: the pool is a RELIABILITY substrate, not a
     requirement of trajectory-level async RL. And note the plain
     sentinel+eviction story was NOT enough for the true long tail — one
     straggler used to poison its n−1 healthy siblings (compute waste ∝
@@ -253,11 +272,22 @@ KV movement); freed sources immediately pull the latest weights.
     original rollout.n; advantage normalization runs over survivors), and
     a GROUP DEADLINE (`group_deadline_s`, bounds head-of-line blocking;
     late siblings are counted and dropped — the accepted cost of a
-    bounded wait). What still argues FOR the pool: (a) fleet scale where
-    worker failure is routine, or (b) active migration that empties BUSY
-    replicas and the re-prefill cost of recompute resend matters — until
-    then retries + survivors + recompute resend cover the cases without a
-    pool.
+    bounded wait). The pool itself has now LANDED as the substrate
+    (`partial_pool.py`): a central, version-gated store of in-progress
+    trajectories (same-version reads only — a cross-version partial is
+    refused AND dropped, the same-version redirect rule; TTL + LRU +
+    byte-quota bounded) with the consumer wired (row retries consult
+    it: a same-version hit becomes a resume hint on the retry, a miss
+    restarts clean; a pool error can never break a retry). The §3.3
+    failure-redirect half is fully live WITHOUT the pool: probe →
+    retire from routing → the row-retry loop redirects onto healthy
+    replicas (recompute prefill). The one deliberately-external seam
+    is the token-level WRITER: checkpointing partials as they are
+    generated must sit where tokens are observable (the LLM client's
+    generation loop or a resume-aware agent loop — shared rollout
+    infrastructure outside this package; the pool actor's `put` RPC is
+    the seam). Until a writer lands, the pool serves redirects at
+    whole-trajectory retry granularity.
 
 ## Staleness correction (loss-side)
 
@@ -319,7 +349,7 @@ off-policy distance, the latter reweights what is admitted.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (183 tests; 167 stdlib-only +
+`tests/experimental/trajectory_async/` (212 tests; 196 stdlib-only +
 3 torch-gated adapter smokes + 2 torch-gated staleness batch-application
 smokes + 11 ray-gated wiring smokes, all skipping gracefully without
 their deps):
@@ -335,6 +365,20 @@ their deps):
   unknown skipped, one failure never stops the rest), migration
   declining (never half-migrates), manager hook + notify-update wakeup,
   conservative no-mapping wiring;
+* partial response pool: version-gated reads (same-version reuse,
+  mismatch refused-and-dropped, complete entries terminal), TTL expiry,
+  LRU/byte-quota eviction (never the just-put), no version regression
+  on overwrite, discard lifecycle, snapshot metrics; retry-consumer
+  hook (hints flow to retries only, first attempts clean, pool errors
+  never break retries);
+* fault tolerance: health monitor (threshold strikes, success-resets,
+  retire dedup, revive), supervisor (heartbeat failover recovers +
+  re-attaches consumers, failed resurrection survived and counted,
+  probe retire/revive lifecycle, retire fires once), chain rebuild
+  (identity, middle splice, multiple deaths, all-dead empty, unknown
+  deads ignored), controller recover semantics, bridge retire/revive
+  (no refresh, non-routable snapshots, drain release, migrate-pair
+  decline, idempotence);
 * repack drain lifecycle: soft plan execution (drain steering, deferred
   emptiness), hard mode (abort counts, drain-before-abort ordering,
   crash-degrades-to-soft), execution-time CanFit rejections, no-drain

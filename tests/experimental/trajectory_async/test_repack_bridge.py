@@ -338,6 +338,68 @@ class TestDrainWatcher(unittest.TestCase):
         self.assertEqual(drain.calls, [])  # end_drain NOT called
 
 
+class TestRetireRevive(unittest.TestCase):
+    """Fault tolerance (§3.3): dead replicas are excluded from every
+    lifecycle path; revived ones return."""
+
+    def _cfg(self, **kw):
+        return RepackConfig(batch_bound=32, **kw)
+
+    def test_retired_replica_never_refreshed_or_routable(self):
+        pulls = []
+        inflight = {"srv-0": 0, "srv-1": 0}
+        views = [_view(0, {0: 3}, inflight, pulls), _view(1, {1: 3}, inflight, pulls)]
+        ex = _executor(views, latest=5, config=self._cfg())
+        self.assertEqual(ex.retire(["srv-0"]), 1)
+        refreshed = asyncio.run(ex.refresh_idle())
+        self.assertEqual(pulls, [(1, 5)])  # only the live replica refreshes
+        self.assertEqual(refreshed, 1)
+        states = {s.replica_id: s for s in asyncio.run(ex.snapshot())}
+        self.assertFalse(states[0].routable)  # dead: not a plan party
+        self.assertTrue(states[1].routable)
+
+    def test_retired_released_from_drain(self):
+        """A replica that dies mid-migration cannot complete its drain —
+        release it so the counters stay honest."""
+        pulls = []
+        inflight = {"srv-0": 2}
+        views = [_view(0, {0: 3}, inflight, pulls)]
+        drain = _FakeDrain()
+        ex = _executor(views, latest=5, drain=drain, config=self._cfg())
+        ex._draining[0] = "srv-0"
+        ex.retire(["srv-0"])
+        self.assertNotIn(0, ex._draining)  # released
+
+    def test_migrate_pairs_with_retired_party_declined(self):
+        pulls = []
+        inflight = {"srv-0": 1, "srv-1": 1}
+        views = [_view(0, {0: 5}, inflight, pulls), _view(1, {1: 5}, inflight, pulls)]
+        drain = _FakeDrain()
+        ex = _executor(views, latest=5, drain=drain, config=self._cfg())
+        ex.retire(["srv-1"])
+        result = asyncio.run(ex.migrate([(0, 1)]))
+        self.assertEqual(result.plan, [])  # destination dead -> declined
+        self.assertEqual(ex.migration_pairs_declined, 1)
+
+    def test_revive_returns_replica_to_lifecycle(self):
+        pulls = []
+        inflight = {"srv-0": 0}
+        views = [_view(0, {0: 3}, inflight, pulls)]
+        ex = _executor(views, latest=5, config=self._cfg())
+        ex.retire(["srv-0"])
+        self.assertEqual(ex.revive(["srv-0"]), 1)
+        asyncio.run(ex.refresh_idle())
+        self.assertEqual(pulls, [(0, 5)])  # refreshable again
+
+    def test_retire_is_idempotent(self):
+        pulls = []
+        views = [_view(0, {0: 3}, {"srv-0": 0}, pulls)]
+        ex = _executor(views, latest=5, config=self._cfg())
+        self.assertEqual(ex.retire(["srv-0"]), 1)
+        self.assertEqual(ex.retire(["srv-0"]), 0)  # already retired
+        self.assertEqual(ex.retired_replicas, 1)
+
+
 class TestSnapshot(unittest.TestCase):
     def test_real_states_from_probes(self):
         pulls = []

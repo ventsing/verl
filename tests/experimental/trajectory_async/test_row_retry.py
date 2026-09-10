@@ -32,9 +32,11 @@ class FlakyGenerate:
         self.fail_times = fail_times
         self.calls = 0
         self.result = result
+        self.hints: list = []
 
-    async def __call__(self, row):
+    async def __call__(self, row, resume_hint=None):
         self.calls += 1
+        self.hints.append(resume_hint)
         if self.calls <= self.fail_times:
             raise RuntimeError(f"transient failure #{self.calls}")
         return self.result
