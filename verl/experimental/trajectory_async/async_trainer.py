@@ -274,6 +274,47 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
             keep_last,
         )
 
+    def _fit_compute_advantage(self, batch):
+        """Standard advantages + the version-staleness correction layer.
+
+        The correction applies ONLY to version-stamped batches (rows carry
+        ``model_version`` from the trajectory-level producer) on the
+        versioned weight path (relay controller attached): it reweights
+        each trajectory by its version age, optionally widens/tightens its
+        clip bounds and (experimentally) renormalizes mixed-version groups
+        by version cohort — see ``staleness_correction.py`` for the
+        positioning vs the PPO ratio's built-in per-token cross-version IS.
+        """
+        batch = super()._fit_compute_advantage(batch)
+
+        from verl.experimental.trajectory_async.staleness_correction import (
+            StalenessCorrectionConfig,
+            apply_staleness_correction,
+        )
+
+        cfg = StalenessCorrectionConfig.from_config(self.config.async_training.get("staleness_correction", None))
+        if cfg is None:
+            return batch
+        if getattr(self, "relay_controller", None) is None:
+            logger.debug(
+                "staleness_correction set but no relay controller attached "
+                "(stock push path or unstamped producer); skipping"
+            )
+            return batch
+        if "model_version" not in (getattr(batch, "non_tensor_batch", None) or {}):
+            return batch  # group-level producer without version stamps
+
+        # during this update the actor embodies the version that will be
+        # published at the end of the step (the weight_store path publishes
+        # current_param_version + 1 in _fit_update_weights)
+        apply_staleness_correction(
+            batch,
+            current_version=self.current_param_version + 1,
+            config=cfg,
+            metrics_out=self.metrics,
+        )
+        return batch
+
     async def _fit_update_weights(self):
         """Weight sync with a multi-version pull-based extension point.
 

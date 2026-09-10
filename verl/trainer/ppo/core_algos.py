@@ -1291,6 +1291,8 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    staleness_weights: torch.Tensor | None = None,
+    cliprange_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1344,6 +1346,11 @@ def compute_policy_loss_vanilla(
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
+    if cliprange_scale is not None:
+        # per-trajectory adaptive clip bounds (version-staleness correction;
+        # broadcast (batch, 1) over the response positions)
+        cliprange_low = cliprange_low * cliprange_scale
+        cliprange_high = cliprange_high * cliprange_scale
     pg_losses2 = -advantages * torch.clamp(
         ratio, 1 - cliprange_low, 1 + cliprange_high
     )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
@@ -1363,6 +1370,12 @@ def compute_policy_loss_vanilla(
     # Apply rollout correction weights if provided
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
+
+    # Apply version-staleness weights if provided: age-based per-trajectory
+    # reweighting (trajectory-level async RL; NOT a π-ratio IS weight —
+    # composes with the clipped ratio above without double-counting)
+    if staleness_weights is not None:
+        pg_losses = pg_losses * staleness_weights
 
     pg_loss = agg_loss(
         loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
@@ -2419,6 +2432,8 @@ def compute_policy_loss_bypass_mode(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    staleness_weights: torch.Tensor | None = None,
+    cliprange_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Bypass mode policy loss supporting both REINFORCE and PPO-clip.
 
@@ -2515,7 +2530,13 @@ def compute_policy_loss_bypass_mode(
 
     # Dispatch to appropriate loss function based on loss_type
     if loss_type == "reinforce":
-        # REINFORCE: Apply IS weights explicitly
+        # REINFORCE: Apply IS weights explicitly; version-staleness weights
+        # compose multiplicatively (age-based, orthogonal to the π-ratio IS)
+        effective_is_weights = computed_is_weights
+        if staleness_weights is not None and effective_is_weights is not None:
+            effective_is_weights = effective_is_weights * staleness_weights
+        elif staleness_weights is not None:
+            effective_is_weights = staleness_weights
         pg_loss, pg_metrics = compute_policy_loss_reinforce(
             rollout_log_prob=rollout_log_prob,
             log_prob=log_prob,
@@ -2523,7 +2544,7 @@ def compute_policy_loss_bypass_mode(
             response_mask=effective_mask,
             loss_agg_mode=loss_agg_mode,
             config=config,
-            rollout_is_weights=computed_is_weights,
+            rollout_is_weights=effective_is_weights,
         )
 
     elif loss_type == "ppo_clip":
@@ -2538,6 +2559,8 @@ def compute_policy_loss_bypass_mode(
             loss_agg_mode=loss_agg_mode,
             config=config,
             rollout_is_weights=None,  # Explicitly None - no IS weights for PPO-clip
+            staleness_weights=staleness_weights,  # age-based; composes with the clip
+            cliprange_scale=cliprange_scale,
         )
 
     else:

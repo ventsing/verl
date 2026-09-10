@@ -53,6 +53,15 @@ from verl.experimental.trajectory_async.relay_controller import (
     build_relay_controller,
     make_relay_controller_actor,
 )
+from verl.experimental.trajectory_async.staleness_correction import (
+    StalenessCorrectionConfig,
+    adaptive_clip_scale,
+    apply_staleness_correction,
+    cohort_advantages,
+    cohort_stats,
+    staleness_weight,
+    staleness_weights,
+)
 from verl.experimental.trajectory_async.relay_tier import (
     RelayNode,
     RelayService,
@@ -110,6 +119,14 @@ __all__ = [
     "RelayController",
     "build_relay_controller",
     "make_relay_controller_actor",
+    # loss-side staleness correction (version-aware off-policy layer)
+    "StalenessCorrectionConfig",
+    "adaptive_clip_scale",
+    "apply_staleness_correction",
+    "cohort_advantages",
+    "cohort_stats",
+    "staleness_weight",
+    "staleness_weights",
     # weight store + P2P backends
     "FakeP2PBackend",
     "KimiP2PBackend",

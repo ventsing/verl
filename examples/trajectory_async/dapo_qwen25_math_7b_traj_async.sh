@@ -91,6 +91,10 @@ staleness_drop=null
 # multi-version pull-based weights over the kimi P2P engine
 weight_store_backend="kimi"
 weight_store_keep_last=2
+# loss-side version-staleness correction (PPO ratio already carries the
+# per-token cross-version IS; this adds age-based reweighting etc.)
+stale_mode="decay"
+stale_lam=0.5
 
 python -m verl.experimental.trajectory_async.trajectory_async_main \
     data.train_files="${TRAIN_FILE}" \
@@ -179,4 +183,6 @@ python -m verl.experimental.trajectory_async.trajectory_async_main \
     async_training.staleness_drop="${staleness_drop}" \
     async_training.weight_store.backend="${weight_store_backend}" \
     async_training.weight_store.keep_last="${weight_store_keep_last}" \
+    async_training.staleness_correction.mode="${stale_mode}" \
+    async_training.staleness_correction.lam="${stale_lam}" \
     rollout.checkpoint_engine.backend="kimi_ckpt_engine"

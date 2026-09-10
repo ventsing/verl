@@ -86,6 +86,13 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     fields = ["response_mask", "old_log_probs", "advantages"]
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
+    # version-staleness correction columns (trajectory-level async RL; only
+    # present when the trainer applies staleness_correction — consumed by
+    # the vanilla/bypass loss modes)
+    if "staleness_weights" in data:
+        fields.append("staleness_weights")
+    if "cliprange_scale" in data:
+        fields.append("cliprange_scale")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
     data = data.select(*fields).to_padded_tensor()
@@ -95,13 +102,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
+    staleness_weights = data.get("staleness_weights", None)
+    cliprange_scale = data.get("cliprange_scale", None)
 
     loss_agg_mode = config.loss_agg_mode
 
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
+    loss_kwargs = dict(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
@@ -110,6 +119,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         config=config,
         rollout_is_weights=rollout_is_weights,
     )
+    if staleness_weights is not None:
+        loss_kwargs["staleness_weights"] = staleness_weights
+    if cliprange_scale is not None:
+        loss_kwargs["cliprange_scale"] = cliprange_scale
+    pg_loss, pg_metrics = policy_loss_fn(**loss_kwargs)
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower

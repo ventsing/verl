@@ -63,6 +63,25 @@ async_training:
   # staleness, no static cap — rely on staleness_threshold instead).
   staleness_drop: null
 
+  # Loss-side version-staleness correction (see staleness_correction.py):
+  # the PPO ratio already carries the per-token cross-version IS
+  # (bypass_mode: old_log_probs = rollout_log_probs -> ratio = pi_V/pi_vi,
+  # clipped = TIS); this layer adds the version-aware treatment —
+  # per-trajectory reweighting by version age (gap-aware/SAPipe-style,
+  # self-normalized), optional adaptive clip scaling, and (experimental)
+  # version-cohort group baselines. Requires the versioned weight path
+  # (weight_store) + the trajectory-level producer's version stamps.
+  # null = off.
+  staleness_correction:
+    mode: decay        # none | decay (1/(1+lam*age)) | exp (exp(-lam*age))
+    lam: 0.5
+    normalize: True    # self-normalize weights to mean 1 (gradient scale)
+    adaptive_clip: False   # per-trajectory clip scaling (experimental)
+    adaptive_clip_gamma: 0.25  # >0 widens trust region with age; <0 tightens
+    adaptive_clip_max_scale: 2.0
+    adaptive_clip_min_scale: 0.5
+    cohort_baseline: False  # version-cohort GRPO baselines (experimental)
+
   # Multi-version, pull-based weight path (the relay tier's P0 wiring):
   #   publish = stage-only (actor ranks register per-version CPU shards in
   #             the kimi P2P store; the metadata gather is the whole

@@ -27,6 +27,7 @@ the kimi/mooncake adapters).
 | `repack.py` | active scheduling (Laminar §5): `ReplicaState` idleness (KVCache ramp-down), Algorithm 1 `best_fit_consolidation` (pure function), `RepackManager` (periodic + post-update triggers, drives any `RepackExecutor`), `MigrationResult` |
 | `relay_controller.py` | the Ray-native control plane of the versioned pull path: `RelayController` (version registry, retention, pull policy, metrics — CPU-testable) + `build_relay_controller` / `make_relay_controller_actor` wiring it over a real `CheckpointEngineManager` |
 | `rollout_producer.py` | `TrajectoryLevelRollouter(FullyAsyncRollouter)` — the trajectory-level producer: one queue message per response (uid / traj_index / group_size / model_version stamped), FAILED rows on failure, batch-boundary weight pulls |
+| `staleness_correction.py` | loss-side version-staleness correction: per-trajectory reweighting by version age (`staleness_weights`), adaptive clip scaling (`adaptive_clip_scale`), version-cohort GRPO baselines (`cohort_advantages`), cohort diagnostics; `apply_staleness_correction` attaches `staleness_weights` / `cliprange_scale` batch columns consumed by the policy loss (see below) |
 | `trajectory_async_main.py` | the launcher: `TrajectoryAsyncTaskRunner` wiring `TrajectoryLevelRollouter` + `TrajectoryAsyncTrainer` + MessageQueue + the relay controller (mirrors `fully_async_main.py`) |
 
 ## Relation to the v1 separate-async stack (TransferQueue replay buffer)
@@ -189,6 +190,49 @@ KV movement); freed sources immediately pull the latest weights.
     delivery at trajectory granularity already landed with the producer;
     the pool + redirect is the missing part.)
 
+## Staleness correction (loss-side)
+
+Honest positioning first: **the Laminar paper derives no importance-sampling
+bias or convergence bound** — its Appendix D analyzes chain-broadcast
+latency, and its §8.2 comparison is empirical. Its actual recipe is
+trajectory version-atomicity (one weight version per trajectory — unlike
+partial-rollout systems that mix versions *within* a trajectory), a bounded
+observed staleness (≤4 in its runs), and a larger mini-batch (2048) to
+stabilize off-policy training. Appendix C explicitly lists IS-based
+experience sampling as future work.
+
+What the loss path already has (no new code needed): with
+`algorithm.rollout_correction.bypass_mode=True` (the fully-async default),
+`old_log_probs := rollout_log_probs`, so the PPO ratio is
+π_current/π_{v_i} — the per-token cross-version importance ratio — and its
+clipping IS truncated importance sampling. The correction exists; it is
+version-blind.
+
+What `staleness_correction.py` adds (grounded in the staleness-aware
+training literature — gap-aware gradient-staleness mitigation, SAPipe-style
+staleness-aware reweighting, TIS/V-trace variance control):
+
+1. **Staleness reweighting** (`async_training.staleness_correction`, default
+   in the example config): per-trajectory weight `w(age)=1/(1+λ·age)` or
+   `exp(-λ·age)`, self-normalized to mean 1. Reweights *representation* —
+   how much each version cohort contributes to the update. Composes with,
+   never double-counts, the π-ratio IS inside the clip (it is a function of
+   version distance, not of the ratio).
+2. **Adaptive clipping** (default OFF): per-trajectory clip scale
+   `ε_i = ε·clamp(1+γ·age, min, max)`; γ>0 widens the trust region with age
+   (counteracts clip saturation shrinking stale gradients), γ<0 tightens it.
+3. **Version-cohort baselines** (default OFF, experimental): mixed-version
+   groups (version_span>0) normalize advantages within same-version cohorts.
+   Any baseline keeps the IS-weighted estimator unbiased; a cohort baseline
+   removes between-version reward drift from the control variate at the cost
+   of the between-cohort signal. Empirical tradeoff, hence opt-in.
+4. **Cohort diagnostics**: `trajectory_async/stale_*` metrics (age mean/max,
+   cohort count, fresh fraction, weight spread, clip scale).
+
+Consumer-side `max_staleness_drop` (hard truncation in the collector) and
+this loss-side layer are complementary: the former bounds the worst-case
+off-policy distance, the latter reweights what is admitted.
+
 ## Relation to the Laminar paper (alignment status)
 
 | Paper element | Status |
@@ -202,16 +246,22 @@ KV movement); freed sources immediately pull the latest weights.
 | §4.2 relay hierarchy: master + per-machine relays, resharding, chain-pipelined broadcast, PCIe local pull | ⚠️ P0 flat path via `relay_controller.py` (versioned stage + fleet pull, live); per-machine chain tier = `relay_tier.py` (CPU-verified) = TODO-12 |
 | §4.2 actor stall = single push to master | ✅ `publish` returns after the master stage |
 | §5 repack: triggers, version grouping, KVCache idleness, Algorithm 1 Best-Fit + CanFit(`C_max` ∧ `B`), freed sources pull fresh weights | ✅ `repack.py` + `RolloutRepackExecutor`; real-stack handle TODO-14 |
-| §8 convergence guarantees / multi-iteration training | ❌ out of scope here (no model, no gradient step) |
+| §8 convergence / off-policy stability under staleness | ⚠️ paper itself derives no bound (App. D = broadcast latency; App. C lists IS-based experience sampling as future work); our mitigation = bounded staleness (collector) + loss-side version-staleness correction (`staleness_correction.py`) |
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (87 tests; 80 stdlib-only + 2
+`tests/experimental/trajectory_async/` (112 tests; 103 stdlib-only + 2
 torch-gated adapter smokes + 4 ray-gated wiring smokes + 1 torch-gated
-kimi read-placement smoke, all skipping gracefully without their deps):
+kimi read-placement smoke + 2 torch-gated staleness batch-application
+smokes, all skipping gracefully without their deps):
 
 * aggregator: completion order, duplicates, FAILED-eviction protocol,
   late-arrival guard, buffer limits, record invariants;
+* staleness correction: weight families (decay/exp/none), normalization
+  invariants, adaptive clip bounds + caps, cohort baselines (mixed-version
+  groups, singleton fallback, degenerate rewards), diagnostics, config
+  parsing, torch batch application (weight column masking/normalization,
+  clip column, cohort advantage rewrite);
 * collector: group/trajectory/mixed granularity, eviction accounting,
   staleness refusal, reconciliation identity, DataProto row adapter;
 * mini-batcher: exact sizes, group advantages preserved;
