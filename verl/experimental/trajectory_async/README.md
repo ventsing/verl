@@ -237,7 +237,8 @@ rollouter's LB + manager seams (committed sockets: `remove_servers` /
   transparently resume them on other replicas (recompute prefill —
   real KV movement is NOT implemented: the pluggable `kv_transfer_fn`
   hook exists only in `relay_tier.py`'s CPU model, the honest
-  boundary); the completion watcher then pulls the fresh version into
+  boundary; the upgrade path is items 17/18 with recompute as the
+  PERMANENT fallback); the completion watcher then pulls the fresh version into
   the emptied source over ITS engine subgroup and `end_drain` returns
   it to routing.
 * **escalation**: `drain_deadline_s` bounds the soft wait — past the
@@ -352,7 +353,8 @@ stays fleet-synchronized either way) — what
 remains is cluster validation (BOTH engines now implement the versioned
 protocol; mooncake's landed in item 9);
 in P2 the two biggest open gaps are the relay-chain distribution's
-real deployment and per-token KV introspection. For positioning vs
+real deployment and per-token KV introspection + KV direct migration
+(items 17/18 below). For positioning vs
 the v1 separate-async stack see the section above: this package's
 incremental value on ANY path is the relay tier (weights) and the
 repack algorithm + executor.
@@ -427,6 +429,11 @@ itself (6) — now covering BOTH engines' stage/pull cycles.
    fleet-synchronized by design — PULL_REPLICA lines come from the
    repack idle refresh only, so keep a replica idle across a publish
    (small gen batch or a long generation elsewhere) to exercise it.
+   Also capture the `repack/*` counters (`kv_util_delta_mean`,
+   `sources_emptied`, `migrations_declined`, `overhead_total_s`) on
+   this run — under today's count-denominated model they are the
+   BASELINE that item 17's per-token introspection must beat, and the
+   acceptance gate for 17/18 is defined against them.
 
    **Tier 3 — fault injection (a second run).**
    * `ray kill` the relay-controller actor → the supervisor logs
@@ -525,8 +532,9 @@ itself (6) — now covering BOTH engines' stage/pull cycles.
 items 14 (repack execution), 15 (fault tolerance), 16 (partial pool
 substrate + long-tail mitigations) are live; the two biggest open gaps
 are the relay-chain distribution on real transports (12) and per-token
-KV introspection (13's real-queue semantics also remains; 9's mooncake
-staging is engine-implemented, cluster-pending).
+KV introspection + KV direct migration (17/18; 13's real-queue
+semantics also remains; 9's mooncake staging is engine-implemented,
+cluster-pending).
 
 14. `RolloutReplicaHandle` against the real rollout stack — MOSTLY
     LIVE: the closed loop is wired (`repack_bridge.py`:
@@ -558,8 +566,9 @@ staging is engine-implemented, cluster-pending).
     `partial_rollout=false` the stock client DROPS aborted requests);
     per-token KV introspection (KV columns are linear in the in-flight
     count, CanFit collapses onto the true batch bound
-    `rollout.max_num_seqs`); a real `kv_transfer_fn` (KV blocks never
-    travel — recompute prefill is the accepted default).
+    `rollout.max_num_seqs` — item 17); a real `kv_transfer_fn` (KV
+    blocks never travel — recompute prefill is the accepted default,
+    item 18).
 15. Relay tier elasticity — LANDED (§4.3 + §3.3): master failover is
     `RelaySupervisor` (fault_tolerance.py): heartbeats the
     RelayControllerActor; on actor death it recreates the controller
@@ -617,6 +626,80 @@ staging is engine-implemented, cluster-pending).
     infrastructure outside this package; the pool actor's `put` RPC is
     the seam). Until a writer lands, the pool serves redirects at
     whole-trajectory retry granularity.
+17. per-token KV introspection — OPEN (upgrades the repack planner's
+    KV columns AND the honesty of its benefit metrics):
+    * today the placement model is COUNT-denominated by design —
+      `kv_used = inflight × kv_per_request`, `C_max = batch_bound ×
+      kv_per_request` (repack_bridge.py's `ReplicaState` snapshot), so
+      CanFit's KV constraint collapses onto the true batch bound B;
+      the `RepackStats` rounds (`kv_util_before/after`,
+      `kv_util_delta_mean`) are count-proportional, not bytes;
+    * target: per-REQUEST KV token accounting from the engine plus the
+      real KV pool size for C_max.
+    Design constraints (fixed; do not revisit):
+    (a) DUAL CONSTRAINT STAYS — B (`rollout.max_num_seqs`) is a genuine
+        engine roofline, not an approximation to replace: CanFit keeps
+        BOTH `C_max` (KVCache) and B (paper Algorithm 1 line 9);
+    (b) ONE PRIMITIVE, TWO CONSUMERS — the engine-side per-request
+        metrics RPC is SHARED with the L2 layered-scheduling stack
+        (the same seam that supplies `begin_drain`/`end_drain`): design
+        it once there, consume it here; do not build a second
+        introspection channel;
+    (c) CAPABILITY-PROBED UPGRADE — the pattern already proven twice
+        (`supports_pull_replica`, the `_PullUnavailable` latch): RPC
+        absent → fall back to the count-linear estimate and SAY SO in
+        stats (e.g. `repack/kv_model: count|tokens`); the stock stack
+        always runs. This is an upgrade path, never a hard cutover.
+    Division of labor: engine + `llm_server` RPC = L2-side (external);
+    the probe, planner consumption, and stats = this package.
+18. KV direct migration — OPEN (one SEMANTIC decision required before
+    any code):
+    * the seam exists: `RolloutRepackExecutor(kv_transfer_fn=...)`
+      (relay_tier.py) — default `None` → abort-resume with recompute
+      prefill, the accepted default on every path;
+    * SEMANTIC DECISION (prerequisite): SAME-VERSION constraint — KV
+      blocks are computed under the SOURCE replica's weights; resuming
+      on a different-version replica continues generation under a
+      different policy (token-level drift, mid-trajectory). The pool
+      precedent redirects SAME-VERSION only (cross-version partials
+      refused AND dropped), and soft-mode drain guarantees no version
+      mixing. KV migration must route to a same-version destination —
+      or the drift must be EXPLICITLY accepted and folded into
+      staleness accounting. Decide before writing code; do not
+      discover it in a cluster run;
+    * scope: PREFIX-KV first (prompt KV is the bulk of the recompute
+      cost and needs no request-state reconstruction); full
+      decode-state migration (block tables + sampler state) is a later
+      engine-coupled step;
+    * transport options to evaluate SIDE BY SIDE:
+      (a) engine-native connectors (vLLM `kv_connector` / sglang KV
+          transfer) — built for PD-disaggregation prefill→decode
+          handoff, NOT cross-replica decode continuation;
+      (b) the package's own mooncake path — registered staging buffers
+          + `transfer_sync_read` direct reads, the same machinery as
+          the versioned weights (item 9): KV blocks are just bytes, no
+          engine-internal API dependency;
+    * dependency order: 17 (per-request KV sizes) ∥ 16's writer seam
+      (request handoff) → 18. NOT linear after 17;
+    * INVARIANT: recompute prefill stays the PERMANENT fallback —
+      `kv_transfer_fn` is a capability-gated fast path, never a
+      replacement; a failure mid-migration falls back to abort-resume
+      + recompute and must never strand a request (the drain
+      lifecycle's crash-safety rules apply unchanged).
+
+    **Repack benefit acceptance (the 17/18 gate)** — the metrics that
+    define "real migration benefit", all captured on the TODO-6
+    cluster run (the count-model values recorded there are the
+    BASELINE 17 must improve):
+    * p99 tail trajectory time (watch its interaction with
+      `group_deadline_s` drops);
+    * `repack/kv_util_delta_mean` (honest bytes after 17);
+    * `sources_emptied` vs `migrations_declined` (plans that execute
+      vs plans the missing capability killed);
+    * `repack/overhead_total_s` as a share of the run.
+    Phase order: runbook 6 first (baseline), then 17, then 18 —
+    building 18 on an unvalidated cluster stack compounds risk
+    exactly the way this package refuses to.
 
 ## Staleness correction (loss-side)
 
