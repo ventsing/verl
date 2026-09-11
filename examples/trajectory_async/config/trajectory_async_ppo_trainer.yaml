@@ -14,7 +14,8 @@ defaults:
 #               per-trajectory rows; trains on complete, fresh groups only
 #   weights   = optional multi-version pull path (async_training.weight_store):
 #               the trainer publishes stage-only versions; the rollout side
-#               pulls at its batch boundaries. Requires the kimi engine.
+#               pulls at its batch boundaries. kimi (subgroup pulls) or
+#               mooncake (direct per-consumer reads, no subgroups).
 
 async_training:
 
@@ -160,7 +161,8 @@ async_training:
   #             the kimi P2P store; the metadata gather is the whole
   #             trainer-side stall)
   #   pull    = rollout-driven, at group-submission batch boundaries
-  # Requires rollout.checkpoint_engine.backend=kimi_ckpt_engine.
+  # kimi -> rollout.checkpoint_engine.backend=kimi_ckpt_engine;
+  # mooncake -> rollout.checkpoint_engine.backend=mooncake.
   # null = stock push-based sync through the CheckpointEngineManager.
   weight_store:
     backend: kimi

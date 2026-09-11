@@ -189,9 +189,13 @@ per-replica pulls are truly concurrent, while DISJOINT windows = a
 global barrier remains (revisit the split). The per-rank
 `receive v{N} done ... time cost` engine lines corroborate.
 Chunk-pipelined chain distribution remains
-`relay_tier.py`'s CPU-verified model (TODO-12). The mooncake engine
-raises `NotImplementedError` on `stage_version` (per-version RDMA
-staging buffers still to design — TODO below).
+`relay_tier.py`'s CPU-verified model (TODO-12). The mooncake engine now
+implements the same versioned method set as kimi (TODO-9 below): its
+per-version staging buffers replace the rank CHAIN entirely — pulls are
+direct per-consumer `transfer_sync_read`s, so mooncake needs NO
+per-replica subgroups (each replica's pull is engine-side disjoint by
+construction; `replica_id` is accepted for driver-dispatch parity and
+otherwise unused).
 
 Run it (see `examples/trajectory_async/`):
 
@@ -202,6 +206,12 @@ python -m verl.experimental.trajectory_async.trajectory_async_main \
     [examples/trajectory_async/dapo_qwen25_math_7b_traj_async.sh for the full recipe]
 ```
 
+Both versioned engines work: `weight_store.backend=kimi` pairs with
+`checkpoint_engine.backend=kimi_ckpt_engine` (per-version CPU shards +
+P2P-store registration, pulls over per-replica subgroups); `mooncake`
+pairs with `checkpoint_engine.backend=mooncake` (per-version pinned
+host staging buffers + direct `transfer_sync_read` pulls — see item 9
+below for what is engine-implemented vs cluster-pending).
 `async_training.weight_store=null` falls back to the stock push path;
 `async_training.trajectory_group_assembly=False` falls back to stock
 group-level consumption (either producer granularity works on the
@@ -310,7 +320,7 @@ head-of-line blocking; late siblings are counted and dropped).
 |---|---|---|
 | `trajectory_group_assembly` | `True` | trainer-side GRPO re-assembly from per-trajectory messages (`False` = stock group-level consumption) |
 | `staleness_drop` | `null` | per-trajectory staleness refusal (versions behind current); null = emergent staleness, rely on loss-side correction |
-| `weight_store` | `backend: kimi` | versioned pull path; `null` = stock push-based sync |
+| `weight_store` | `backend: kimi` | versioned pull path (`kimi` or `mooncake`); `null` = stock push-based sync |
 | `weight_store.keep_last` | `2` | retained staged versions |
 | `weight_store.max_staged_bytes` | `null` | host pinned-memory quota (retires oldest, never the latest) |
 | `row_max_attempts` | `2` | per-row generation retry budget (1 = single-shot) |
@@ -339,7 +349,8 @@ groups and pinned-memory (staged-bytes) accounting have landed
 (subgroups activate at ≥2 rollout replicas — the shipped single-replica
 example never exercises them, and the producer's batch-boundary pull
 stays fleet-synchronized either way) — what
-remains is cluster validation and mooncake's per-version RDMA staging;
+remains is cluster validation (BOTH engines now implement the versioned
+protocol; mooncake's landed in item 9);
 in P2 the two biggest open gaps are the relay-chain distribution's
 real deployment and per-token KV introspection. For positioning vs
 the v1 separate-async stack see the section above: this package's
@@ -368,10 +379,10 @@ repack algorithm + executor.
    pull), matching the mooncake adapter and stock semantics.
 
 **P1 — validate the written code on a real machine** — PARTIALLY
-LANDED HERE: per-replica process groups (item 10) and pinned-memory /
-staged-bytes accounting (item 8) are done; the remaining items are the
-cluster validation run itself (6) and mooncake per-version RDMA
-staging (9).
+LANDED HERE: per-replica process groups (item 10), pinned-memory /
+staged-bytes accounting (item 8), and the mooncake versioned path
+(item 9) are done; the remaining item is the cluster validation run
+itself (6) — now covering BOTH engines' stage/pull cycles.
 
 6. Full-run cluster validation of
    `examples/trajectory_async/dapo_qwen25_math_7b_traj_async.sh` — the
@@ -435,8 +446,7 @@ staging (9).
    run never logs PULL_REPLICA (per-replica path inert by design —
    `repack/per_replica_pulls: 0`); migration without LB drain sockets
    logs "repack declined ... begin_drain unsupported" and degrades to
-   idle refresh only; the mooncake backend raises
-   NotImplementedError on stage_version (TODO-9); KV never actually
+   idle refresh only; KV never actually
    moves — recompute prefill is the only migration mode; hard_drain
    requires abort-resume semantics (L2 or partial_rollout=true) —
    keep it off on the stock client.
@@ -449,10 +459,37 @@ staging (9).
    versions beyond `keep_last` AND the byte quota, never the latest);
    `relay/staged_bytes` / `relay/quota_retires` metrics. Cluster
    validation of the accounting itself remains (run with the metric on).
-9. mooncake `stage_version`: per-version RDMA staging buffers + runtime
-   `batch_register_memory`/`unregister_memory` semantics + per-version
-   buffer descriptor distribution (the engine currently raises
-   NotImplementedError by design).
+9. ~~mooncake `stage_version`~~ — DONE (engine-level): the mooncake
+   engine implements the full versioned method set with the same
+   contracts as kimi — `stage_version` packs whole-tensor buckets (the
+   stock packing convention) into a per-version PINNED HOST buffer and
+   registers it with `batch_register_memory` (kept registered — the
+   buffer IS the relay memory); the descriptor reaches rollout ranks
+   through the store `all_gather_obj` rendezvous (the same pattern the
+   topology init uses), concurrent with the actor-side stage (mirrors
+   kimi's `gather_metas`); `receive_weights_version` streams bucket by
+   bucket via direct `transfer_sync_read` from the staged buffer — no
+   rank chain, no barrier, per-consumer by construction, hence NO
+   replica subgroups (the driver scopes a pull by dispatching to one
+   replica's worker group); `unstage_version`/`drop_version` retire.
+   `build_topology` accepts (and ignores) `replica_partition`, and
+   `async_trainer` accepts `weight_store.backend=mooncake` (paired with
+   `checkpoint_engine.backend=mooncake`). The mooncake ADAPTER
+   (`MooncakeP2PBackend`, the package-level store) gained the same
+   whole-tensor bucket packing and per-bucket streaming reads — fixing
+   a real multi-chunk bug where every bucket overwrote the same
+   consumer offset and the reassembly read past the last chunk. HONEST
+   BOUNDARY: the protocol smokes are torch/mooncake-gated (not executed
+   on the CPU-only dev box — they run on the first full install); the
+   runtime `batch_register_memory`/`unregister_memory` semantics across
+   mooncake-transfer-engine versions and the RDMA transport itself are
+   CLUSTER-PENDING — validate in runbook item 6 before trusting at
+   scale. Shared exposure (identical to kimi, not mooncake-specific):
+   a DEAD rollout rank breaks the descriptor rendezvous (the store
+   ``all_gather_obj`` misses a participant) exactly as it breaks kimi's
+   ``gather_metas`` — engine-store rebuild after replica death is the
+   TODO-15 cluster item. The P0 single-sender convention is kept: actor engine rank 0
+   stages; other actor ranks drain (same as stock `send_weights`).
 10. ~~kimi per-replica process-group topology~~ — DONE: `init_process_group`
    takes a `replica_partition` (derived from the replicas' worker order;
    `derive_replica_partition`) and installs one subgroup per replica;
@@ -488,8 +525,8 @@ staging (9).
 items 14 (repack execution), 15 (fault tolerance), 16 (partial pool
 substrate + long-tail mitigations) are live; the two biggest open gaps
 are the relay-chain distribution on real transports (12) and per-token
-KV introspection (13's real-queue semantics and 9's mooncake staging
-also remain).
+KV introspection (13's real-queue semantics also remains; 9's mooncake
+staging is engine-implemented, cluster-pending).
 
 14. `RolloutReplicaHandle` against the real rollout stack — MOSTLY
     LIVE: the closed loop is wired (`repack_bridge.py`:
@@ -641,13 +678,20 @@ off-policy distance, the latter reweights what is admitted.
 
 ## Test coverage
 
-`tests/experimental/trajectory_async/` (225 tests; 208 stdlib-only +
+`tests/experimental/trajectory_async/` (227 tests; 208 stdlib-only +
 3 torch-gated adapter smokes + 2 torch-gated staleness batch-application
-smokes + 12 ray-gated wiring smokes, all skipping gracefully without
+smokes + 14 ray/mooncake-gated smokes, all skipping gracefully without
 their deps):
 
 * aggregator: completion order, duplicates, FAILED-eviction protocol,
   late-arrival guard, buffer limits, record invariants;
+* mooncake versioned engine protocol (torch+mooncake-gated): stage ->
+  descriptor rendezvous -> multi-bucket direct reads with REAL bytes
+  flowing -> repeatable pull -> LookupError on unknown version ->
+  unstage/drop; whole-tensor bucket layouts; `build_topology` accepting
+  (and ignoring) `replica_partition`; the ADAPTER smoke exercises the
+  same packing/streaming end to end including the multi-bucket case the
+  old single-chunk smoke missed;
 * relay controller per-replica path: partition derivation (contiguous
   blocks, workerless replicas skipped, single-replica degenerate),
   `pull_replica` version tracking / idempotence / error paths,

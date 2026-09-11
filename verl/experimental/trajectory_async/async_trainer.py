@@ -250,19 +250,24 @@ class TrajectoryAsyncTrainer(FullyAsyncTrainer):
         from verl.experimental.trajectory_async.relay_controller import make_relay_controller_actor
 
         backend = weight_store_cfg.get("backend", "kimi")
-        if backend == "kimi":
+        # both engines implement the versioned protocol: kimi via per-version
+        # CPU shards + P2P-store registration, mooncake via per-version
+        # pinned host staging buffers + direct transfer_sync_read pulls
+        engine_for = {"kimi": "kimi_ckpt_engine", "mooncake": "mooncake"}
+        if backend in engine_for:
             config_backend = self.config.actor_rollout_ref.rollout.checkpoint_engine.get("backend", None)
-            if config_backend not in ("kimi_ckpt_engine", None):
+            if config_backend not in (engine_for[backend], None):
                 logger.warning(
-                    "weight_store.backend=kimi but rollout.checkpoint_engine.backend=%s; "
-                    "the versioned stage path requires the kimi engine",
+                    "weight_store.backend=%s but rollout.checkpoint_engine.backend=%s; "
+                    "the versioned stage path requires the %s engine",
+                    backend,
                     config_backend,
+                    engine_for[backend],
                 )
         else:
             raise NotImplementedError(
-                f"async_training.weight_store.backend={backend!r}: only 'kimi' is "
-                "implemented for the multi-version pull path (mooncake needs "
-                "per-version RDMA staging buffers — see the package README TODO)"
+                f"async_training.weight_store.backend={backend!r}: only "
+                f"{sorted(engine_for)} are implemented for the multi-version pull path"
             )
 
         keep_last = int(weight_store_cfg.get("keep_last", 2))

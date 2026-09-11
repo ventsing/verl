@@ -102,7 +102,20 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         return {"addr": self.hostname, "port": port}
 
     @classmethod
-    def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadatas: list[dict]):
+    def build_topology(
+        cls,
+        actor_wg_world_size: int,
+        rollout_world_size: int,
+        metadatas: list[dict],
+        replica_partition: list[list[int]] | None = None,
+    ):
+        """``replica_partition`` is accepted but UNUSED: mooncake's versioned
+        path uses direct P2P reads from the actor's staged buffer (no rank
+        chain, no collective barrier between consumers), so per-replica pulls
+        need NO communication-domain subgroups — scoping happens by
+        dispatching ``pull_weights_version`` to a single replica's worker
+        group. The parameter exists so the versioned driver
+        (``build_process_group``) can pass it uniformly across backends."""
         actor_wg_kwargs = {
             "rank": [0] + [-1] * (actor_wg_world_size - 1),
             "world_size": [rollout_world_size + 1] * actor_wg_world_size,
@@ -322,21 +335,205 @@ class MooncakeCheckpointEngine(CheckpointEngine):
 
     # ------------------------------------------------- multi-version pull path
     #
-    # NOT IMPLEMENTED for this engine (cluster TODO; see
-    # verl/experimental/trajectory_async/README.md). The stock flow streams
-    # buckets through ONE double-buffered registered buffer along the rank
-    # chain and reuses it immediately — nothing is retained to pull from.
-    # A versioned stage needs: (a) a per-version pinned staging buffer on the
-    # actor rank(s), (b) runtime RDMA (un)registration of those buffers
-    # (``batch_register_memory`` — exact semantics differ across
-    # mooncake-transfer-engine versions), and (c) a way to publish each
-    # version's buffer descriptor (session_id + ptr + len) to consumers.
-    # Sketch only; validated implementations welcome.
+    # The versioned path replaces the stock rank CHAIN (0 -> 1 -> ... -> N,
+    # each rank reading the previous rank's transient buffer) with direct
+    # P2P reads from a per-version STAGED buffer on the actor rank 0:
+    #
+    # * ``stage_version`` packs the version into its own pinned host buffer
+    #   (whole-tensor buckets, the stock packing convention), registers it
+    #   with ``batch_register_memory``, and KEEPS it registered — the
+    #   registered buffer is the relay memory for this version (the same
+    #   placement idea as the kimi engine's per-version CPU shards).
+    # * The buffer descriptor (session_id + ptr + bucket map) reaches the
+    #   rollout ranks through the SAME store rendezvous the stock topology
+    #   uses (``all_gather_obj``), fired concurrently with the actor-side
+    #   stage — mirroring kimi's ``gather_metas`` collective.
+    # * ``receive_weights_version`` streams bucket by bucket via
+    #   ``transfer_sync_read`` DIRECTLY from the staged buffer — no chain,
+    #   no barrier, nothing shared between consumers: per-replica pulls are
+    #   per-consumer by construction (which is why this engine needs no
+    #   replica subgroups — see ``build_topology``).
+    #
+    # Cluster-validated TODO: the runtime ``batch_register_memory`` /
+    # ``unregister_memory`` semantics across mooncake-transfer-engine
+    # versions, and the RDMA transport itself (TODO-6 runbook).
 
-    async def stage_version(self, version, weights, global_steps=None):
-        raise NotImplementedError(
-            "mooncake checkpoint engine does not implement the multi-version "
-            "pull path yet (per-version RDMA staging buffers); use the kimi "
-            "backend for async_training.weight_store, or see the TODO in "
-            "verl/experimental/trajectory_async/README.md"
+    def _versioned_state(self):
+        # lazy state so __new__-constructed instances (tests) work too
+        if not hasattr(self, "_staged_versions"):
+            self._staged_versions: dict[int, dict[str, Any]] = {}  # actor: version -> staged buffer
+            self._versioned_descriptors: dict[int, dict[str, Any]] = {}  # rollout: version -> descriptor
+        return self._staged_versions, self._versioned_descriptors
+
+    @torch.no_grad()
+    async def stage_version(
+        self,
+        version: int,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        global_steps: int | None = None,
+    ):
+        """Register this rank's current weights as a pullable version.
+
+        Actor-side counterpart of ``send_weights`` with the SAME
+        single-sender convention: engine rank 0 (the only actor rank in the
+        store world) stages the weights it is handed; other actor ranks
+        drain their generators (their weights are not part of this engine's
+        transfer, exactly as in the stock push path).
+        """
+        staged, _ = self._versioned_state()
+        if self.rank < 0:
+            for _ in weights:
+                pass
+            logger.info(f"stage v{version} rank={self.rank} drained (non-sender actor rank)")
+            return {"staged_bytes": 0, "staged_params": 0}
+
+        start_time = time.time()
+        tensors: list[tuple[str, torch.Tensor]] = []
+        for name, weight in weights:
+            tensors.append((name, weight.to(self.rollout_dtype)))
+        if not tensors:
+            raise ValueError("refusing to stage an empty weight set")
+
+        # pack whole tensors per bucket (stock send_weights convention: a
+        # tensor never spans buckets) into ONE pinned host buffer per version
+        # — the Laminar relay placement, and what the host-memory quota
+        # (relay controller's max_staged_bytes) accounts
+        nbytes = sum(t.numel() * t.element_size() for _, t in tensors)
+        # PIN when an accelerator is present (the RDMA-preferred host
+        # placement); pageable otherwise so CPU-only hosts still run the
+        # protocol (tests) — registration pins pages either way
+        pin = get_torch_device().is_available()
+        buf = torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=pin)
+        view = buf.view(-1)
+        buckets: list[dict[str, Any]] = []
+        offset = 0
+        cur_len = 0
+        cur_tensors: dict[str, tuple[int, Any, Any]] = {}
+        per_tensor: dict[str, tuple[int, Any, Any]] = {}
+        for name, tensor in tensors:
+            flat = tensor.detach().contiguous().view(-1).view(torch.uint8)
+            size = flat.numel()
+            assert size <= self.bucket_size, (
+                f"Weight {name}({tensor.shape}, {tensor.dtype}) is too large to fit in the bucket."
+            )
+            if cur_len + size > self.bucket_size and cur_len > 0:
+                buckets.append({"offset": offset - cur_len, "size": cur_len, "tensors": cur_tensors})
+                cur_tensors, cur_len = {}, 0
+            view[offset : offset + size].copy_(flat, non_blocking=True)
+            cur_tensors[name] = (cur_len, tensor.shape, tensor.dtype)
+            per_tensor[name] = (offset, tensor.shape, tensor.dtype)
+            offset += size
+            cur_len += size
+        if cur_len > 0:
+            buckets.append({"offset": offset - cur_len, "size": cur_len, "tensors": cur_tensors})
+        get_torch_device().synchronize()
+
+        # register + KEEP registered: this pinned buffer is the relay memory
+        # for the version until unstage_version retires it
+        ret = self.engine.batch_register_memory([buf.data_ptr()], [nbytes])
+        assert ret == 0, f"batch_register_memory failed ret={ret} for v{version}"
+        staged[version] = {"buf": buf, "ptr": buf.data_ptr(), "nbytes": nbytes}
+
+        # publish the descriptor to every rollout rank: the same store
+        # rendezvous the topology init uses — rollout ranks run
+        # gather_version_metas(version) concurrently (mirroring kimi's
+        # collective gather_metas on both sides of the stage)
+        descriptor = {
+            "kind": "mooncake",
+            "session_id": self.session_id,
+            "ptr": buf.data_ptr(),
+            "nbytes": nbytes,
+            "buckets": buckets,
+        }
+        info_list = self.store.all_gather_obj(descriptor)
+        assert info_list[0] is descriptor or info_list[0] == descriptor
+
+        logger.info(
+            f"Rank {self.rank} stage v{version}: {len(per_tensor)} params, {nbytes} bytes, "
+            f"{len(buckets)} bucket(s), {time.time() - start_time:.2f}s"
         )
+        return {"staged_bytes": nbytes, "staged_params": len(per_tensor)}
+
+    def gather_version_metas(self, version: int):
+        """Rollout-side participation in a version's descriptor exchange.
+
+        Must run CONCURRENTLY with the actor rank 0's ``stage_version`` —
+        the store ``all_gather_obj`` is the rendezvous (the same collective
+        pattern the topology init uses for buffer_info).
+        """
+        _, descriptors = self._versioned_state()
+        info_list = self.store.all_gather_obj(None)
+        descriptor = info_list[0]
+        if not isinstance(descriptor, dict) or descriptor.get("kind") != "mooncake":
+            raise RuntimeError(
+                f"gather_version_metas({version}) rendezvoused without a mooncake "
+                f"descriptor — did the actor rank 0 run stage_version concurrently?"
+            )
+        descriptors[version] = descriptor
+
+    @torch.no_grad()
+    async def receive_weights_version(
+        self,
+        version: int,
+        replica_id: int | None = None,
+    ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        """Pull a staged version into this rollout rank (anytime, repeatable).
+
+        Streams bucket by bucket via ``transfer_sync_read`` DIRECTLY from the
+        actor's registered staging buffer into this rank's registered
+        ``buf`` — no rank chain, no collective barrier, nothing shared with
+        other consumers. ``replica_id`` is accepted for driver-dispatch
+        parity (the driver scopes the pull by dispatching to one replica's
+        worker group) and is otherwise unused: this engine has no subgroups
+        to scope because per-consumer reads never synchronize the fleet.
+        """
+        _, descriptors = self._versioned_state()
+        descriptor = descriptors.get(version)
+        if descriptor is None:
+            raise LookupError(
+                f"version {version} was never gathered on this rank "
+                f"(known versions: {sorted(descriptors)})"
+            )
+
+        start_time = time.time()
+        total_bytes = 0
+        current = self.buf[: self.bucket_size]
+        for bucket in descriptor["buckets"]:
+            size = bucket["size"]
+            if size <= 0:
+                continue
+            ret = self.engine.transfer_sync_read(
+                descriptor["session_id"],
+                current.data_ptr(),
+                descriptor["ptr"] + bucket["offset"],
+                size,
+            )
+            assert ret == 0, f"transfer_sync_read failed ret={ret} for v{version}"
+            total_bytes += size
+            for name, (rel_offset, shape, dtype) in bucket["tensors"].items():
+                t_size = dtype.itemsize * shape.numel()
+                tensor = current[rel_offset : rel_offset + t_size].view(dtype=dtype).view(shape)
+                yield name, tensor
+            get_torch_device().synchronize()
+
+        time_cost = time.time() - start_time
+        bandwidth = total_bytes / time_cost / (1024 * 1024 * 1024) if time_cost > 0 else 0.0
+        logger.info(
+            f"Rank {self.rank} receive v{version} done, total bytes: {total_bytes} "
+            f"time cost: {time_cost:.2f}s bandwidth: {bandwidth:.2f} GB/s"
+        )
+
+    def unstage_version(self, version: int):
+        """Retire a staged version (actor side): unregister and free."""
+        staged, _ = self._versioned_state()
+        entry = staged.pop(version, None)
+        if entry is None or self.rank < 0:
+            return
+        ret = self.engine.unregister_memory(entry["ptr"])
+        assert ret == 0, f"unregister_memory failed ret={ret} for v{version}"
+        logger.info(f"Rank {self.rank} unstage v{version}: {entry['nbytes']} bytes released")
+
+    def drop_version(self, version: int):
+        """Drop a retired version's descriptor snapshot (rollout side)."""
+        _, descriptors = self._versioned_state()
+        descriptors.pop(version, None)

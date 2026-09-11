@@ -28,6 +28,22 @@ except ImportError:
     import _bootstrap  # noqa: F401
 
 try:
+    import torch  # noqa: F401
+
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+try:
+    # the mooncake ENGINE module needs torch + ray + mooncake + vllm/sglang;
+    # gate the engine protocol smoke on the pieces it actually executes
+    from mooncake.engine import TransferEngine  # noqa: F401
+
+    HAS_MOONCAKE = True
+except ImportError:
+    HAS_MOONCAKE = False
+
+try:
     import ray  # noqa: F401
 
     HAS_RAY = True
@@ -126,6 +142,168 @@ class TestP0Wiring(unittest.TestCase):
             self.assertTrue(hasattr(FleetRepackExecutor, method), f"bridge executor missing {method}")
         for method in ("pull_weights", "running_requests", "remove_request", "admit_request"):
             self.assertTrue(hasattr(RolloutReplicaView, method), f"replica view missing {method}")
+
+    @unittest.skipUnless(
+        HAS_MOONCAKE and HAS_TORCH, "mooncake engine + torch required (full install)"
+    )
+    def test_mooncake_versioned_engine_protocol(self):
+        """The mooncake engine's versioned path (TODO-9) against stub
+        transport/store: stage -> descriptor rendezvous -> per-bucket direct
+        reads -> unstage/drop, with REAL tensor bytes flowing (the stub
+        reads actually copy)."""
+        import torch
+
+        import verl.checkpoint_engine.mooncake_checkpoint_engine as mce
+        from verl.checkpoint_engine.mooncake_checkpoint_engine import MooncakeCheckpointEngine
+
+        class _CpuDeviceShim:  # stage/receive call get_torch_device().synchronize()
+            def synchronize(self):
+                pass
+
+            def empty_cache(self):
+                pass
+
+            def is_available(self):
+                return False  # -> pageable staging buffers (CPU-only host)
+
+        mce.get_torch_device = lambda: _CpuDeviceShim()
+        from verl.utils.device import get_torch_device as _real_get_torch_device
+
+        self.addCleanup(lambda: setattr(mce, "get_torch_device", _real_get_torch_device))
+
+        class StubTransferEngine:
+            def __init__(self):
+                self.buffers = {}  # data_ptr -> tensor
+                self.unregistered = []
+
+            def _find(self, ptr):
+                for base, buf in self.buffers.items():
+                    if base <= ptr < base + buf.numel():
+                        return base, buf
+                raise KeyError(f"ptr {ptr:#x} not registered")
+
+            def batch_register_memory(self, ptrs, sizes):
+                return 0
+
+            def register_buffer(self, buf):
+                self.buffers[buf.data_ptr()] = buf
+
+            def unregister_memory(self, ptr):
+                self.unregistered.append(ptr)
+                self.buffers.pop(ptr, None)
+                return 0
+
+            def transfer_sync_read(self, src_session, dst_ptr, src_ptr, length):
+                src_base, src_buf = self._find(src_ptr)
+                dst_base, dst_buf = self._find(dst_ptr)
+                src_rel, dst_rel = src_ptr - src_base, dst_ptr - dst_base
+                dst_buf.view(-1)[dst_rel : dst_rel + length].copy_(
+                    src_buf.view(-1)[src_rel : src_rel + length]
+                )
+                return 0
+
+        class StubStore:
+            """Sequential all_gather_obj: rank 0 contributes the object,
+            everyone else None (the engine only consumes info_list[0])."""
+
+            def __init__(self):
+                self.descriptor = None
+
+            def all_gather_obj(self, obj):
+                if obj is not None:
+                    self.descriptor = obj
+                return [self.descriptor, None]
+
+        BUCKET = 4096
+
+        def make_engine(te, store, rank):
+            e = MooncakeCheckpointEngine.__new__(MooncakeCheckpointEngine)
+            e.rank = rank
+            e.bucket_size = BUCKET
+            e.rollout_dtype = torch.float32
+            e.device = "cpu"
+            e.engine = te
+            e.store = store
+            e.session_id = "actor-session" if rank <= 0 else f"rollout-{rank}"
+            e.buf = torch.zeros(2 * BUCKET, dtype=torch.uint8)
+            te.register_buffer(e.buf)
+            return e
+
+        async def scenario():
+            te = StubTransferEngine()
+            store = StubStore()
+            actor = make_engine(te, store, 0)  # the single sender (store rank 0)
+            drain_actor = make_engine(te, store, -1)  # a non-sender actor rank
+            rollout = make_engine(te, store, 1)  # a rollout consumer rank
+
+            w1 = torch.arange(1024, dtype=torch.float32)  # 4096B = exactly one bucket
+            w2 = torch.full((512,), 7, dtype=torch.float32)  # 2048B
+
+            def weights_gen():
+                yield "w.a", w1
+                yield "w.b", w2
+
+            # non-sender actor ranks drain (stock single-sender convention)
+            drained = await drain_actor.stage_version(5, weights_gen())
+            self.assertEqual(drained, {"staged_bytes": 0, "staged_params": 0})
+
+            # stage + gather run concurrently in the real driver; sequentially
+            # here: stage publishes the descriptor via the store rendezvous,
+            # gather snapshots it
+            metrics = await actor.stage_version(5, weights_gen())
+            self.assertEqual(metrics["staged_params"], 2)
+            self.assertEqual(metrics["staged_bytes"], 4096 + 2048)
+            te.register_buffer(actor._staged_versions[5]["buf"])
+            rollout.gather_version_metas(5)
+
+            # whole-tensor buckets: w.a fills a bucket exactly, w.b the next
+            desc = rollout._versioned_descriptors[5]
+            self.assertEqual(len(desc["buckets"]), 2)
+            self.assertIn("w.a", desc["buckets"][0]["tensors"])
+            self.assertIn("w.b", desc["buckets"][1]["tensors"])
+
+            # pull: per-bucket direct reads yield the true tensor values
+            got = {}
+            async for name, tensor in rollout.receive_weights_version(5, replica_id=0):
+                got[name] = tensor.clone()
+            self.assertTrue(torch.equal(got["w.a"], w1))
+            self.assertTrue(torch.equal(got["w.b"], w2))
+
+            # anytime + repeatable: a second pull of the same version works
+            got2 = {}
+            async for name, tensor in rollout.receive_weights_version(5):
+                got2[name] = tensor.clone()
+            self.assertTrue(torch.equal(got2["w.b"], w2))
+
+            # unknown version -> the kimi-contract LookupError
+            with self.assertRaises(LookupError):
+                async for _ in rollout.receive_weights_version(99):
+                    pass
+
+            # retire: actor unregisters the staging buffer, rollout drops
+            actor.unstage_version(5)
+            self.assertEqual(te.unregistered, [desc["ptr"]])
+            rollout.drop_version(5)
+            self.assertNotIn(5, rollout._versioned_descriptors)
+
+        import asyncio
+
+        asyncio.run(scenario())
+
+    @unittest.skipUnless(
+        HAS_MOONCAKE and HAS_TORCH, "mooncake engine + torch required (full install)"
+    )
+    def test_mooncake_build_topology_accepts_replica_partition(self):
+        """mooncake ignores the partition (direct P2P reads need no
+        subgroups) but must ACCEPT it — the versioned driver passes it
+        uniformly across backends."""
+        from verl.checkpoint_engine.mooncake_checkpoint_engine import MooncakeCheckpointEngine
+
+        actor_kw, rollout_kw = MooncakeCheckpointEngine.build_topology(
+            2, 4, [{"addr": "h", "port": 1}], replica_partition=[[2, 3], [4, 5], [6, 7]]
+        )
+        self.assertNotIn("replica_partition", actor_kw)
+        self.assertNotIn("replica_partition", rollout_kw)
 
     def test_kimi_topology_change_fails_loud(self):
         """Elastic-safety guard: a re-init with a CHANGED replica

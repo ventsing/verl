@@ -596,20 +596,31 @@ class MooncakeP2PBackend(P2PWeightBackend):
 
         buf = torch.empty(nbytes, dtype=torch.uint8, device=self.staging_device)
         view = buf.view(-1)
-        buckets: list[dict[str, Any]] = []  # (offset, size, {name: (offset, shape, dtype)})
-        offset = 0
-        per_tensor: dict[str, tuple[int, Any, Any]] = {}
+        chunk = self.chunk_bytes or self.engine.bucket_size
+        # whole-tensor buckets (the stock engine convention): each bucket
+        # holds WHOLE tensors (a tensor never spans buckets), so a reader
+        # can consume bucket-by-bucket without reassembly across chunks
+        buckets: list[dict[str, Any]] = []
+        offset = 0  # absolute offset into the staging buffer
+        cur_len = 0  # current bucket length
+        cur_tensors: dict[str, tuple[int, Any, Any]] = {}  # name -> (bucket-relative offset, shape, dtype)
+        per_tensor: dict[str, tuple[int, Any, Any]] = {}  # name -> (absolute offset, shape, dtype)
         for name, tensor in tensors:
             flat = tensor.detach().contiguous().view(-1).view(torch.uint8)
-            view[offset : offset + flat.numel()].copy_(flat, non_blocking=True)
+            size = flat.numel()
+            assert size <= chunk, f"tensor {name} ({size}B) exceeds the chunk size {chunk}B"
+            if cur_len + size > chunk and cur_len > 0:
+                buckets.append({"offset": offset - cur_len, "size": cur_len, "tensors": cur_tensors})
+                cur_tensors, cur_len = {}, 0
+            view[offset : offset + size].copy_(flat, non_blocking=True)
+            cur_tensors[name] = (cur_len, tensor.shape, tensor.dtype)
             per_tensor[name] = (offset, tensor.shape, tensor.dtype)
-            offset += flat.numel()
+            offset += size
+            cur_len += size
+        if cur_len > 0:
+            buckets.append({"offset": offset - cur_len, "size": cur_len, "tensors": cur_tensors})
         if self.staging_device.startswith("cuda"):
             torch.cuda.synchronize()
-
-        chunk = self.chunk_bytes or self.engine.bucket_size
-        for start in range(0, max(nbytes, 1), chunk):
-            buckets.append({"offset": start, "size": min(chunk, nbytes - start)})
 
         # stock TransferEngine API: register the buffer for remote reads
         ret = self.engine.engine.batch_register_memory([buf.data_ptr()], [nbytes])
@@ -640,16 +651,19 @@ class MooncakeP2PBackend(P2PWeightBackend):
         consumer_engine = consumer_ctx["engine"]  # the replica's own MooncakeCheckpointEngine
         te = consumer_engine.engine
         desc = manifest.descriptor
-        chunk = desc["chunk_bytes"]
 
         start = time.monotonic()
-        # the consumer's already-registered double buffer (engine.buf is
-        # 2*bucket_size and registered in __init__)
+        # stream bucket by bucket: read into the consumer's already-registered
+        # buffer (engine.buf is 2*bucket_size, registered in __init__), then
+        # hand THAT bucket's whole tensors to the sink before the next bucket
+        # overwrites the buffer — a tensor never spans buckets (stage packs
+        # whole-tensor buckets), so no cross-chunk reassembly exists
+        n_tensors = 0
         for bucket in desc["buckets"]:
             size = bucket["size"]
             if size <= 0:
                 continue
-            assert size <= consumer_engine.bucket_size, "chunk larger than consumer buffer"
+            assert size <= consumer_engine.bucket_size, "bucket larger than consumer buffer"
             ret = te.transfer_sync_read(
                 desc["session_id"],  # source: the actor's registered staging buffer
                 consumer_engine.buf.data_ptr(),
@@ -657,15 +671,14 @@ class MooncakeP2PBackend(P2PWeightBackend):
                 size,
             )
             assert ret == 0, f"transfer_sync_read failed ret={ret} for {manifest.checkpoint_name}"
-            await asyncio.sleep(0)  # keep the loop responsive between chunks
-
-        # hand the reassembled tensors to the rollout server adapter
-        flat = consumer_engine.buf.view(-1).view(torch.uint8)
-        for name, (offset, shape, dtype) in desc["tensors"].items():
-            size = dtype.itemsize * shape.numel()
-            sink(name, flat[offset : offset + size].view(dtype=dtype).view(shape))
+            flat = consumer_engine.buf.view(-1).view(torch.uint8)
+            for name, (rel_offset, shape, dtype) in bucket["tensors"].items():
+                t_size = dtype.itemsize * shape.numel()
+                sink(name, flat[rel_offset : rel_offset + t_size].view(dtype=dtype).view(shape))
+                n_tensors += 1
+            await asyncio.sleep(0)  # keep the loop responsive between buckets
         return ReadStats(
-            nbytes=desc["nbytes"], tensors=len(desc["tensors"]), seconds=time.monotonic() - start
+            nbytes=desc["nbytes"], tensors=n_tensors, seconds=time.monotonic() - start
         )
 
     async def unstage(self, manifest: WeightManifest) -> None:
@@ -702,8 +715,8 @@ def make_p2p_backend(
       ``engine=``. Optional ``rollout_dtype`` (stock default bf16).
     * ``"mooncake"`` — :class:`MooncakeP2PBackend` over an **initialized**
       ``MooncakeCheckpointEngine``. Requires the ``mooncake`` package and
-      RDMA; pass ``engine=``. Optional ``staging_device`` ("cpu" = pinned
-      host memory, the Laminar relay placement, or "cuda"),
+      RDMA; pass ``engine=``. Optional ``staging_device`` ("cpu" = host
+      memory, the Laminar relay placement, or "cuda"),
       ``rollout_dtype``, ``chunk_bytes`` (defaults to the engine's bucket
       size).
 

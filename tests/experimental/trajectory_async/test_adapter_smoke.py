@@ -190,25 +190,42 @@ class TestKimiAdapterSmoke(unittest.TestCase):
 class TestMooncakeAdapterSmoke(unittest.TestCase):
     def test_stage_per_version_direct_read_evict(self):
         async def scenario():
-            # --- stub: the TransferEngine surface (records calls; the test
-            # pre-fills the consumer buffer to simulate a completed RDMA)
+            # --- stub: the TransferEngine surface, with REAL copies — reads
+            # actually move bytes from the source buffer to the destination,
+            # so the per-bucket streaming path is verified end to end
             class StubTransferEngine:
                 def __init__(self):
-                    self.registered = {}  # ptr -> size
+                    self.buffers = {}  # data_ptr -> tensor (registered)
                     self.unregistered = []
                     self.reads = []  # (src_ptr, length)
 
+                def _find(self, ptr):
+                    for base, buf in self.buffers.items():
+                        if base <= ptr < base + buf.numel():
+                            return base, buf
+                    raise KeyError(f"ptr {ptr:#x} not registered")
+
                 def batch_register_memory(self, ptrs, sizes):
-                    for ptr, size in zip(ptrs, sizes):
-                        self.registered[ptr] = size
+                    # the caller registers AFTER we learn the tensor — the
+                    # test associates buffers via register_buffer below
                     return 0
+
+                def register_buffer(self, buf):
+                    self.buffers[buf.data_ptr()] = buf
 
                 def unregister_memory(self, ptr):
                     self.unregistered.append(ptr)
-                    self.registered.pop(ptr, None)
+                    self.buffers.pop(ptr, None)
                     return 0
 
                 def transfer_sync_read(self, src_session, dst_ptr, src_ptr, length):
+                    src_base, src_buf = self._find(src_ptr)
+                    dst_base, dst_buf = self._find(dst_ptr)
+                    src_rel = src_ptr - src_base
+                    dst_rel = dst_ptr - dst_base
+                    dst_buf.view(-1)[dst_rel : dst_rel + length].copy_(
+                        src_buf.view(-1)[src_rel : src_rel + length]
+                    )
                     self.reads.append((src_ptr, length))
                     return 0
 
@@ -220,35 +237,47 @@ class TestMooncakeAdapterSmoke(unittest.TestCase):
                     self.session_id = session_id
                     self.bucket_size = BUCKET
                     self.buf = torch.zeros(2 * BUCKET, dtype=torch.uint8)
+                    te.register_buffer(self.buf)
 
             te = StubTransferEngine()
             actor_engine = StubMooncakeEngine(te, "actor-session")
             consumer_engine = StubMooncakeEngine(te, "replica-session")
 
-            backend = MooncakeP2PBackend(actor_engine, staging_device="cpu")
+            # MULTI-BUCKET weights: 3 tensors x 2048B with chunk=5120B ->
+            # bucket 1 holds TWO whole tensors (4096B; the third no longer
+            # fits: 4096+2048 > 5120), bucket 2 holds the last (2048B) —
+            # mixed occupancy exercises per-bucket relative offsets; a
+            # tensor never spans buckets
+            chunk = 5120
+            w1 = torch.arange(512, dtype=torch.float32)  # 2048B
+            w2 = torch.full((512,), 7, dtype=torch.float32)  # 2048B
+            w3 = torch.arange(1024, dtype=torch.bfloat16)  # 2048B
+            weights_v1 = [("w.a", w1), ("w.b", w2), ("w.c", w3)]
+
+            backend = MooncakeP2PBackend(actor_engine, staging_device="cpu", chunk_bytes=chunk)
             store = VersionedWeightStore(backend, keep_last=5)
 
-            w1 = torch.arange(16, dtype=torch.float32)
-            w2 = torch.full((3,), 7, dtype=torch.bfloat16)
-            m1 = await store.publish(1, [("w.a", w1), ("w.b", w2)])
-            m2 = await store.publish(2, [("w.a", w1 + 1), ("w.b", w2 + 1)])
+            m1 = await store.publish(1, weights_v1)
+            m2 = await store.publish(2, [(n, t + 1) for n, t in weights_v1])
+
+            # the staging buffers are registered with the (real-copy) engine
+            te.register_buffer(backend._buffers[m1.checkpoint_name])
+            te.register_buffer(backend._buffers[m2.checkpoint_name])
 
             # per-version staging buffers: distinct registrations, both alive
             self.assertNotEqual(m1.descriptor["ptr"], m2.descriptor["ptr"])
-            self.assertIn(m1.descriptor["ptr"], te.registered)
-            self.assertIn(m2.descriptor["ptr"], te.registered)
 
-            # simulate the completed transfer: fill the consumer buffer with
-            # v1's staged bytes at the manifest-declared offsets
+            # whole-tensor buckets: 2 buckets, none spanning a tensor
             desc = m1.descriptor
-            self.assertEqual(desc["session_id"], "actor-session")
-            for name, tensor in (("w.a", w1), ("w.b", w2)):
-                offset, shape, dtype = desc["tensors"][name]
-                nbytes = dtype.itemsize * shape.numel()
-                consumer_engine.buf[offset : offset + nbytes].copy_(
-                    tensor.detach().contiguous().view(-1).view(torch.uint8)
-                )
+            self.assertEqual(len(desc["buckets"]), 2)
+            self.assertEqual(desc["buckets"][0]["size"], 4096)
+            self.assertEqual(desc["buckets"][1]["size"], 2048)
+            self.assertIn("w.a", desc["buckets"][0]["tensors"])
+            self.assertIn("w.b", desc["buckets"][0]["tensors"])
+            self.assertIn("w.c", desc["buckets"][1]["tensors"])
 
+            # pull v1 end to end: values survive the per-bucket streaming
+            # (read into buf[0:size] then yield the bucket's whole tensors)
             got = {}
             await store.pull(
                 "replica-0",
@@ -258,17 +287,31 @@ class TestMooncakeAdapterSmoke(unittest.TestCase):
             )
             self.assertTrue(torch.equal(got["w.a"], w1))
             self.assertTrue(torch.equal(got["w.b"], w2))
-            # direct read: every chunk read from v1's registered ptr
+            self.assertTrue(torch.equal(got["w.c"], w3))
+
+            # repeatable pull (the version stays registered until retired)
+            got2 = {}
+            await store.pull(
+                "replica-0",
+                version=1,
+                consumer_ctx={"engine": consumer_engine},
+                sink=lambda n, t: got2.__setitem__(n, t.clone()),
+            )
+            self.assertTrue(torch.equal(got2["w.c"], w3))
+
+            # direct read accounting: every read from v1's registered buffer,
+            # total bytes == the version's nbytes
             self.assertTrue(te.reads)
             for src_ptr, length in te.reads:
-                self.assertEqual(src_ptr, desc["ptr"])
+                self.assertGreaterEqual(src_ptr, desc["ptr"])
+                self.assertLess(src_ptr, desc["ptr"] + desc["nbytes"])
             self.assertEqual(sum(length for _, length in te.reads), desc["nbytes"])
 
             # eviction unregisters the evicted version's buffer
             await store.release(keep_last=1)
             self.assertEqual(te.unregistered, [m1.descriptor["ptr"]])
-            self.assertNotIn(m1.descriptor["ptr"], te.registered)
-            self.assertIn(m2.descriptor["ptr"], te.registered)
+            self.assertNotIn(m1.descriptor["ptr"], te.buffers)
+            self.assertIn(m2.descriptor["ptr"], te.buffers)
 
         asyncio.run(scenario())
 
