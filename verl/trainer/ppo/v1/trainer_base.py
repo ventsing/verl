@@ -350,9 +350,7 @@ class PPOTrainer(ABC):
             self.distillation_config = None
 
         # 9. initialize agent loop manager
-        self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
-        )
+        self.llm_server_manager: LLMServerManager = self._create_hybrid_server_manager(actor_rollout_resource_pool)
 
         # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
@@ -369,6 +367,11 @@ class PPOTrainer(ABC):
         self._load_checkpoint()
 
         logger.info("all initialize finished, ready to fit")
+
+    def _create_hybrid_server_manager(self, actor_rollout_resource_pool):
+        return LLMServerManager.create(
+            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
+        )
 
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
@@ -1829,6 +1832,9 @@ class PPOTrainer(ABC):
             data["token_level_rewards"] = data["rm_scores"]
         data["prompt_length"] = prompt_length.float()
         data["response_length"] = response_length.float()
+        reward_diagnostics = getattr(self, "_update_reward_diagnostics", None)
+        if reward_diagnostics is not None:
+            metrics.update(reward_diagnostics(batch.keys, data, non_padding_mask))
         batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
         metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
 

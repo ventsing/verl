@@ -19,6 +19,7 @@ import logging
 import os
 import uuid
 from collections.abc import Mapping
+from functools import partial
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -469,6 +470,14 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
+        if self.config.checkpoint_engine.backend in {"cpu_relay", "mooncake_relay"}:
+            from verl.experimental.trajectory_async.vllm_telemetry import TrajectoryStatsLogger
+
+            if "stat_loggers" not in fn_args:
+                raise RuntimeError("Laminar requires vLLM's custom scheduler-stat logger interface")
+            self._trajectory_stats = {"kv_usage": 0.0, "running": 0, "waiting": 0, "observed_at": 0.0}
+            kwargs["stat_loggers"] = [partial(TrajectoryStatsLogger, sink=self._trajectory_stats)]
+
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
         # Don't keep the dummy data in memory
@@ -544,6 +553,7 @@ class vLLMHttpServer:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
         kv_transfer_params: Optional[dict] = None,
+        trajectory_progress: Optional[dict] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out.
 
@@ -561,6 +571,20 @@ class vLLMHttpServer:
                 mm_processor_kwargs=mm_processor_kwargs,
                 priority=priority,
             )
+
+        progress_journal = None
+        if trajectory_progress is not None:
+            from verl.experimental.trajectory_async.partial_store import StreamJournal
+
+            if self.config.checkpoint_engine.backend not in {"cpu_relay", "mooncake_relay"}:
+                raise ValueError("Durable streaming requires a Laminar checkpoint backend")
+            progress_journal = StreamJournal(trajectory_progress)
+            if self.global_steps != progress_journal.version:
+                raise ValueError("Durable stream was assigned different behavior weights")
+            # Force cumulative token/logprob outputs regardless of upstream defaults.
+            from vllm.sampling_params import RequestOutputKind
+
+            sampling_params["output_kind"] = RequestOutputKind.CUMULATIVE
 
         prompt_ids = normalize_token_ids(prompt_ids)
 
@@ -648,18 +672,55 @@ class vLLMHttpServer:
 
             # Get final response
             final_res: Optional[RequestOutput] = None
-            async for output in generator:
-                final_res = output
+            try:
+                async for output in generator:
+                    final_res = output
+                    if progress_journal is not None and output.outputs:
+                        result = output.outputs[0]
+                        if not progress_journal.due(len(result.token_ids), result.finish_reason is not None):
+                            continue
+                        if result.logprobs is None and result.token_ids:
+                            raise ValueError("Durable generation requires behavior logprobs")
+                        probs = [
+                            values[token].logprob
+                            for token, values in zip(result.token_ids, result.logprobs or [], strict=True)
+                        ]
+                        terminal = result.finish_reason in ("stop", "length")
+                        await progress_journal.update(
+                            result.token_ids,
+                            probs,
+                            self.global_steps,
+                            finished=terminal,
+                            force=result.finish_reason is not None,
+                            extra_fields={
+                                **trajectory_progress.get("extra_fields", {}),
+                                "global_steps": self.global_steps,
+                            },
+                        )
+            except BaseException:
+                # A stale writer may be fenced while the engine is still alive.
+                # Stop only this request, preserving healthy concurrent decodes.
+                try:
+                    await self.engine.abort(request_id)
+                except Exception:
+                    logger.exception("Could not abort failed durable stream %s", request_id)
+                raise
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
+        if self.config.checkpoint_engine.backend in {"cpu_relay", "mooncake_relay"}:
+            metrics = getattr(final_res, "metrics", None)
+            first_token = getattr(metrics, "first_token_ts", 0.0)
+            scheduled = getattr(metrics, "scheduled_ts", 0.0)
+            if first_token and scheduled:
+                extra_fields["prefill_seconds"] = max(0.0, first_token - scheduled)
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
         if not final_res.outputs:
             return TokenOutput(
                 token_ids=[],
-                log_probs=None,
+                log_probs=[] if progress_journal is not None else None,
                 routed_experts=None,
                 stop_reason="aborted",
                 extra_fields=extra_fields,
@@ -890,9 +951,84 @@ class vLLMHttpServer:
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
+        if getattr(self, "_roofline_join", None) is not None:
+            await self.engine.collective_rpc("set_trajectory_roofline_version", kwargs={"version": global_steps})
+
+    async def configure_trajectory_roofline(self, options):
+        from verl.experimental.trajectory_async.capacity import join_engine_capacity
+        from verl.experimental.trajectory_async.roofline import RooflineConfig
+        from verl.experimental.trajectory_async.roofline_worker import TPRooflineJoin
+
+        validated = RooflineConfig.from_dict(options)
+        self._roofline_join = None
+        if not validated.enabled:
+            return {"enabled": False}
+        workers = await self.engine.collective_rpc("configure_trajectory_roofline", kwargs={"options": options})
+        available = len(workers) == self.config.tensor_model_parallel_size and all(w.get("available") for w in workers)
+        if available:
+            self._roofline_join = TPRooflineJoin(self.config.tensor_model_parallel_size)
+        self._roofline_configuration = {
+            "enabled": available,
+            "workers": workers,
+            "capacity": join_engine_capacity(workers, self.config.tensor_model_parallel_size),
+        }
+        return self._roofline_configuration
+
+    async def trajectory_roofline(self):
+        join = getattr(self, "_roofline_join", None)
+        if join is None:
+            return {"available": False, "samples": [], "configuration": getattr(self, "_roofline_configuration", {})}
+        packets = await self.engine.collective_rpc("drain_trajectory_roofline")
+        from verl.experimental.trajectory_async.capacity import join_engine_capacity
+
+        errors = [p["error"] for p in packets if p.get("error")]
+        modes = {p.get("mode", "unknown") for p in packets}
+        result = {
+            "available": not errors,
+            "samples": join.add(packets) if not errors else [],
+            "mode": next(iter(modes)) if len(modes) == 1 else "unknown",
+            "max_context_tokens": max((p.get("max_context_tokens", 0) for p in packets), default=0),
+            "collecting": any(p.get("enabled", False) for p in packets),
+            "counts": [p.get("counts", {}) for p in packets],
+            "errors": errors,
+            "unmatched_steps": len(join.pending),
+            "capacity": join_engine_capacity(packets, self.config.tensor_model_parallel_size),
+        }
+
+        self._roofline_status = {k: v for k, v in result.items() if k != "samples"}
+        return result
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
+
+    async def trajectory_status(self):
+        """Actual scheduler usage and external IDs, for same-version repacking."""
+        if not hasattr(self, "_trajectory_stats"):
+            raise RuntimeError("Trajectory telemetry requires cpu_relay or mooncake_relay")
+        # Health checks must not consume the manager's calibration samples.
+        roofline = getattr(self, "_roofline_status", {"available": False})
+        return {
+            **self._trajectory_stats,
+            "roofline": roofline,
+            "version": self.global_steps,
+            "request_ids": [s.external_req_id for s in self.engine.output_processor.request_states.values()],
+            "generated_tokens": {
+                s.external_req_id: len(s.detokenizer.output_token_ids) if s.detokenizer is not None else 0
+                for s in self.engine.output_processor.request_states.values()
+            },
+        }
+
+    async def abort_trajectory(self, request_id: str):
+        """Abort by public external ID, preserving cumulative token/logprob output.
+
+        AsyncLLM.abort emits the final abort result itself. Do not manipulate
+        internal request mappings, reset other requests' caches, or pause the
+        whole engine. The controller reserves the destination before this RPC.
+        """
+        present = any(s.external_req_id == request_id for s in self.engine.output_processor.request_states.values())
+        if present:
+            await self.engine.abort(request_id)
+        return {"aborted": present}
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests.

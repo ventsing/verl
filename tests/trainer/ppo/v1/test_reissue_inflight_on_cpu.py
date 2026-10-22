@@ -57,7 +57,7 @@ requires_tq_checkpoint = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def tq_init():
+def tq_init(isolated_tq_ray_cluster):
     tq.init()
     yield
     tq.close()

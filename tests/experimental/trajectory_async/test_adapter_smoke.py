@@ -35,6 +35,7 @@ it (the rest of the suite is stdlib-only).
 """
 
 import asyncio
+import ctypes
 import unittest
 
 try:
@@ -190,9 +191,7 @@ class TestKimiAdapterSmoke(unittest.TestCase):
 class TestMooncakeAdapterSmoke(unittest.TestCase):
     def test_stage_per_version_direct_read_evict(self):
         async def scenario():
-            # --- stub: the TransferEngine surface, with REAL copies — reads
-            # actually move bytes from the source buffer to the destination,
-            # so the per-bucket streaming path is verified end to end
+        # Transfer real bytes between CPU buffers, including across chunks.
             class StubTransferEngine:
                 def __init__(self):
                     self.buffers = {}  # data_ptr -> tensor (registered)
@@ -227,9 +226,10 @@ class TestMooncakeAdapterSmoke(unittest.TestCase):
                         src_buf.view(-1)[src_rel : src_rel + length]
                     )
                     self.reads.append((src_ptr, length))
+                    ctypes.memmove(dst_ptr, src_ptr, length)
                     return 0
 
-            BUCKET = 1 << 16
+            BUCKET = 16
 
             class StubMooncakeEngine:
                 def __init__(self, te, session_id):
@@ -266,18 +266,7 @@ class TestMooncakeAdapterSmoke(unittest.TestCase):
 
             # per-version staging buffers: distinct registrations, both alive
             self.assertNotEqual(m1.descriptor["ptr"], m2.descriptor["ptr"])
-
-            # whole-tensor buckets: 2 buckets, none spanning a tensor
             desc = m1.descriptor
-            self.assertEqual(len(desc["buckets"]), 2)
-            self.assertEqual(desc["buckets"][0]["size"], 4096)
-            self.assertEqual(desc["buckets"][1]["size"], 2048)
-            self.assertIn("w.a", desc["buckets"][0]["tensors"])
-            self.assertIn("w.b", desc["buckets"][0]["tensors"])
-            self.assertIn("w.c", desc["buckets"][1]["tensors"])
-
-            # pull v1 end to end: values survive the per-bucket streaming
-            # (read into buf[0:size] then yield the bucket's whole tensors)
             got = {}
             await store.pull(
                 "replica-0",
@@ -302,9 +291,11 @@ class TestMooncakeAdapterSmoke(unittest.TestCase):
             # direct read accounting: every read from v1's registered buffer,
             # total bytes == the version's nbytes
             self.assertTrue(te.reads)
-            for src_ptr, length in te.reads:
-                self.assertGreaterEqual(src_ptr, desc["ptr"])
-                self.assertLess(src_ptr, desc["ptr"] + desc["nbytes"])
+            self.assertEqual(
+                te.reads,
+                [(desc["ptr"] + pos, min(BUCKET, desc["nbytes"] - pos))
+                 for pos in range(0, desc["nbytes"], BUCKET)],
+            )
             self.assertEqual(sum(length for _, length in te.reads), desc["nbytes"])
 
             # eviction unregisters the evicted version's buffer

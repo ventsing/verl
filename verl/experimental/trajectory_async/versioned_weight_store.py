@@ -235,6 +235,10 @@ class VersionedWeightStore:
         self._latest: int | None = None
         self._consumers: dict[str, ConsumerState] = {}
         self._lock = asyncio.Lock()
+        # Serialize publications without blocking independent consumer reads.
+        self._publish_lock = asyncio.Lock()
+        self._readers: dict[int, int] = {}
+        self._retiring: dict[int, WeightManifest] = {}
 
     # ------------------------------------------------------------ publish
 
@@ -248,22 +252,23 @@ class VersionedWeightStore:
         the analogue of Laminar's actor→master-relay hop. Never waits for
         consumers.
         """
-        async with self._lock:
-            if version in self._manifests:
-                raise ValueError(f"version {version} already published")
-            if self._latest is not None and version <= self._latest:
-                raise ValueError(f"versions must increase: latest={self._latest}, got {version}")
-        manifest = WeightManifest(version=version, checkpoint_name=self.checkpoint_name(version))
-        await self.backend.stage(manifest, _aiter(weights))
-        async with self._lock:
-            self._manifests[version] = manifest
-            self._latest = version
-            self.stats.publishes += 1
-            self.stats.bytes_staged += manifest.nbytes
-        evicted = await self.release(keep_last=self.keep_last)
-        if evicted:
-            logger.info("weight store: evicted versions %s (keep_last=%d)", evicted, self.keep_last)
-        return manifest
+        async with self._publish_lock:
+            async with self._lock:
+                if version in self._manifests:
+                    raise ValueError(f"version {version} already published")
+                if self._latest is not None and version <= self._latest:
+                    raise ValueError(f"versions must increase: latest={self._latest}, got {version}")
+            manifest = WeightManifest(version=version, checkpoint_name=self.checkpoint_name(version))
+            await self.backend.stage(manifest, _aiter(weights))
+            async with self._lock:
+                self._manifests[version] = manifest
+                self._latest = version
+                self.stats.publishes += 1
+                self.stats.bytes_staged += manifest.nbytes
+            evicted = await self.release(keep_last=self.keep_last)
+            if evicted:
+                logger.info("weight store: evicted versions %s (keep_last=%d)", evicted, self.keep_last)
+            return manifest
 
     # ------------------------------------------------------------- inspect
 
@@ -298,7 +303,9 @@ class VersionedWeightStore:
 
         ``version=None`` pulls the latest — the steady-state path (batch
         boundary or repack release). An explicit version pins the read
-        (must still be retained). Consumers are expected to serialize
+        (must still be retained). Its memory is pinned until this read
+        finishes, even if retention evicts the version meanwhile.
+        Consumers are expected to serialize
         their own pulls (a replica pulls at its batch boundary, one at a
         time); concurrent pulls from *different* consumers are the norm.
         """
@@ -311,28 +318,52 @@ class VersionedWeightStore:
                 raise LookupError(
                     f"version {version} is not retained (evicted?); retained={self.retained_versions}"
                 )
-        read_stats = await self.backend.read_into(consumer_id, consumer_ctx or {}, manifest, sink or _noop_sink)
-        async with self._lock:
-            state = self._consumers.setdefault(consumer_id, ConsumerState(consumer_id=consumer_id))
-            state.version = target
-            state.pulls += 1
-            state.bytes_read += read_stats.nbytes
-            state.last_pull_at = time.monotonic()
-            self.stats.pulls += 1
-            self.stats.bytes_read += read_stats.nbytes
-        return target
+            self._readers[target] = self._readers.get(target, 0) + 1
+        try:
+            read_stats = await self.backend.read_into(consumer_id, consumer_ctx or {}, manifest, sink or _noop_sink)
+            async with self._lock:
+                state = self._consumers.setdefault(consumer_id, ConsumerState(consumer_id=consumer_id))
+                state.version = target
+                state.pulls += 1
+                state.bytes_read += read_stats.nbytes
+                state.last_pull_at = time.monotonic()
+                self.stats.pulls += 1
+                self.stats.bytes_read += read_stats.nbytes
+            return target
+        finally:
+            async with self._lock:
+                self._readers[target] -= 1
+                retired = None
+                if self._readers[target] == 0:
+                    del self._readers[target]
+                    retired = self._retiring.pop(target, None)
+            if retired is not None:
+                await self.backend.unstage(retired)
+                self.stats.evictions += 1
 
     # ----------------------------------------------------------------- gc
 
     async def release(self, keep_last: int | None = None) -> list[int]:
-        """Evict all but the newest ``keep_last`` versions; returns evicted."""
+        """Evict all but the newest ``keep_last`` versions; returns evicted.
+
+        Evicted versions immediately reject new pulls. Memory used by an
+        active pull is unregistered only after its last reader exits.
+        """
         keep = self.keep_last if keep_last is None else keep_last
+        if keep < 0:
+            raise ValueError("keep_last must be >= 0")
         async with self._lock:
             versions = sorted(self._manifests)
             if len(versions) <= keep:
                 return []
             evict = versions[:-keep] if keep > 0 else versions
-            manifests = [self._manifests.pop(v) for v in evict]
+            manifests = []
+            for version in evict:
+                manifest = self._manifests.pop(version)
+                if self._readers.get(version, 0):
+                    self._retiring[version] = manifest
+                else:
+                    manifests.append(manifest)
         for manifest in manifests:
             await self.backend.unstage(manifest)
             self.stats.evictions += 1
@@ -576,6 +607,8 @@ class MooncakeP2PBackend(P2PWeightBackend):
     name = "mooncake"
 
     def __init__(self, engine, staging_device: str = "cpu", rollout_dtype=None, chunk_bytes: int | None = None) -> None:
+        if chunk_bytes is not None and chunk_bytes < 1:
+            raise ValueError("chunk_bytes must be >= 1")
         self.engine = engine
         self.staging_device = staging_device
         self.rollout_dtype = rollout_dtype
@@ -607,13 +640,9 @@ class MooncakeP2PBackend(P2PWeightBackend):
         per_tensor: dict[str, tuple[int, Any, Any]] = {}  # name -> (absolute offset, shape, dtype)
         for name, tensor in tensors:
             flat = tensor.detach().contiguous().view(-1).view(torch.uint8)
-            size = flat.numel()
-            assert size <= chunk, f"tensor {name} ({size}B) exceeds the chunk size {chunk}B"
-            if cur_len + size > chunk and cur_len > 0:
-                buckets.append({"offset": offset - cur_len, "size": cur_len, "tensors": cur_tensors})
-                cur_tensors, cur_len = {}, 0
-            view[offset : offset + size].copy_(flat, non_blocking=True)
-            cur_tensors[name] = (cur_len, tensor.shape, tensor.dtype)
+            # CPU staging must finish device-to-host copies before RDMA
+            # registration makes these bytes available to consumers.
+            view[offset : offset + flat.numel()].copy_(flat)
             per_tensor[name] = (offset, tensor.shape, tensor.dtype)
             offset += size
             cur_len += size
@@ -651,32 +680,39 @@ class MooncakeP2PBackend(P2PWeightBackend):
         consumer_engine = consumer_ctx["engine"]  # the replica's own MooncakeCheckpointEngine
         te = consumer_engine.engine
         desc = manifest.descriptor
+        chunk = min(desc["chunk_bytes"], consumer_engine.bucket_size)
+        if chunk < 1:
+            raise ValueError("consumer bucket size must be >= 1")
 
         start = time.monotonic()
-        # stream bucket by bucket: read into the consumer's already-registered
-        # buffer (engine.buf is 2*bucket_size, registered in __init__), then
-        # hand THAT bucket's whole tensors to the sink before the next bucket
-        # overwrites the buffer — a tensor never spans buckets (stage packs
-        # whole-tensor buckets), so no cross-chunk reassembly exists
-        n_tensors = 0
-        for bucket in desc["buckets"]:
-            size = bucket["size"]
-            if size <= 0:
-                continue
-            assert size <= consumer_engine.bucket_size, "bucket larger than consumer buffer"
-            ret = te.transfer_sync_read(
-                desc["session_id"],  # source: the actor's registered staging buffer
-                consumer_engine.buf.data_ptr(),
-                desc["ptr"] + bucket["offset"],
-                size,
-            )
-            assert ret == 0, f"transfer_sync_read failed ret={ret} for {manifest.checkpoint_name}"
-            flat = consumer_engine.buf.view(-1).view(torch.uint8)
-            for name, (rel_offset, shape, dtype) in bucket["tensors"].items():
-                t_size = dtype.itemsize * shape.numel()
-                sink(name, flat[rel_offset : rel_offset + t_size].view(dtype=dtype).view(shape))
-                n_tensors += 1
-            await asyncio.sleep(0)  # keep the loop responsive between buckets
+        # Reassemble one tensor at a time. The registered receive buffer is
+        # scratch space, reused only after copying its bytes into the tensor.
+        # Global model offsets must never index this bucket-sized buffer.
+        scratch = consumer_engine.buf.view(-1).view(torch.uint8)
+        chunk = min(chunk, scratch.numel())
+        if chunk < 1:
+            raise ValueError("consumer buffer must not be empty")
+        for name, (offset, shape, dtype) in desc["tensors"].items():
+            tensor = torch.empty(shape, dtype=dtype, device=scratch.device)
+            flat = tensor.view(-1).view(torch.uint8)
+            for pos in range(0, flat.numel(), chunk):
+                size = min(chunk, flat.numel() - pos)
+                ret = te.transfer_sync_read(
+                    desc["session_id"],
+                    scratch.data_ptr(),
+                    desc["ptr"] + offset + pos,
+                    size,
+                )
+                assert ret == 0, f"transfer_sync_read failed ret={ret} for {manifest.checkpoint_name}"
+                flat[pos : pos + size].copy_(scratch[:size])
+                if scratch.device.type != "cpu":
+                    # RDMA may overwrite scratch on the next read, so the
+                    # device copy must complete before yielding control.
+                    from verl.utils.device import get_torch_device
+
+                    get_torch_device().synchronize(scratch.device)
+                await asyncio.sleep(0)
+            sink(name, tensor)
         return ReadStats(
             nbytes=desc["nbytes"], tensors=n_tensors, seconds=time.monotonic() - start
         )

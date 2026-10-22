@@ -230,8 +230,98 @@ trainer:
   # V1 trainer mode configs
   v1:
 
-    # Trainer mode: "sync", "colocate_async", "separate_async"
+    # Trainer mode: "sync", "colocate_async", "separate_async", "laminar"
     trainer_mode: sync
+
+    # Single-node asynchronous rollout controller and CPU weight relay
+    laminar:
+      # Strict 8+8 synchronous control: one batch, then update, then all-replica barrier.
+      synchronous: false
+      parameter_sync_step: 1
+      batch_per_replica: 8
+      repack_interval_s: 5.0
+      enable_repack: true
+      # Separate repack capacity from engine max_num_seqs and batch admission quota.
+      repack_max_running: 0  # 0 uses the engine limit until calibration is confident.
+      online_capacity:
+        enabled: true
+        kv_usage_limit: 0.9  # Safety margin, not a model/device capacity estimate.
+        healthy_polls: 3
+        growth_factor: 1.25
+        backoff_factor: 0.75
+        load_ratio: 0.75
+        context_bucket_tokens: 4096
+        max_observation_age_s: 15.0
+      roofline:
+        enabled: true
+        calibration_rounds: 3  # Per-replica policy versions; not guaranteed convergence.
+        sample_every: 8
+        coverage_sample_every: 1  # Brief dense sampling for new batch/context bins.
+        warmup_per_shape: 2
+        max_samples: 16384
+        max_samples_per_bin: 128
+        max_pending_events: 64
+        context_bucket_tokens: 4096
+        min_samples_per_bin: 16
+        min_batch_sizes: 6
+        min_side_sizes: 2
+        block_steps: 128
+        min_blocks: 8
+        bootstrap_samples: 64
+        min_rss_improvement: 0.35
+        min_slope_ratio: 2.0
+        max_ci_fraction: 0.25
+        kneedle_sensitivity: 1.0
+        latency_tolerance: 0.25
+        stable_fits: 2
+        fit_interval_s: 10.0
+      run_migration_probe: false
+      prompt_buffer_groups: 64
+      keep_last_versions: 2
+      # Per relay: cache + incoming version + native receive/Ray-copy staging.
+      # This excludes inference model/device memory and unrelated Ray objects.
+      weight_budget:
+        max_versions: 4
+        max_bytes: 103079215104  # 96 GiB; adjust for model size and host memory.
+        capacity_timeout_s: 600.0
+      event_dir: null
+      initial_experience_dir: null
+      # A dedicated CPU actor retains acknowledged prefixes independently of rollout.
+      partial_store:
+        enabled: true
+        persist_to_disk: false  # Durability is deferred; no SQLite file/fsync by default.
+        path: null
+        max_active: 4096
+        chunk_tokens: 128
+        flush_interval_s: 1.0
+        heartbeat_interval_s: 5.0
+        heartbeat_timeout_s: 10.0
+        heartbeat_failures: 2
+        progress_timeout_s: 600.0
+        recovery_timeout_s: 300.0
+        max_retries: 3
+      # CPU host-memory transfer; never silently fall back from RDMA to TCP.
+      mooncake:
+        chunk_bytes: 67108864
+        protocol: rdma
+        device_name: ""
+        verify_checksums: true
+        acquire_timeout_s: 900
+        max_pending_versions: 2
+        # Optional isolated CPU-compatible Mooncake environment, for relay actors only.
+        runtime_env: {}
+        # Process failover keeps exact-version snapshots outside TransferEngine.
+        recovery:
+          enabled: true
+          persist_to_disk: false  # No model backup or catalog fsync on the publish path.
+          hash_workers: 4  # Bounded SHA256 pool; reserved in Ray CPU resources.
+          reuse_verified_source: true  # Exact immutable refs + version/schema/digest only.
+          directory: null
+          heartbeat_interval_s: 5.0
+          rpc_timeout_s: 10.0
+          recovery_timeout_s: 900.0
+          max_retries: 3
+          retry_interval_s: 0.5
 
     # Synchronous PPO trainer
     sync: {}

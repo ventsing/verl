@@ -40,6 +40,7 @@ exercises the full path on 2 GPUs.
 """
 
 import contextlib
+from types import MethodType
 from unittest import mock
 
 import pytest
@@ -124,7 +125,7 @@ class _FakeBaseOutput:
         raise IndexError(idx)
 
 
-def _make_fake_lm() -> torch.nn.Module:
+def _make_fake_lm(forward_fn=None) -> torch.nn.Module:
     """Minimal stand-in for the language-model wrapper used by every adapter.
 
     Provides `self.config`, `self.model(...)`, and `self.lm_head`. The fake
@@ -148,7 +149,12 @@ def _make_fake_lm() -> torch.nn.Module:
             self.lm_head = torch.nn.Linear(HIDDEN_SIZE, VOCAB_SIZE, bias=False)
 
     torch.manual_seed(42)
-    return FakeLM()
+    model = FakeLM()
+    if forward_fn is qwen3_5.forward_with_torch_backend:
+        # Production backend selection installs the module-level PPO forward
+        # before FSDP wraps the head; reproduce that setup in the routing stub.
+        model.lm_head.forward = MethodType(qwen3_5.torch_fused_lm_head_forward, model.lm_head)
+    return model
 
 
 @contextlib.contextmanager
@@ -228,7 +234,7 @@ def test_adapter_honors_shift_labels(forward_fn):
     """When `shift_labels` is provided, every fused adapter must pass it
     through to the kernel verbatim — no local re-rolling.
     """
-    model = _make_fake_lm()
+    model = _make_fake_lm(forward_fn)
     input_ids = torch.tensor([[10, 20, 30, 40]], dtype=torch.long)
     # Deliberately != torch.roll(input_ids); the only way these labels reach
     # the kernel is if the adapter honors `shift_labels`.
@@ -256,7 +262,7 @@ def test_adapter_falls_back_to_local_roll_when_shift_labels_absent(forward_fn):
     """Backward-compat: callers that don't pass `shift_labels` (e.g. the SP=1
     code path or any non-engine consumer) see unchanged behavior.
     """
-    model = _make_fake_lm()
+    model = _make_fake_lm(forward_fn)
     input_ids = torch.tensor([[10, 20, 30, 40]], dtype=torch.long)
     expected = torch.roll(input_ids, shifts=-1, dims=-1)
 

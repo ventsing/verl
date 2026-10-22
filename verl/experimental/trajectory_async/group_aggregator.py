@@ -50,7 +50,9 @@ Semantics:
   eviction). Late siblings arriving after resolution are counted and
   dropped (``late_dropped``) — the accepted cost of a bounded wait.
 * the buffer never blocks the producer; memory is bounded by
-  ``max_buffered_groups`` (soft limit, exceeded only by in-flight groups).
+  ``max_buffered_groups`` for trajectory payloads. Completed uid tombstones
+  are retained for the aggregator's lifetime to prevent replayed groups
+  from being trained twice. Use a new aggregator for a new training run.
 """
 
 from __future__ import annotations
@@ -95,6 +97,9 @@ class GroupAggregator:
         self._first_seen: dict[str, float] = {}
         # uids whose group was dropped; late arrivals are counted and dropped
         self._dead_uids: OrderedDict[str, None] = OrderedDict()
+        # Unlike evicted-group guards, completed ids must not expire: a
+        # delayed replay must never turn a trained group into new work.
+        self._completed_uids: set[str] = set()
         self.max_buffered_groups = max_buffered_groups
         self.max_dead_uids = max_dead_uids
         if min_group_survivors is not None and min_group_survivors < 2:
@@ -130,6 +135,10 @@ class GroupAggregator:
         eviction record available via the return value of :meth:`evict_group`
         or counted internally — see module docstring for the protocol).
         """
+        if traj.uid in self._completed_uids:
+            self.total_duplicates_dropped += 1
+            return None
+
         if traj.uid in self._dead_uids:
             # Sibling arrived after the group was evicted — protocol
             # violation, but we fail soft: count and drop.
@@ -181,6 +190,7 @@ class GroupAggregator:
             del self._group_sizes[traj.uid]
             self._first_seen.pop(traj.uid, None)
             self.total_groups_completed += 1
+            self._completed_uids.add(traj.uid)
             return GroupRecord(
                 uid=traj.uid,
                 group_size=expected_size,

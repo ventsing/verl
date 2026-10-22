@@ -526,6 +526,16 @@ class LLMServerManager:
         await instance._init_global_load_balancer()
         return instance
 
+    @classmethod
+    def empty(cls, *args, **kwargs):
+        """Metadata-only manager for fixed training roles with no hybrid engines."""
+        instance = cls(*args, **kwargs)
+        instance.rollout_replicas = []
+        instance.server_handles = []
+        instance.server_addresses = []
+        instance.global_load_balancer = None
+        return instance
+
     async def _initialize_llm_servers(self, start_rank: int = None):
         """Initialize the LLM server replicas.
 

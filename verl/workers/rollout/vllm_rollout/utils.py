@@ -198,6 +198,31 @@ class vLLMColocateWorkerExtension:
         instance._is_modelopt_qat = _is_modelopt_qat
         return instance
 
+    def configure_trajectory_roofline(self, options):
+        from verl.experimental.trajectory_async.roofline_worker import install_decode_probe
+
+        return install_decode_probe(self, options)
+
+    def set_trajectory_roofline_sampling(self, enabled, fresh_measurement=False):
+        from verl.experimental.trajectory_async.roofline_worker import set_decode_probe_sampling
+
+        return set_decode_probe_sampling(self, enabled, fresh_measurement)
+
+    def set_trajectory_roofline_version(self, version):
+        probe = getattr(self, "_trajectory_decode_probe", None)
+        if probe is not None:
+            probe.set_version(version)
+
+    def drain_trajectory_roofline(self):
+        probe = getattr(self, "_trajectory_decode_probe", None)
+        if probe is None:
+            return {"rank": int(getattr(self, "rank", 0)), "samples": [], "error": "probe unavailable"}
+        try:
+            return probe.drain()
+        except Exception as error:
+            probe.fail(error)
+            return {"rank": int(getattr(self, "rank", 0)), "samples": [], "error": repr(error)}
+
     def _get_drafter_model(self):
         """Return the drafter's model object, or None if unavailable."""
         drafter = getattr(self.model_runner, "drafter", None)
