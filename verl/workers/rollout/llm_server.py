@@ -19,9 +19,10 @@ Utility classes for manage and request LLM servers:
 """
 
 import asyncio
+import inspect
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 import numpy as np
@@ -41,6 +42,49 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+# ---------------------------------------------------------------------------
+# Plugin sockets (design: rollout_layered_scheduling_design.md §3/§9).
+# All sockets are additive and default-off: an unset env var and an empty
+# upgrader registry keep behaviour identical to the stock classes.
+# ---------------------------------------------------------------------------
+
+
+def _load_balancer_class_from_env() -> Optional[type]:
+    """Resolve a balancer class from ``VERL_ROLLOUT_LOAD_BALANCER_CLS`` (FQN).
+
+    Lets balancer plugins (e.g.
+    ``verl.experimental.rollout_scheduling.TokenWeightedLoadBalancer``) plug
+    in without code changes. Returns ``None`` when unset.
+    """
+    fqn = os.environ.get("VERL_ROLLOUT_LOAD_BALANCER_CLS", "").strip()
+    if not fqn:
+        return None
+    from verl.utils.import_utils import load_class_from_fqn
+
+    cls = load_class_from_fqn(fqn, "GlobalRequestLoadBalancer")
+    if not (isinstance(cls, type) and issubclass(cls, GlobalRequestLoadBalancer)):
+        raise TypeError(f"VERL_ROLLOUT_LOAD_BALANCER_CLS={fqn!r} must name a subclass of GlobalRequestLoadBalancer.")
+    return cls
+
+
+# Client-class upgraders: callables (client_cls) -> upgraded_cls | None,
+# consulted by LLMServerManager.get_client(). Registered by plugins to swap
+# in client variants (e.g. hinted clients that pass token-weight hints).
+_CLIENT_CLASS_UPGRADERS: list[Callable[[type], Optional[type]]] = []
+
+
+def register_client_class_upgrader(upgrader: Callable[[type], Optional[type]]) -> None:
+    """Register a client-class upgrader consulted by :meth:`LLMServerManager.get_client`."""
+    _CLIENT_CLASS_UPGRADERS.append(upgrader)
+
+
+def _upgrade_client_class(client_cls: type) -> type:
+    for upgrader in _CLIENT_CLASS_UPGRADERS:
+        upgraded = upgrader(client_cls)
+        if upgraded is not None:
+            return upgraded
+    return client_cls
 
 
 class GlobalRequestLoadBalancer:
@@ -80,8 +124,15 @@ class GlobalRequestLoadBalancer:
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
         self._full_determinism = full_determinism
 
-    def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
+    def acquire_server(self, request_id: str, kv_hint: Optional[int] = None) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
+
+        Args:
+            request_id: request id for the sticky session.
+            kv_hint: optional token-weight hint (estimated final token count)
+                from the client. Ignored by this count-based balancer;
+                consumed by token-weighted subclasses such as
+                ``verl.experimental.rollout_scheduling.TokenWeightedLoadBalancer``.
 
         Returns:
             A tuple of ``(server_id, actor_handle)`` in a single atomic call.
@@ -113,12 +164,35 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests[server_id] += 1
         return server_id, self._servers[server_id]
 
-    def release_server(self, server_id: str) -> None:
-        """Release a server after a request completes."""
+    def release_server(self, server_id: str, request_id: Optional[str] = None, actual_kv: Optional[int] = None) -> None:
+        """Release a server after a request completes.
+
+        Args:
+            server_id: server to release.
+            request_id: optional request id; ignored here, consumed by
+                token-weighted subclasses for exact per-request bookkeeping.
+            actual_kv: optional actual final token count; ignored here,
+                accumulated by subclasses for hint-calibration telemetry.
+        """
         if server_id not in self._inflight_requests:
             return
         if self._inflight_requests[server_id] > 0:
             self._inflight_requests[server_id] -= 1
+
+    def is_request_migrating(self, request_id: str) -> bool:
+        """Whether the server sticky-mapped to this request is being drained for migration.
+
+        Client socket decoupling abort-retry permission from ``partial_rollout``:
+        a migration-caused abort (L2 drain of a replica) retries onto a
+        same-weight-version cohort keeper — zero version mixing, safe without
+        ``partial_rollout`` — while a weight-update abort crosses weight
+        versions and keeps the ``partial_rollout`` gate (design doc §4.4).
+        The stock balancer never drains, so the default answer is ``False``;
+        drain-aware subclasses (e.g.
+        ``verl.experimental.rollout_scheduling.TokenWeightedLoadBalancer``)
+        override this.
+        """
+        return False
 
     def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
         """Atomically add multiple servers to the load balancer pool.
@@ -342,6 +416,31 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             return response_length
         return None
 
+    async def _abort_was_migration(self, request_id: str) -> bool:
+        """Whether this request's last abort was caused by an L2 migration drain.
+
+        Asks the load balancer whether the server sticky-mapped to this
+        request is being drained or was removed mid-flight — the drain path
+        is the only one that leaves a sticky entry pointing at a departing
+        server (``rebalance_requests`` clears sticky before aborting). True
+        means the abort was migration-caused and the retry lands on a
+        same-weight-version keeper. False/unknown — custom LB predating the
+        :meth:`is_request_migrating` socket, no sticky entry, or no LB at
+        all — is conservative: treat the abort as weight-update-caused and
+        keep the ``partial_rollout`` gate.
+
+        Safety premise (design §4.3/§4.4): L2's membership lock makes drain
+        and weight update mutually exclusive windows, so "sticky server is
+        draining" cannot mask a concurrent version change.
+        """
+        if self._load_balancer is None:
+            return False
+        try:
+            return bool(await self._load_balancer.is_request_migrating.remote(request_id=request_id))
+        except AttributeError:
+            # Custom LB without the socket: cannot prove migration-safety.
+            return False
+
     @rollout_trace_op
     async def generate(
         self,
@@ -455,12 +554,21 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     break
 
             # 4. check stop reason
-            # If partial rollout not enable, aborted samples will be dropped.
-            # For v1 trainer, should_retry is always True. Since self.config.async_training is not exist.
+            if output.stop_reason not in ("aborted", "abort"):
+                break
+
+            # Aborted. Retry permission is decoupled from partial_rollout
+            # (design doc §4.4): partial_rollout gates only *version-crossing*
+            # retries — a weight-update abort resumes on new weights. A
+            # migration-caused abort (L2 drain of this request's replica)
+            # resumes on a same-weight-version cohort keeper — zero version
+            # mixing — and is safe to retry regardless of partial_rollout.
+            # The load balancer is the single source of truth for drain
+            # state; only aborted outputs pay the query.
             should_retry = True
             if hasattr(self.config, "async_training") and not self.config.async_training.partial_rollout:
-                should_retry = False
-            if output.stop_reason not in ("aborted", "abort") or not should_retry:
+                should_retry = await self._abort_was_migration(request_id)
+            if not should_retry:
                 break
 
             await asyncio.sleep(1)
@@ -506,7 +614,10 @@ class LLMServerManager:
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.start_rank = start_rank
-        self._load_balancer_cls = load_balancer_cls or GlobalRequestLoadBalancer
+        # Plugin socket: explicit arg > env-var FQN plugin > default.
+        self._load_balancer_cls = (
+            load_balancer_cls or _load_balancer_class_from_env() or GlobalRequestLoadBalancer
+        )
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -520,7 +631,33 @@ class LLMServerManager:
     @classmethod
     @auto_await
     async def create(cls, *args, **kwargs):
-        """Create the LLMServerManager."""
+        """Create the LLMServerManager.
+
+        Plugin socket: when ``actor_rollout_ref.rollout.llm_server_manager_class``
+        names a subclass (FQN) and the caller invoked the base class directly,
+        the subclass is instantiated instead — single-point dispatch, no
+        trainer code changes (same idiom as ``agent_loop_manager_class``).
+        E.g. the shared rollout pool::
+
+            rollout.llm_server_manager_class: \\
+  verl.experimental.rollout_scheduling.pooled_replica.PooledLLMServerManager
+        """
+        if cls is LLMServerManager:
+            config = kwargs.get("config")
+            manager_fqn = (
+                config.actor_rollout_ref.rollout.get("llm_server_manager_class")
+                if config is not None
+                else None
+            )
+            if manager_fqn:
+                from verl.utils.import_utils import load_class_from_fqn
+
+                manager_cls = load_class_from_fqn(manager_fqn, "LLMServerManager")
+                if not (isinstance(manager_cls, type) and issubclass(manager_cls, LLMServerManager)):
+                    raise TypeError(
+                        f"llm_server_manager_class={manager_fqn!r} must name a subclass of LLMServerManager."
+                    )
+                return await manager_cls.create(*args, **kwargs)
         instance = cls(*args, **kwargs)
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
@@ -615,9 +752,12 @@ class LLMServerManager:
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
         # The default GlobalRequestLoadBalancer honors the full_determinism flag
-        # in acquire_server. A custom subclass overrides acquire_server and takes
-        # full control of routing, so the flag is not forwarded to it.
-        if load_balancer_cls is GlobalRequestLoadBalancer:
+        # in acquire_server. A custom subclass takes full control of routing, so
+        # the flag is not forwarded — unless the subclass opted in by accepting
+        # the parameter in its __init__ (keeps determinism semantics uniform).
+        if load_balancer_cls is GlobalRequestLoadBalancer or "full_determinism" in inspect.signature(
+            load_balancer_cls.__init__
+        ).parameters:
             kwargs["full_determinism"] = getattr(self.rollout_config, "full_determinism", False)
         self.global_load_balancer = ray.remote(load_balancer_cls).remote(**kwargs)
 
@@ -632,7 +772,9 @@ class LLMServerManager:
                 :class:`FullyAsyncLLMServerClient` for abort-resume support.
             **kwargs: Forwarded to the client constructor.
         """
-        client_cls = client_cls or LLMServerClient
+        # Plugin socket: registered upgraders may swap in a client variant
+        # (e.g. a hinted client); exact-match no-op when none apply.
+        client_cls = _upgrade_client_class(client_cls or LLMServerClient)
         return client_cls(
             config=self.config,
             load_balancer_handle=self.global_load_balancer,

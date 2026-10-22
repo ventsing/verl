@@ -237,6 +237,20 @@ class RolloutConfig(BaseConfig):
     # loads this class instead of the built-in CheckpointEngineManager.
     checkpoint_manager_class: Optional[str] = None
 
+    # Fully qualified class name for a custom LLMServerManager (plugin socket,
+    # dispatched inside LLMServerManager.create — e.g. the shared rollout
+    # pool's PooledLLMServerManager from verl.experimental.rollout_scheduling).
+    # When set, the trainer transparently instantiates this subclass instead
+    # of the built-in manager; same idiom as checkpoint_manager_class.
+    llm_server_manager_class: Optional[str] = None
+
+    # Shared rollout pool options (multi-task-infer actor pool; consumed by
+    # PooledLLMServerManager). Keys: num_replicas (required int), devices
+    # (list of GPU ids; default range(num_actors)), warmup_distributed (bool),
+    # shared_cache_dir, enable_cache_compression, and fill (mandatory:
+    # checkpoint_path + global_steps [+ storage_backend, storage_config]).
+    shared_pool: Optional[dict] = None
+
     # Checkpoint Engine config for update weights from trainer to rollout
     checkpoint_engine: CheckpointEngineConfig = field(default_factory=CheckpointEngineConfig)
 
