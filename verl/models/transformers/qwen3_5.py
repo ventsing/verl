@@ -350,7 +350,12 @@ def qwen3_5_decoder_layer_forward(
 
     hidden_states = self.input_layernorm(hidden_states)
 
-    if self.layer_type == "linear_attention":
+    # Transformers renamed the decoder attribute to block_type; older releases
+    # (including the MoE decoder) still expose layer_type.
+    layer_type = getattr(self, "block_type", None)
+    if layer_type is None:
+        layer_type = self.layer_type
+    if layer_type == "linear_attention":
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
             cache_params=past_key_values,
@@ -358,7 +363,7 @@ def qwen3_5_decoder_layer_forward(
             cu_seqlens=cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
         )
-    elif self.layer_type == "full_attention":
+    elif layer_type == "full_attention":
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -553,6 +558,22 @@ def forward_with_normal_backend(
     )
 
 
+def torch_fused_lm_head_forward(self, hidden_states, rolled_labels=None, temperature=1.0):
+    """Run chunked PPO projection inside lm_head's FSDP forward hooks."""
+    if rolled_labels is None:
+        return F.linear(hidden_states, self.weight, self.bias)
+    from verl.utils.experimental.torch_functional import FusedLinearForPPO
+
+    # Calling the module (rather than reading its sharded weight externally)
+    # lets FSDP unshard, load CPU-offloaded weights, and install backward hooks.
+    return FusedLinearForPPO().forward(
+        hidden_states=hidden_states.to(self.weight.dtype),
+        vocab_weights=self.weight,
+        input_ids=rolled_labels,
+        temperature=temperature,
+    )
+
+
 def forward_with_torch_backend(
     self: "Qwen3_5ForConditionalGeneration",
     input_ids: torch.LongTensor = None,
@@ -563,8 +584,6 @@ def forward_with_torch_backend(
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> "Qwen3_5CausalLMOutputForPPO":
-    from verl.utils.experimental.torch_functional import FusedLinearForPPO
-
     if cu_seqlens is not None:
         kwargs["cu_seqlens"] = cu_seqlens
     if cu_seqlens_cpu is not None:
@@ -583,23 +602,12 @@ def forward_with_torch_backend(
     else:
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
-    fused_linear_for_ppo = FusedLinearForPPO(impl_backend=getattr(self, "_verl_fused_kernels_backend", "torch"))
-    vocab_weights = self.lm_head.weight
-    if isinstance(vocab_weights, DTensor):
-        vocab_weights = vocab_weights.full_tensor()
-
     ulysses_sequence_parallel_size = get_ulysses_sequence_parallel_world_size()
     if shift_labels is None and ulysses_sequence_parallel_size > 1:
         rolled_labels, _, _ = ulysses_pad_and_slice_inputs(
             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
         )
-    hidden_states = hidden_states.to(vocab_weights.dtype)  # bf16 to float
-    log_probs, entropy = fused_linear_for_ppo.forward(
-        hidden_states=hidden_states,
-        vocab_weights=vocab_weights,
-        input_ids=rolled_labels,
-        temperature=temperature,
-    )
+    log_probs, entropy = self.lm_head(hidden_states, rolled_labels=rolled_labels, temperature=temperature)
     return Qwen3_5CausalLMOutputForPPO(
         log_probs=log_probs,
         entropy=entropy,

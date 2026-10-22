@@ -1,0 +1,1215 @@
+# Copyright 2026 verl contributors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+"""Real-server control plane: independent pulls and same-version repacking.
+
+The portable migration transport aborts a request and re-prefills its prefix on
+the destination. It preserves policy identity, not the source KV/SSM storage.
+This is deliberately reported as ``recompute`` in event traces.
+"""
+
+import asyncio
+import json
+import math
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from uuid import uuid4
+
+import numpy as np
+import ray
+
+from verl.utils import normalize_token_ids
+from verl.workers.rollout.llm_server import LLMServerClient
+from verl.workers.rollout.replica import TokenOutput
+
+
+@dataclass
+class Replica:
+    server: object
+    workers: list
+    version: int = -1
+    admitted: int = 0
+    closed: bool = False
+    pulling: bool = False
+    active: dict = field(default_factory=dict)
+    reserved: set = field(default_factory=set)
+    previous_usage: float = 0.0
+    ramp_down: bool = False
+    relay: object = None
+    healthy: bool = True
+    recovering: bool = False
+
+    @property
+    def load(self):
+        return len(self.active) + len(self.reserved)
+
+
+@dataclass
+class Request:
+    request_id: str
+    slot: int
+    version: int
+    backend_id: str = ""
+    destination: int | None = None
+    migrations: int = 0
+    recoveries: int = 0
+
+
+def consolidation_plan(snapshots, max_requests, capacity=0.9, request_limit=None, usage_projection=None):
+    """Best-fit consolidation with projected source AND destination loads.
+
+    Destinations are never subsequently used as sources in this round. This
+    avoids chain plans whose source load would omit already reserved arrivals.
+    Caller supplies one version group, with nonempty ramp-down candidates.
+    """
+    ordered = sorted(snapshots, key=lambda s: s["usage"])
+    loads = {s["id"]: [s["usage"], s["count"], s.get("context_tokens", 0)] for s in ordered}
+    emptied, destinations, plan = set(), set(), []
+    for source in ordered:
+        sid = source["id"]
+        if sid in emptied or sid in destinations:
+            continue
+        fits = [
+            d
+            for d in ordered
+            if d["id"] != sid
+            and d["id"] not in emptied
+            and (
+                usage_projection(d["id"], loads[d["id"]][0], loads[sid][1])
+                if usage_projection
+                else loads[d["id"]][0] + loads[sid][0]
+            )
+            <= capacity
+            and loads[d["id"]][1] + loads[sid][1]
+            <= (request_limit(d["id"], max(loads[d["id"]][2], loads[sid][2])) if request_limit else max_requests)
+        ]
+        if not fits:
+            continue
+        target = max(fits, key=lambda d: loads[d["id"]][0])["id"]
+        loads[target][0] = (
+            usage_projection(target, loads[target][0], loads[sid][1])
+            if usage_projection
+            else loads[target][0] + loads[sid][0]
+        )
+        loads[target][1] += loads[sid][1]
+        loads[target][2] = max(loads[target][2], loads[sid][2])
+        emptied.add(sid)
+        destinations.add(target)
+        plan.append((sid, target))
+    return plan
+
+
+class LaminarController:
+    """Async Ray actor owning admission, drain boundaries, pulls and migration.
+
+    No trainer collective or rollout-wide pause is used by this controller.
+    In-flight requests reserve their version on admission; replicas can update
+    only after both active requests and migration reservations reach zero.
+    """
+
+    def __init__(
+        self,
+        replicas,
+        relay,
+        batch_quota=8,
+        max_running=8,
+        check_interval_s=5.0,
+        enable_repack=True,
+        event_path=None,
+        partial_store=None,
+        recovery_options=None,
+        repack_max_running=0,
+        roofline_options=None,
+        capacity_options=None,
+        capacity_profiles=None,
+    ):
+        if batch_quota < 1 or max_running < 1 or check_interval_s <= 0:
+            raise ValueError("Quotas, max_running and check_interval_s must be positive")
+        self.replicas = [Replica(**r) for r in replicas]
+        self.relay = relay
+        self.partial_store = partial_store
+        self.recovery_options = dict(recovery_options or {})
+        self.pinned_versions = set()
+        self.pin_owner = "laminar-partial-pool"
+        self.batch_quota = batch_quota
+        self.max_running = max_running
+        if repack_max_running < 0:
+            raise ValueError("Repack capacity cannot be negative")
+        self.repack_max_running = min(max_running, repack_max_running or max_running)
+        self.roofline = {}
+        self.roofline_last_fit = {}
+        self.roofline_dirty = set()
+        self.roofline_lock = asyncio.Lock()
+        if roofline_options and roofline_options.get("enabled", False):
+            from verl.experimental.trajectory_async.roofline import OnlineRoofline
+
+            self.roofline = {i: OnlineRoofline(roofline_options) for i in range(len(replicas))}
+        self.capacity = {}
+        if self.roofline and capacity_options and capacity_options.get("enabled", False):
+            from verl.experimental.trajectory_async.capacity import OnlineCapacity
+
+            self.capacity = {
+                i: OnlineCapacity(batch_quota, self.max_running, capacity_options) for i in range(len(replicas))
+            }
+        for index, profile in enumerate(capacity_profiles or []):
+            if index in self.capacity and profile and profile.get("available"):
+                governor = self.capacity[index]
+                governor.pool = profile
+                if governor.memory_limit() < 1:
+                    raise ValueError("Initial KV/SSM pool cannot fit one request within its safety margin")
+                governor.current = min(governor.current, governor.memory_limit())
+                governor.reason = "profiled_initial_pool"
+        self.check_interval = check_interval_s
+        self.enable_repack = enable_repack
+        self.latest = -1
+        self.minimum_version = -1
+        self.condition = asyncio.Condition()
+        self.wakeup = asyncio.Event()
+        self.repack_requested = False
+        self.task = None
+        self.pulls = set()
+        self.failure = None
+        self.stopped = False
+        self.pending = set()
+        self.request_tasks = {}
+        self.imported_requests = set()
+        self.event_path = Path(event_path) if event_path else None
+        if self.event_path:
+            self.event_path.parent.mkdir(parents=True, exist_ok=True)
+        self.metrics = {
+            "completed": 0,
+            "migrations": 0,
+            "pulls": 0,
+            "repack_checks": 0,
+            "roofline_polls": 0,
+            "preflight_completed": 0,
+            "preflight_migrations": 0,
+            "replayed_experiences": 0,
+            "recoveries": 0,
+            "quarantined_replicas": 0,
+        }
+        self.last_telemetry = []
+
+    def _event(self, event, **fields):
+        record = {"event": event, "time": time.time(), **fields}
+        if self.event_path:
+            with self.event_path.open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+
+    def _check(self):
+        if self.failure:
+            raise RuntimeError(f"Laminar controller failed: {self.failure}")
+        if self.stopped:
+            raise RuntimeError("Laminar controller stopped")
+
+    async def start(self, version):
+        await self.notify_weights(version)
+        if self.partial_store is not None:
+            for retained in await self.partial_store.versions.remote():
+                await self._retain_version(retained)
+        await asyncio.gather(*(self._pull(i) for i in range(len(self.replicas))))
+        self.task = asyncio.create_task(self._run())
+        return self.status()
+
+    def _relays(self):
+        # Ray handle equality is stable; plain test handles are also hashable.
+        return list(dict.fromkeys([self.relay] + [r.relay for r in self.replicas if r.relay is not None]))
+
+    async def _retain_version(self, version):
+        if self.partial_store is not None and version not in self.pinned_versions:
+            for relay in self._relays():
+                await relay.retain.remote(version, f"{self.pin_owner}:{version}")
+            self.pinned_versions.add(version)
+
+    async def _collect_versions(self):
+        if self.partial_store is None:
+            return
+        needed = set(await self.partial_store.versions.remote()) | {self.latest}
+        needed.update(r.version for r in self.replicas if r.healthy and r.version >= 0)
+        for version in list(self.pinned_versions - needed):
+            for relay in self._relays():
+                await relay.release_owner.remote(f"{self.pin_owner}:{version}")
+            self.pinned_versions.remove(version)
+
+    async def notify_weights(self, version):
+        await self._retain_version(version)
+        async with self.condition:
+            if version < self.latest:
+                raise ValueError("Published versions must not decrease")
+            self.latest = version
+            self.repack_requested = True
+            for replica in self.replicas:
+                if replica.version < version:
+                    replica.closed = True
+            self._event("published", version=version, active=sum(r.load for r in self.replicas))
+            self.wakeup.set()
+            self.condition.notify_all()
+
+    async def set_minimum_version(self, version):
+        async with self.condition:
+            self.minimum_version = version
+            self.condition.notify_all()
+
+    async def _pull(self, index, exact_version=None):
+        replica = self.replicas[index]
+        # Reserve before any await, so admission cannot race a load.
+        if replica.load or replica.pulling:
+            return
+        replica.pulling = True
+        manifest = None
+        relay = replica.relay if replica.relay is not None else self.relay
+        started = time.monotonic()
+        try:
+            # Hierarchical relays may still be receiving this committed version.
+            manifest = (
+                await relay.acquire.remote(exact_version if exact_version is not None else self.latest)
+                if replica.relay is not None or exact_version is not None
+                else await relay.acquire.remote()
+            )
+            version = manifest["version"]
+            self._event(
+                "pull_begin",
+                replica=index,
+                version=version,
+                other_active=sum(r.load for i, r in enumerate(self.replicas) if i != index),
+            )
+            await replica.server.wait_for_requests_to_drain.remote()
+            await asyncio.gather(
+                *[worker.execute_checkpoint_engine.remote("set_manifest", manifest) for worker in replica.workers]
+            )
+            await asyncio.gather(*[worker.update_weights.remote(global_steps=version) for worker in replica.workers])
+            replica.version = version
+            replica.admitted = 0
+            replica.previous_usage = 0.0
+            replica.ramp_down = False
+            replica.closed = version < self.latest
+            self.metrics["pulls"] += 1
+            self._event("pull_end", replica=index, version=version, seconds=time.monotonic() - started)
+        except Exception as error:
+            if self.partial_store is not None and self._recoverable(error):
+                self._quarantine(index, error)
+            else:
+                self.failure = repr(error)
+                self._event("failure", replica=index, error=self.failure)
+            raise
+        finally:
+            # Hold the relay lease until every TP worker has relinquished its
+            # manifest. Failed loads remain unroutable, never partially fresh.
+            try:
+                results = await asyncio.gather(
+                    *[
+                        asyncio.wait_for(
+                            worker.execute_checkpoint_engine.remote("finalize"),
+                            self.recovery_options.get("heartbeat_timeout_s", 10.0),
+                        )
+                        for worker in replica.workers
+                    ],
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, Exception):
+                        if self.partial_store is not None and self._recoverable(result):
+                            self._quarantine(index, result)
+                        else:
+                            raise result
+            finally:
+                if manifest is not None:
+                    await relay.release.remote(manifest["lease"])
+                async with self.condition:
+                    replica.pulling = False
+                    self.condition.notify_all()
+
+    async def _assign(self, request_id, is_validation=False):
+        async with self.condition:
+            while True:
+                self._check()
+                if self.partial_store is not None and not any(r.healthy for r in self.replicas):
+                    raise RuntimeError("No healthy rollout replica remains; durable prefixes are retained")
+                if self.minimum_version >= 0 and not is_validation:
+                    await self.condition.wait()
+                    continue
+                required_version = max(self.minimum_version, self.latest) if is_validation else -1
+                available = [
+                    i
+                    for i, r in enumerate(self.replicas)
+                    if r.healthy
+                    and not r.recovering
+                    and not r.closed
+                    and not r.pulling
+                    and r.load < self._admission_limit(i)
+                    and r.version >= required_version
+                    and r.admitted < self._admission_limit(i)
+                ]
+                if available:
+                    index = min(available, key=lambda i: self.replicas[i].load)
+                    replica = self.replicas[index]
+                    request = Request(request_id, index, replica.version)
+                    replica.active[request_id] = request
+                    replica.admitted += 1
+                    replica.closed = replica.admitted >= self._admission_limit(index)
+                    return request
+                await self.condition.wait()
+
+    async def generate(self, request_id, prompt_ids, sampling_params, **kwargs):
+        if self.partial_store is not None:
+            return await self._generate_durable(request_id, prompt_ids, sampling_params, **kwargs)
+        prompt_ids = normalize_token_ids(prompt_ids)
+        if request_id in self.pending or request_id in self.imported_requests:
+            raise ValueError(f"Duplicate in-flight request ID {request_id}")
+        self.pending.add(request_id)
+        request = None
+        tokens, logprobs, experts = [], [], []
+        sampling_params = dict(sampling_params)
+        is_validation = bool(sampling_params.pop("_laminar_validate", False))
+        budget = sampling_params.pop("max_tokens", sampling_params.pop("max_new_tokens", None))
+        if not isinstance(budget, int) or budget <= 0:
+            self.pending.remove(request_id)
+            raise ValueError("Laminar requests require an explicit positive response budget")
+        if kwargs.get("image_data") or kwargs.get("video_data") or kwargs.get("audio_data"):
+            self.pending.remove(request_id)
+            raise ValueError("Laminar recompute migration currently supports text-only trajectories")
+        started = time.monotonic()
+        self.request_tasks[request_id] = asyncio.current_task()
+        try:
+            request = await self._assign(request_id, is_validation=is_validation)
+            is_probe = request_id.startswith("preflight-")
+            self._event(
+                "request_begin", request=request_id, replica=request.slot, version=request.version, is_probe=is_probe
+            )
+            while len(tokens) < budget:
+                replica = self.replicas[request.slot]
+                if replica.version != request.version or replica.pulling:
+                    raise RuntimeError("In-flight trajectory policy version changed")
+                request.backend_id = f"laminar-{request_id}-{uuid4().hex}"
+                output = await replica.server.generate.remote(
+                    request_id=request.backend_id,
+                    prompt_ids=list(prompt_ids) + tokens,
+                    sampling_params={**sampling_params, "max_tokens": budget - len(tokens)},
+                    **kwargs,
+                )
+                version = output.extra_fields.get("global_steps")
+                if version != request.version:
+                    raise RuntimeError(f"Behavior policy mismatch: expected {request.version}, got {version}")
+                if output.log_probs is None or len(output.log_probs) != len(output.token_ids):
+                    raise RuntimeError("Each generated token must retain its behavior log probability")
+                if not all(math.isfinite(value) for value in output.log_probs):
+                    raise RuntimeError("Non-finite behavior log probability")
+                tokens.extend(output.token_ids)
+                logprobs.extend(output.log_probs)
+                if len(tokens) > budget:
+                    raise RuntimeError("Backend exceeded the remaining trajectory budget")
+                if request.migrations:
+                    self._event(
+                        "continuation_segment",
+                        request=request_id,
+                        version=request.version,
+                        tokens=len(output.token_ids),
+                        prefill_seconds=output.extra_fields.get("prefill_seconds"),
+                    )
+                if output.routed_experts is not None:
+                    experts.append(output.routed_experts)
+                if output.stop_reason not in ("aborted", "abort") or len(tokens) == budget:
+                    self.metrics["preflight_completed" if is_probe else "completed"] += 1
+                    self._event(
+                        "request_end",
+                        request=request_id,
+                        version=request.version,
+                        tokens=len(tokens),
+                        migrations=request.migrations,
+                        seconds=time.monotonic() - started,
+                        is_probe=is_probe,
+                    )
+                    return TokenOutput(
+                        token_ids=tokens,
+                        log_probs=logprobs,
+                        routed_experts=np.concatenate(experts, axis=0) if experts else None,
+                        stop_reason="completed",
+                        extra_fields={
+                            **output.extra_fields,
+                            "global_steps": request.version,
+                            "min_global_steps": request.version,
+                            "max_global_steps": request.version,
+                            "migrations": request.migrations,
+                            "migration_transport": "recompute",
+                            "trajectory_request_id": request_id,
+                        },
+                    )
+                async with self.condition:
+                    if request.destination is None:
+                        raise RuntimeError("Unexpected abort: no same-version migration was reserved")
+                    source = request.slot
+                    target = request.destination
+                    destination = self.replicas[target]
+                    if destination.version != request.version or destination.pulling:
+                        raise RuntimeError("Migration destination policy version changed")
+                    self.replicas[source].active.pop(request_id)
+                    destination.reserved.remove(request_id)
+                    destination.active[request_id] = request
+                    request.slot, request.destination = target, None
+                    request.migrations += 1
+                    self.metrics["preflight_migrations" if is_probe else "migrations"] += 1
+                    self._event(
+                        "migration",
+                        request=request_id,
+                        source=source,
+                        destination=target,
+                        version=request.version,
+                        prefix_tokens=len(prompt_ids) + len(tokens),
+                        transport="recompute",
+                        is_probe=is_probe,
+                    )
+                    self.wakeup.set()
+                    self.condition.notify_all()
+        finally:
+            async with self.condition:
+                self.pending.discard(request_id)
+                self.request_tasks.pop(request_id, None)
+                if request is not None:
+                    self.replicas[request.slot].active.pop(request_id, None)
+                    if request.destination is not None:
+                        self.replicas[request.destination].reserved.discard(request_id)
+                self.wakeup.set()
+                self.condition.notify_all()
+
+    def _quarantine(self, index, error):
+        replica = self.replicas[index]
+        if replica.healthy:
+            replica.healthy = False
+            replica.closed = True
+            self.metrics["quarantined_replicas"] += 1
+            self._event("replica_quarantined", replica=index, error=repr(error))
+            if not any(r.healthy for r in self.replicas):
+                self.failure = "No healthy rollout replica remains; durable prefixes are retained"
+                self._event("failure", error=self.failure)
+        self.wakeup.set()
+
+    async def _wait_backend(self, request, reference):
+        task = asyncio.ensure_future(reference)
+        heartbeat = self.recovery_options.get("heartbeat_interval_s", 5.0)
+        timeout = self.recovery_options.get("heartbeat_timeout_s", 10.0)
+        progress_timeout = self.recovery_options.get("progress_timeout_s", 600.0)
+        failures = 0
+        try:
+            while True:
+                done, _ = await asyncio.wait([task], timeout=heartbeat)
+                if done:
+                    return await task
+                if not self.replicas[request.slot].healthy:
+                    raise ConnectionError("Rollout replica was quarantined")
+                try:
+                    status = await asyncio.wait_for(
+                        self.replicas[request.slot].server.trajectory_status.remote(), timeout
+                    )
+                except Exception as error:
+                    failures += 1
+                    if failures >= self.recovery_options.get("heartbeat_failures", 2):
+                        raise ConnectionError("Rollout heartbeat failed") from error
+                    continue
+                failures = 0
+                if status["version"] != request.version:
+                    raise ValueError("Heartbeat reports a different behavior policy")
+                progress = await self.partial_store.progress.remote(request.request_id)
+                if time.time() - progress["updated"] > progress_timeout:
+                    raise TimeoutError("Rollout made no durable token progress")
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @staticmethod
+    def _recoverable(error):
+        cause = getattr(error, "cause", error)
+        return isinstance(
+            cause,
+            (
+                ConnectionError,
+                TimeoutError,
+                ray.exceptions.RayActorError,
+                ray.exceptions.RaySystemError,
+                ray.exceptions.ObjectLostError,
+            ),
+        ) or (type(cause).__name__ == "EngineDeadError")
+
+    async def _recover_slot(self, request):
+        """Reserve an exact-version target, reloading retained weights if needed."""
+        source = request.slot
+        if request.destination is not None:
+            self.replicas[request.destination].reserved.discard(request.request_id)
+            request.destination = None
+        self.replicas[source].active.pop(request.request_id, None)
+        self.wakeup.set()
+        async with asyncio.timeout(self.recovery_options.get("recovery_timeout_s", 300.0)):
+            while True:
+                async with self.condition:
+                    self._check()
+                    healthy = [i for i, r in enumerate(self.replicas) if r.healthy]
+                    if not healthy:
+                        raise RuntimeError("No healthy rollout replica remains; durable prefix is retained")
+                    same = [
+                        i
+                        for i in healthy
+                        if not self.replicas[i].pulling
+                        and not self.replicas[i].recovering
+                        and self.replicas[i].version == request.version
+                        and self.replicas[i].load < self._admission_limit(i)
+                    ]
+                    if same:
+                        target = min(same, key=lambda i: self.replicas[i].load)
+                        self.replicas[target].active[request.request_id] = request
+                        self.replicas[target].closed = True
+                        request.slot = target
+                        break
+                    idle = [
+                        i
+                        for i in healthy
+                        if not self.replicas[i].pulling
+                        and not self.replicas[i].recovering
+                        and not self.replicas[i].load
+                    ]
+                    if idle:
+                        target = idle[0]
+                        self.replicas[target].recovering = True
+                    else:
+                        await self.condition.wait()
+                        continue
+                try:
+                    try:
+                        await self._pull(target, exact_version=request.version)
+                    except Exception as error:
+                        if self._recoverable(error):
+                            continue  # A second failed target does not stop other healthy replicas.
+                        raise
+                    async with self.condition:
+                        self.replicas[target].active[request.request_id] = request
+                        self.replicas[target].closed = True
+                        request.slot = target
+                    break
+                finally:
+                    self.replicas[target].recovering = False
+        self.metrics["recoveries"] += 1
+        request.recoveries += 1
+        self._event(
+            "trajectory_recovered",
+            request=request.request_id,
+            source=source,
+            destination=request.slot,
+            version=request.version,
+        )
+
+    def _stored_output(self, state, migrations=None):
+        version = state["version"]
+        return TokenOutput(
+            token_ids=state["token_ids"],
+            log_probs=state["log_probs"],
+            stop_reason="completed",
+            extra_fields={
+                **state["extra_fields"],
+                "global_steps": version,
+                "min_global_steps": version,
+                "max_global_steps": version,
+                "migrations": state["extra_fields"].get("migrations", 0) if migrations is None else migrations,
+                "migration_transport": "recompute",
+                "trajectory_request_id": state["request_id"],
+                "durable_partial": True,
+            },
+        )
+
+    async def _generate_durable(self, request_id, prompt_ids, sampling_params, **kwargs):
+        prompt_ids = normalize_token_ids(prompt_ids)
+        params = dict(sampling_params)
+        is_validation = bool(params.pop("_laminar_validate", False))
+        budget = params.pop("max_tokens", params.pop("max_new_tokens", None))
+        if type(budget) is not int or budget <= 0:
+            raise ValueError("Laminar requests require an explicit positive response budget")
+        if any(kwargs.get(k) for k in ("image_data", "video_data", "audio_data")):
+            raise ValueError("Durable trajectories currently support text-only generation")
+        if request_id in self.pending or request_id in self.imported_requests:
+            raise ValueError(f"Duplicate in-flight request ID {request_id}")
+        self.pending.add(request_id)
+        self.request_tasks[request_id] = asyncio.current_task()
+        request = None
+        started = time.monotonic()
+        try:
+            state = await self.partial_store.lookup.remote(request_id)
+            if state is not None:
+                # create() verifies immutable input identity before replay/resume.
+                state = await self.partial_store.create.remote(request_id, prompt_ids, params, budget, state["version"])
+                if state["status"] == "completed":
+                    return self._stored_output(state)
+                if state["status"] == "abandoned":
+                    raise ValueError("Trajectory was explicitly abandoned")
+                request = Request(
+                    request_id,
+                    -1,
+                    state["version"],
+                    migrations=state["extra_fields"].get("migrations", 0),
+                    recoveries=state["extra_fields"].get("recoveries", 0),
+                )
+                # There is no live source on a reattach; fence any previous writer.
+                await self.partial_store.fence.remote(request_id)
+                request.slot = 0
+                await self._recover_slot(request)
+            else:
+                request = await self._assign(request_id, is_validation=is_validation)
+                await self._retain_version(request.version)
+                state = await self.partial_store.create.remote(request_id, prompt_ids, params, budget, request.version)
+            is_probe = request_id.startswith("preflight-")
+            self._event(
+                "request_begin", request=request_id, replica=request.slot, version=request.version, is_probe=is_probe
+            )
+            failures = 0
+            while state["status"] != "completed":
+                if len(state["token_ids"]) == budget:
+                    attempt = await self.partial_store.begin_attempt.remote(request_id, uuid4().hex)
+                    await self.partial_store.append.remote(
+                        request_id, attempt["epoch"], request.version, budget, [], [], terminal=True
+                    )
+                    state = await self.partial_store.get.remote(request_id)
+                    break
+                replica = self.replicas[request.slot]
+                if replica.version != request.version or replica.pulling:
+                    raise RuntimeError("In-flight trajectory policy version changed")
+                attempt = await self.partial_store.begin_attempt.remote(request_id, uuid4().hex)
+                request.backend_id = f"laminar-{request_id}-{uuid4().hex}"
+                base = len(state["token_ids"])
+                context = {
+                    **attempt,
+                    "store": self.partial_store,
+                    "request_id": request_id,
+                    "chunk_tokens": self.recovery_options.get("chunk_tokens", 128),
+                    "interval_s": self.recovery_options.get("flush_interval_s", 1.0),
+                    "extra_fields": {"migrations": request.migrations, "recoveries": request.recoveries},
+                }
+                try:
+                    output = await self._wait_backend(
+                        request,
+                        replica.server.generate.remote(
+                            request_id=request.backend_id,
+                            prompt_ids=prompt_ids + state["token_ids"],
+                            sampling_params={**params, "max_tokens": budget - base},
+                            trajectory_progress=context,
+                            **kwargs,
+                        ),
+                    )
+                except Exception as error:
+                    if not self._recoverable(error):
+                        raise
+                    # Fencing is committed before any new generation is admitted.
+                    state = await self.partial_store.fence.remote(request_id)
+                    self._quarantine(request.slot, error)
+                    failures += 1
+                    if state["status"] == "completed":
+                        break  # Durable EOS/length survived a lost final RPC response.
+                    if failures > self.recovery_options.get("max_retries", 3):
+                        raise RuntimeError("Trajectory recovery retry limit exceeded; prefix retained") from error
+                    await self._recover_slot(request)
+                    continue
+                state = await self.partial_store.get.remote(request_id)
+                if output.extra_fields.get("global_steps") != request.version:
+                    raise RuntimeError("Behavior policy mismatch after durable generation")
+                if state["token_ids"][base:] != output.token_ids or state["log_probs"][base:] != output.log_probs:
+                    raise RuntimeError("Backend result differs from acknowledged durable prefix")
+                if state["status"] == "completed":
+                    break
+                async with self.condition:
+                    if output.stop_reason not in ("abort", "aborted") or request.destination is None:
+                        raise RuntimeError("Unexpected partial segment without a migration reservation")
+                    target = request.destination
+                    destination = self.replicas[target]
+                    if not destination.healthy:
+                        # Destination died after reservation/abort. Keep the
+                        # durable prefix on the still-pinned source and resume.
+                        destination.reserved.discard(request_id)
+                        request.destination = None
+                        self._event(
+                            "migration_cancelled",
+                            request=request_id,
+                            source=request.slot,
+                            destination=target,
+                            version=request.version,
+                        )
+                        self.condition.notify_all()
+                        continue
+                    if destination.version != request.version or destination.pulling:
+                        raise RuntimeError("Migration destination changed version")
+                    source = request.slot
+                    replica.active.pop(request_id, None)
+                    destination.reserved.discard(request_id)
+                    destination.active[request_id] = request
+                    request.slot, request.destination = target, None
+                    request.migrations += 1
+                    self.metrics["preflight_migrations" if is_probe else "migrations"] += 1
+                    self._event(
+                        "migration",
+                        request=request_id,
+                        source=source,
+                        destination=target,
+                        version=request.version,
+                        prefix_tokens=len(prompt_ids) + len(state["token_ids"]),
+                        transport="recompute",
+                        is_probe=is_probe,
+                    )
+                    self.wakeup.set()
+                    self.condition.notify_all()
+            self.metrics["preflight_completed" if is_probe else "completed"] += 1
+            self._event(
+                "request_end",
+                request=request_id,
+                version=request.version,
+                tokens=len(state["token_ids"]),
+                migrations=request.migrations,
+                seconds=time.monotonic() - started,
+                is_probe=is_probe,
+            )
+            return self._stored_output(state, request.migrations)
+        except Exception as error:
+            # Probability/version/prefix invariants must stop training, rather
+            # than be swallowed as a bad GRPO group and silently keep going.
+            if request is not None:
+                self.failure = repr(error)
+                self._event("failure", request=request_id, error=self.failure)
+                self.wakeup.set()
+            raise
+        finally:
+            # Stop/caller cancellation also fences a potentially still-live worker.
+            if request is not None:
+                saved = await self.partial_store.fence.remote(request_id)
+                if saved["status"] != "completed" and request.backend_id:
+                    try:
+                        await asyncio.wait_for(
+                            self.replicas[request.slot].server.abort_trajectory.remote(request.backend_id),
+                            self.recovery_options.get("heartbeat_timeout_s", 10.0),
+                        )
+                    except Exception:
+                        pass  # The committed fence already makes late output harmless.
+            async with self.condition:
+                self.pending.discard(request_id)
+                self.request_tasks.pop(request_id, None)
+                if request is not None:
+                    self.replicas[request.slot].active.pop(request_id, None)
+                    if request.destination is not None:
+                        self.replicas[request.destination].reserved.discard(request_id)
+                self.wakeup.set()
+                self.condition.notify_all()
+
+    async def durability_status(self):
+        if self.partial_store is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "pool": await self.partial_store.status.remote(),
+            "incomplete": await self.partial_store.incomplete.remote(),
+            "relays": [await relay.status.remote() for relay in self._relays()],
+        }
+
+    async def abandon(self, request_id, reason):
+        if self.partial_store is None:
+            raise RuntimeError("Partial response storage is disabled")
+        if request_id in self.pending:
+            raise ValueError("Cancel and settle the active request before abandoning its durable prefix")
+        state = await self.partial_store.abandon.remote(request_id, reason)
+        self._event("trajectory_abandoned", request=request_id, version=state["version"], reason=reason)
+        await self._collect_versions()
+        return {"request_id": request_id, "status": state["status"]}
+
+    def record_initial_experiences(self, records):
+        self._check()
+        if self.latest != 0 or self.pending or self.imported_requests:
+            raise ValueError("Initial experience replay must precede live generation on fresh policy version 0")
+        for record in records:
+            if record["version"] != 0 or record["request"] in self.imported_requests:
+                raise ValueError("Initial replay requires unique version-zero experiences")
+            self._event("request_import", **record)
+            self.imported_requests.add(record["request"])
+        self.metrics["replayed_experiences"] = len(records)
+
+    async def _ingest_roofline(self, telemetry):
+        if not self.roofline:
+            return
+        # Only this polling path drains samples. Heartbeat/manual status calls
+        # read cached metadata and cannot steal points before manager fitting.
+        indices = list(self.roofline)
+        packets = await asyncio.gather(
+            *[
+                asyncio.wait_for(
+                    self.replicas[index].server.trajectory_roofline.remote(),
+                    self.recovery_options.get("heartbeat_timeout_s", 10.0),
+                )
+                for index in indices
+            ],
+            return_exceptions=True,
+        )
+        for index, packet in zip(indices, packets, strict=True):
+            telemetry[index]["roofline"] = (
+                packet
+                if not isinstance(packet, BaseException)
+                else {
+                    "available": False,
+                    "samples": [],
+                    "errors": [repr(packet)],
+                }
+            )
+        async with self.roofline_lock:
+            for index, estimator in self.roofline.items():
+                observations = telemetry[index].get("roofline", {})
+                samples = observations.get("samples", []) if observations.get("available", False) else []
+                before = estimator.accepted
+                estimator.add(samples)
+                if estimator.accepted > before:
+                    self.roofline_dirty.add(index)
+                now = time.monotonic()
+                if (
+                    index in self.roofline_dirty
+                    and now - self.roofline_last_fit.get(index, -math.inf) >= estimator.config.fit_interval_s
+                ):
+                    status = await asyncio.to_thread(estimator.fit)
+                    self.roofline_last_fit[index] = time.monotonic()
+                    self.roofline_dirty.discard(index)
+                    self._event("roofline_update", replica=index, **status)
+
+    def _admission_limit(self, index):
+        return self.capacity[index].limit() if index in self.capacity else min(self.batch_quota, self.max_running)
+
+    def _repack_limit(self, index, telemetry, context_tokens=None):
+        fallback = min(self.max_running, self.repack_max_running)
+        if index in self.capacity:
+            fallback = min(fallback, self.capacity[index].limit())
+        estimator = self.roofline.get(index)
+        if estimator is None:
+            return fallback
+        observations = telemetry[index].get("roofline", {})
+        if not observations.get("available", False):
+            return fallback
+        context = context_tokens if context_tokens is not None else observations.get("max_context_tokens", 0)
+        return estimator.limit(observations.get("mode", "unknown"), context, fallback)
+
+    async def repack_once(self, perform_moves=True):
+        """Read backend KV telemetry, reserve destinations, then cancel sources."""
+        self.metrics["repack_checks"] += int(perform_moves)
+        self.metrics["roofline_polls"] += int(bool(self.roofline))
+        telemetry = await asyncio.gather(
+            *[
+                asyncio.wait_for(
+                    r.server.trajectory_status.remote(), self.recovery_options.get("heartbeat_timeout_s", 10.0)
+                )
+                for r in self.replicas
+            ],
+            return_exceptions=self.partial_store is not None,
+        )
+        if self.partial_store is not None:
+            for index, data in enumerate(telemetry):
+                if isinstance(data, BaseException):
+                    self._quarantine(index, data)
+                    telemetry[index] = {"kv_usage": 0.0, "waiting": 0, "request_ids": [], "observed_at": time.time()}
+
+        await self._ingest_roofline(telemetry)
+        for index, governor in self.capacity.items():
+            if governor.update(telemetry[index], self.roofline.get(index), time.time()):
+                self._event("capacity_update", replica=index, **governor.status())
+            replica = self.replicas[index]
+            # Exploration only tops up the current version's batch. A newer
+            # actor version, migration reservations or drain operations win.
+            if (
+                replica.healthy
+                and not replica.recovering
+                and not replica.pulling
+                and not replica.reserved
+                and not any(q.destination is not None for q in replica.active.values())
+                and replica.version == self.latest
+                and replica.admitted < governor.limit()
+                and not replica.ramp_down
+                and telemetry[index].get("kv_usage", 0) >= replica.previous_usage
+            ):
+                replica.closed = False
+        if self.capacity:
+            async with self.condition:
+                self.condition.notify_all()
+        self.last_telemetry = [
+            {
+                "replica": index,
+                "version": replica.version,
+                "active": len(replica.active),
+                "reserved": len(replica.reserved),
+                "closed": replica.closed,
+                "pulling": replica.pulling,
+                "kv_usage": data["kv_usage"],
+                "previous_kv_usage": replica.previous_usage,
+                "waiting": data["waiting"],
+                "observed_at": data["observed_at"],
+                "repack_limit": self._repack_limit(index, telemetry),
+                "admission_limit": self._admission_limit(index),
+                "capacity": self.capacity[index].status() if index in self.capacity else {"enabled": False},
+                "roofline": {k: v for k, v in data.get("roofline", {}).items() if k != "samples"},
+            }
+            for index, (replica, data) in enumerate(zip(self.replicas, telemetry, strict=True))
+        ]
+        groups = {}
+        for index, (replica, data) in enumerate(zip(self.replicas, telemetry, strict=True)):
+            usage = data["kv_usage"]
+            previous, replica.previous_usage = replica.previous_usage, usage
+            capacity_limit = self.capacity[index].config.kv_usage_limit if index in self.capacity else 0.9
+            if data["waiting"] or usage >= capacity_limit:
+                replica.ramp_down = False
+            elif 0 < usage < previous:
+                # Remember the observed drain phase until the batch boundary.
+                # Completions on different replicas need not coincide in the
+                # same five-second polling window to permit consolidation.
+                replica.ramp_down = True
+            self.last_telemetry[index]["ramp_down"] = replica.ramp_down
+            # Stale metrics and pre-engine requests cannot authorize migration.
+            ids = set(data["request_ids"])
+            ready = all(q.backend_id in ids and q.destination is None for q in replica.active.values())
+            if (
+                replica.healthy
+                and not replica.recovering
+                and replica.closed
+                and not replica.pulling
+                and not replica.reserved
+                and ready
+                and 0 < replica.load < self.max_running
+                and data["waiting"] == 0
+                and replica.ramp_down
+                and 0 < usage < capacity_limit
+                and time.time() - data["observed_at"] < 2 * self.check_interval
+            ):
+                groups.setdefault(replica.version, []).append(
+                    {
+                        "id": index,
+                        "usage": usage,
+                        "count": replica.load,
+                        "context_tokens": data.get("roofline", {}).get("max_context_tokens", 0),
+                    }
+                )
+        self._event("replica_snapshot", latest=self.latest, replicas=self.last_telemetry)
+        if not perform_moves:
+            return 0  # Keep identical calibration telemetry in repack-off A/B runs.
+        moves = []
+        # No await during reservations: admission/completion cannot interleave.
+        for group in groups.values():
+            for source, target in consolidation_plan(
+                group,
+                self.repack_max_running,
+                request_limit=lambda target, context: self._repack_limit(target, telemetry, context),
+                capacity=next(iter(self.capacity.values())).config.kv_usage_limit if self.capacity else 0.9,
+                usage_projection=(lambda target, usage, count: self.capacity[target].projected_usage(usage, count))
+                if self.capacity
+                else None,
+            ):
+                destination = self.replicas[target]
+                destination.closed = True
+                for request in list(self.replicas[source].active.values()):
+                    request.destination = target
+                    destination.reserved.add(request.request_id)
+                    moves.append((source, request, request.backend_id))
+        return await self._execute_moves(moves)
+
+    async def _execute_moves(self, moves):
+        for source, request, backend_id in moves:
+            try:
+                result = await self.replicas[source].server.abort_trajectory.remote(backend_id)
+            except Exception as error:
+                if self.partial_store is not None and self._recoverable(error):
+                    self._quarantine(source, error)
+                    continue  # generate() owns fencing and target reservation cleanup.
+                raise
+            if not result["aborted"] and request.slot == source and request.destination is not None:
+                self.replicas[request.destination].reserved.discard(request.request_id)
+                request.destination = None
+        return len(moves)
+
+    async def migrate(self, source, target):
+        """Capacity-checked migration, also used by the real-backend preflight.
+
+        Manual invocation bypasses only ramp-down detection, never version,
+        request-readiness, capacity or reservation checks.
+        """
+        self._check()
+        if source == target or not (0 <= source < len(self.replicas) and 0 <= target < len(self.replicas)):
+            raise ValueError("Migration requires distinct valid source/destination replicas")
+        src, dst = self.replicas[source], self.replicas[target]
+        before = await asyncio.gather(src.server.trajectory_status.remote(), dst.server.trajectory_status.remote())
+        if (
+            not src.healthy
+            or not dst.healthy
+            or src.version != dst.version
+            or src.version < 0
+            or src.pulling
+            or dst.pulling
+            or src.reserved
+            or dst.reserved
+            or not src.active
+        ):
+            raise ValueError("Migration requires ready same-version replicas with no pending reservations")
+        context = max(s.get("roofline", {}).get("max_context_tokens", 0) for s in before)
+        data = {target: before[1]}
+        projected = sum(s["kv_usage"] for s in before)
+        margin = 0.9
+        if target in self.capacity:
+            governor = self.capacity[target]
+            projected = governor.projected_usage(before[1]["kv_usage"], src.load)
+            margin = governor.config.kv_usage_limit
+        if src.load + dst.load > self._repack_limit(target, data, context) or projected > margin:
+            raise ValueError("Migration exceeds destination request/KV capacity")
+        if any(q.backend_id not in before[0]["request_ids"] or q.destination is not None for q in src.active.values()):
+            raise ValueError("Source requests are not ready for migration")
+        moves = []
+        src.closed = dst.closed = True
+        for request in src.active.values():
+            request.destination = target
+            dst.reserved.add(request.request_id)
+            moves.append((source, request, request.backend_id))
+        self._event("manual_repack", source=source, destination=target, version=src.version, requests=len(moves))
+        return await self._execute_moves(moves)
+
+    async def migration_probe(self, prompt_ids):
+        """Check real token/logprob continuation before admitting training data."""
+        if any(r.load for r in self.replicas) or len(self.replicas) < 2:
+            raise RuntimeError("Migration preflight requires at least two idle replicas")
+        sampling = {
+            "max_tokens": 256,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "logprobs": True,
+            "ignore_eos": True,
+        }
+        requests = [
+            asyncio.create_task(self.generate(f"preflight-{uuid4().hex}", prompt_ids, sampling)) for _ in range(2)
+        ]
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(120):
+                while True:
+                    progress = await asyncio.gather(*[r.server.trajectory_status.remote() for r in self.replicas[:2]])
+                    generated = [list(s.get("generated_tokens", {}).values()) for s in progress]
+                    if all(values and max(values) >= 16 for values in generated):
+                        break
+                    for task in requests:
+                        if task.done():
+                            await task  # Preserve the backend's original exception, if any.
+                            raise RuntimeError("Preflight request ended before migration could be tested")
+                    await asyncio.sleep(0.1)
+                if await self.migrate(0, 1) != 1:
+                    raise RuntimeError("Preflight did not reserve exactly one running trajectory")
+                outputs = await asyncio.gather(*requests)
+                if sorted(output.extra_fields["migrations"] for output in outputs) != [0, 1]:
+                    raise RuntimeError("Preflight did not complete a migrated response")
+                if any(len(output.token_ids) != 256 or len(output.log_probs) != 256 for output in outputs):
+                    raise RuntimeError("Preflight lost tokens or behavior logprobs")
+                report = {
+                    "seconds": time.monotonic() - started,
+                    "responses": 2,
+                    "tokens": 512,
+                    "version": outputs[0].extra_fields["global_steps"],
+                }
+                self._event("migration_probe_passed", **report)
+                return report
+        finally:
+            for request in requests:
+                if not request.done():
+                    request.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
+
+    async def _run(self):
+        last_repack = time.monotonic()
+        try:
+            while not self.stopped:
+                try:
+                    timeout = max(0.001, self.check_interval - (time.monotonic() - last_repack))
+                    await asyncio.wait_for(self.wakeup.wait(), timeout=timeout)
+                except TimeoutError:
+                    pass
+                self.wakeup.clear()
+                if self.stopped:
+                    break
+                self._check()
+                if any(replica.relay is not None for replica in self.replicas):
+                    await self.relay.health.remote()
+                for index, replica in enumerate(self.replicas):
+                    if not replica.healthy or replica.recovering or replica.load or replica.pulling:
+                        continue
+                    if replica.version < self.latest:
+                        task = asyncio.create_task(self._pull(index))
+                        self.pulls.add(task)
+                        task.add_done_callback(self.pulls.discard)
+                        task.add_done_callback(self._pull_done)
+                    else:
+                        replica.admitted, replica.closed = 0, False
+                        replica.ramp_down = False
+                await self._collect_versions()
+                async with self.condition:
+                    self.condition.notify_all()
+                if (self.enable_repack or self.roofline) and (
+                    self.repack_requested or time.monotonic() - last_repack >= self.check_interval
+                ):
+                    self.repack_requested = False
+                    await self.repack_once(perform_moves=self.enable_repack)
+                    last_repack = time.monotonic()
+                elif not self.enable_repack and not self.roofline:
+                    last_repack = time.monotonic()
+        except Exception as error:
+            self.failure = repr(error)
+            self._event("failure", error=self.failure)
+            async with self.condition:
+                self.condition.notify_all()
+
+    def _pull_done(self, task):
+        if not task.cancelled() and task.exception() is not None:
+            if self.partial_store is None or not self._recoverable(task.exception()):
+                self.failure = repr(task.exception())
+            self.wakeup.set()
+
+    def status(self):
+        self._check()
+        return {
+            "latest": self.latest,
+            **self.metrics,
+            "pending": len(self.pending),
+            "repack_max_running": self.repack_max_running,
+            "capacity": {i: governor.status() for i, governor in self.capacity.items()},
+            "roofline": {i: estimator.status() for i, estimator in self.roofline.items()},
+            "replicas": [
+                {
+                    "version": r.version,
+                    "healthy": r.healthy,
+                    "active": len(r.active),
+                    "reserved": len(r.reserved),
+                    "pulling": r.pulling,
+                    "closed": r.closed,
+                }
+                for r in self.replicas
+            ],
+        }
+
+    async def stop(self):
+        self.stopped = True
+        self.wakeup.set()
+        current = asyncio.current_task()
+        requests = [task for task in self.request_tasks.values() if task is not current]
+        for request in requests:
+            request.cancel()
+        await asyncio.gather(*requests, return_exceptions=True)
+        if self.task:
+            await self.task
+        await asyncio.gather(*self.pulls, return_exceptions=True)
+        async with self.condition:
+            self.condition.notify_all()
+
+
+class LaminarServerClient(LLMServerClient):
+    def __init__(self, config, controller, **kwargs):
+        super().__init__(config=config, **kwargs)
+        self.controller = controller
+
+    async def generate(self, request_id, prompt_ids, sampling_params, **kwargs):
+        params = dict(sampling_params)
+        if "max_tokens" not in params and "max_new_tokens" not in params:
+            params["max_tokens"] = self.config.actor_rollout_ref.rollout.response_length
+        logical_id = params.pop("_laminar_trajectory_id", None) or f"{request_id}-{uuid4().hex}"
+        return await self.controller.generate.remote(
+            request_id=logical_id,
+            prompt_ids=prompt_ids,
+            sampling_params=params,
+            **kwargs,
+        )

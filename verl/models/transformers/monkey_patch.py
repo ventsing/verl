@@ -268,8 +268,18 @@ def patch_forward_with_backends(
         forward_with_torch_backend_function = forward_with_torch_backend
         forward_with_triton_backend_function = forward_with_triton_backend
     elif model.config.model_type in ["qwen3_5", "qwen3_5_moe"]:
-        from verl.models.transformers.qwen3_5 import forward_with_torch_backend, forward_with_triton_backend
+        from types import MethodType
 
+        from verl.models.transformers.qwen3_5 import (
+            forward_with_torch_backend,
+            forward_with_triton_backend,
+            torch_fused_lm_head_forward,
+        )
+
+        if fused_kernels_backend == "torch":
+            if not isinstance(model.lm_head, torch.nn.Linear) or model.lm_head.bias is not None:
+                raise NotImplementedError("Qwen3.5 Torch fused head requires a bias-free Linear lm_head")
+            model.lm_head.forward = MethodType(torch_fused_lm_head_forward, model.lm_head)
         forward_with_torch_backend_function = forward_with_torch_backend
         forward_with_triton_backend_function = forward_with_triton_backend
     else:

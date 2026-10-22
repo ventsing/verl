@@ -68,6 +68,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        if self.config.trainer.v1.trainer_mode == "laminar":
+            sampling_params["_laminar_validate"] = bool(validate)
 
         # override sampling params for validation
         if validate:
@@ -103,6 +105,12 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             )
             self.background_tasks.add(task)
             task.add_done_callback(self.background_tasks.discard)
+
+    async def shutdown(self):
+        tasks = list(self.background_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
@@ -216,6 +224,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "min_global_steps": field["extra_fields"].get("min_global_steps"),
                     # max_global_steps: end generation model weights version of this trajectory
                     "max_global_steps": field["extra_fields"].get("max_global_steps"),
+                    "trajectory_request_id": field["extra_fields"].get("trajectory_request_id"),
+                    "migrations": field["extra_fields"].get("migrations", 0),
                 }
             )
 
@@ -255,3 +265,6 @@ class AgentLoopManagerTQ(AgentLoopManager):
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
             ]
         )
+
+    def shutdown(self):
+        ray.get([worker.shutdown.remote() for worker in self.agent_loop_workers])

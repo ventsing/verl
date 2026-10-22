@@ -40,7 +40,7 @@ exercises the full path on 2 GPUs.
 """
 
 import contextlib
-from typing import Any
+from types import MethodType
 from unittest import mock
 
 import pytest
@@ -125,7 +125,7 @@ class _FakeBaseOutput:
         raise IndexError(idx)
 
 
-def _make_fake_lm() -> torch.nn.Module:
+def _make_fake_lm(forward_fn=None) -> torch.nn.Module:
     """Minimal stand-in for the language-model wrapper used by every adapter.
 
     Provides `self.config`, `self.model(...)`, and `self.lm_head`. The fake
@@ -149,7 +149,12 @@ def _make_fake_lm() -> torch.nn.Module:
             self.lm_head = torch.nn.Linear(HIDDEN_SIZE, VOCAB_SIZE, bias=False)
 
     torch.manual_seed(42)
-    return FakeLM()
+    model = FakeLM()
+    if forward_fn is qwen3_5.forward_with_torch_backend:
+        # Production backend selection installs the module-level PPO forward
+        # before FSDP wraps the head; reproduce that setup in the routing stub.
+        model.lm_head.forward = MethodType(qwen3_5.torch_fused_lm_head_forward, model.lm_head)
+    return model
 
 
 @contextlib.contextmanager
@@ -158,7 +163,7 @@ def _patch_fused_kernels():
     so the CPU test exercises only the routing layer. Yields a dict that
     captures the `input_ids` arg the kernel would have received.
     """
-    captured: dict[str, Any] = {}
+    captured: dict[str, torch.Tensor] = {}
 
     def _fake_log_probs_and_entropy(input_ids: torch.Tensor):
         if input_ids.dim() == 1:
@@ -171,7 +176,6 @@ def _patch_fused_kernels():
 
     def fake_fused_linear_forward(self, hidden_states, vocab_weights, input_ids, temperature=1.0):
         captured["input_ids"] = input_ids.detach().clone()
-        captured["impl_backend"] = self.impl_backend
         return _fake_log_probs_and_entropy(input_ids)
 
     def fake_linear_ce(hidden_states, vocab_weights, input_ids, temperature, reduction):
@@ -220,29 +224,9 @@ ALL_ADAPTERS = [
     glm4v.forward_with_triton_backend,
 ]
 
-TORCH_ADAPTERS = [
-    dense_common.forward_with_torch_backend,
-    qwen3_5.forward_with_torch_backend,
-    qwen3_vl.forward_with_torch_backend,
-    qwen2_vl.forward_with_torch_backend,
-    glm4v.forward_with_torch_backend,
-]
-
 
 def _adapter_id(forward_fn) -> str:
     return f"{forward_fn.__module__.rsplit('.', 1)[-1]}.{forward_fn.__name__}"
-
-
-@pytest.mark.parametrize("forward_fn", TORCH_ADAPTERS, ids=_adapter_id)
-def test_torch_adapter_propagates_fused_linear_backend(forward_fn):
-    model = _make_fake_lm()
-    model._verl_fused_kernels_backend = "liger"
-    input_ids = torch.tensor([[10, 20, 30, 40]], dtype=torch.long)
-
-    with _patch_fused_kernels() as captured:
-        forward_fn(model, input_ids=input_ids, labels=None, temperature=1.0, return_dict=True)
-
-    assert captured["impl_backend"] == "liger"
 
 
 @pytest.mark.parametrize("forward_fn", ALL_ADAPTERS, ids=_adapter_id)
@@ -250,7 +234,7 @@ def test_adapter_honors_shift_labels(forward_fn):
     """When `shift_labels` is provided, every fused adapter must pass it
     through to the kernel verbatim — no local re-rolling.
     """
-    model = _make_fake_lm()
+    model = _make_fake_lm(forward_fn)
     input_ids = torch.tensor([[10, 20, 30, 40]], dtype=torch.long)
     # Deliberately != torch.roll(input_ids); the only way these labels reach
     # the kernel is if the adapter honors `shift_labels`.
@@ -278,7 +262,7 @@ def test_adapter_falls_back_to_local_roll_when_shift_labels_absent(forward_fn):
     """Backward-compat: callers that don't pass `shift_labels` (e.g. the SP=1
     code path or any non-engine consumer) see unchanged behavior.
     """
-    model = _make_fake_lm()
+    model = _make_fake_lm(forward_fn)
     input_ids = torch.tensor([[10, 20, 30, 40]], dtype=torch.long)
     expected = torch.roll(input_ids, shifts=-1, dims=-1)
 

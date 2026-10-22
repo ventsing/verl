@@ -36,7 +36,7 @@ POLL_INTERVAL = 0.05
 
 
 @pytest.fixture(scope="module")
-def tq_init():
+def tq_init(isolated_tq_ray_cluster):
     tq.init()
     yield
     tq.close()

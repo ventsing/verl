@@ -161,8 +161,8 @@ class ReplayBuffer:
         assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
             f"Invalid max off policy threshold: {self.max_off_policy_threshold}, must be an integer greater than 0"
         )
-        assert self.max_off_policy_strategy in ["drop", "wait"], (
-            f"Invalid max off policy strategy: {self.max_off_policy_strategy}, must be one of ['drop', 'wait']"
+        assert self.max_off_policy_strategy in ["drop", "wait", "none"], (
+            f"Invalid max off policy strategy: {self.max_off_policy_strategy}, must be one of ['drop', 'wait', 'none']"
         )
         if self.filter_groups_metric is not None and self.refill_fn is None:
             raise ValueError("Group filtering (filter_groups_metric) requires refill_fn to replace evicted groups")
