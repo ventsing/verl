@@ -18,6 +18,7 @@ from verl.experimental.trajectory_async.experience_cache import load_initial_gro
 from verl.experimental.trajectory_async.laminar_controller import LaminarController, LaminarServerClient
 from verl.experimental.trajectory_async.prompt_feeder import PromptFeeder
 from verl.experimental.trajectory_async.reward_diagnostics import RewardDiagnostics
+from verl.experimental.trajectory_async.staleness_metrics import CompletionRateTracker, compute_replica_policy_metrics
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 from verl.trainer.ppo.v1.trainer_separate_async import HybridEngineMode, PPOTrainerSeparateAsync
 from verl.utils.debug import marked_timer
@@ -70,6 +71,7 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
         self._prompt_lock = RLock()
         self._prompt_feeder = None
         self.reward_diagnostics = RewardDiagnostics()
+        self._completion_rate_metrics = CompletionRateTracker()
         self.replay_buffer.health_check = self._check_prompt_feeder
 
     def add_replicas_to_balancer(self):
@@ -272,6 +274,12 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             "quarantined_replicas",
         ):
             self._pending_sync_metrics[f"laminar/{name}"] = status[name]
+        self._pending_sync_metrics.update(compute_replica_policy_metrics(status))
+        self._pending_sync_metrics.update(self._completion_rate_metrics.update(status["completed"], time.monotonic()))
+        self._pending_sync_metrics["laminar/queue/prompt_groups"] = self._pending_prompt_count()
+        self._pending_sync_metrics["laminar/queue/prompt_capacity"] = (
+            self.config.trainer.v1.laminar.prompt_buffer_groups
+        )
 
     def _pending_prompt_count(self):
         partitions = tq.kv_list() or {}

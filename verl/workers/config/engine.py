@@ -251,6 +251,8 @@ class FSDPEngineConfig(EngineConfig):
         fsdp_size (int): FSDP group size. -1 means use all available GPUs.
         forward_prefetch (bool): Whether to prefetch parameters for next forward pass, default False
         model_dtype (str): Model data type used to initialize the transformers model. default "fp32"
+        memory_fraction (Optional[float]): Per-process caching allocator limit in (0, 1]. Leave unset to keep
+            the device default. Reserving headroom allows runtime allocations outside the framework allocator.
         use_orig_params (bool): Whether to use original parameters when initialize FSDP1, default False
         seed (int): Random seed for reproducibility.
         full_determinism (bool): If true, enable_full_determinism is called to ensure reproducible results
@@ -287,6 +289,7 @@ class FSDPEngineConfig(EngineConfig):
     fsdp_size: int = -1
     forward_prefetch: bool = False
     model_dtype: str = "fp32"
+    memory_fraction: Optional[float] = None
     use_orig_params: bool = False
     mixed_precision: Optional[dict[str, Any]] = None
     ulysses_sequence_parallel_size: int = 1
@@ -304,6 +307,8 @@ class FSDPEngineConfig(EngineConfig):
     def __post_init__(self):
         super().__post_init__()
         assert self.strategy in ["fsdp", "fsdp2", "fsdp_turbo"], f"strategy {self.strategy} not supported"
+        if self.memory_fraction is not None and not 0 < self.memory_fraction <= 1:
+            raise ValueError("memory_fraction must be in (0, 1] or None")
 
 
 @dataclass

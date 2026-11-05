@@ -11,7 +11,7 @@ REPO_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$REPO_DIR"
 PYTHON_BIN=${PYTHON_BIN:-python3}
 MODEL_PATH=${MODEL_PATH:-/opt/huawei/dataset/ccb_data/code/ventsing/downloaded_models/Qwen3-4B}
-DATA_ROOT=${DATA_ROOT:-/opt/huawei/dataset/ccb_data/code/package_install/datasets_for_train}
+DATA_ROOT=${DATA_ROOT:-/opt/huawei/dataset/omni_training/datasets}
 DATASET=${DATASET:-gsm8k}
 DATA_DIR=${DATA_DIR:-$DATA_ROOT/$DATASET}
 ALGORITHM=${ALGORITHM:-grpo}
@@ -73,7 +73,7 @@ prepare_data() {
         mkdir -p "$DATA_DIR/raw"
         if [[ ! -s "$DATA_DIR/raw/deepscaler.json" ]]; then
             curl --fail --location --progress-bar --retry 3 --connect-timeout 20 --max-time 180 \
-                https://huggingface.co/datasets/agentica-org/DeepScaleR-Preview-Dataset/resolve/main/deepscaler.json \
+                https://huggingface.co/datasets/agentica-org/DeepScaleR-Preview-Dataset/resolve/b6ae8c60f5c1f2b594e2140b91c49c9ad0949e29/deepscaler.json \
                 --output "$DATA_DIR/raw/deepscaler.json.partial"
             mv -- "$DATA_DIR/raw/deepscaler.json.partial" "$DATA_DIR/raw/deepscaler.json"
         fi
@@ -181,7 +181,8 @@ ARGS=(
     actor_rollout_ref.actor.kl_loss_coef=0.001
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
     actor_rollout_ref.actor.entropy_coeff=0
-    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16
+    # Keep optimizer parameters in FP32; FSDP mixed precision computes in BF16.
+    actor_rollout_ref.actor.fsdp_config.model_dtype=fp32
     actor_rollout_ref.actor.fsdp_config.param_offload=True
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
     actor_rollout_ref.actor.fsdp_config.use_torch_compile=False
@@ -248,6 +249,7 @@ fi
 "$PYTHON_BIN" - "$MODEL_PATH" "$NDEVICES" "$UPDATE_WEIGHTS_BUCKET_MB" <<'PY'
 import importlib.util
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -287,10 +289,21 @@ print(
 for name in ["vllm", "vllm_ascend", "ray", "datasets", "hydra", "acl"]:
     if importlib.util.find_spec(name) is None:
         raise SystemExit(f"Missing dependency in this Python environment: {name}")
-count = torch.npu.device_count()
+if address := os.getenv("RAY_ADDRESS"):
+    # Ray Jobs drivers have no assigned NPUs. Query the existing cluster;
+    # worker placement will assign device visibility independently.
+    import ray
+
+    ray.init(address=address, log_to_driver=False)
+    try:
+        count = int(ray.cluster_resources().get("NPU", 0))
+    finally:
+        ray.shutdown()
+else:
+    count = torch.npu.device_count()
 if count < int(sys.argv[2]):
-    raise SystemExit(f"Only {count} NPUs visible; requested {sys.argv[2]}")
-print(f"Preflight passed: {count} NPUs visible; model shards present.", flush=True)
+    raise SystemExit(f"Only {count} NPUs available; requested {sys.argv[2]}")
+print(f"Preflight passed: {count} NPUs available; model shards present.", flush=True)
 PY
 
 prepare_data

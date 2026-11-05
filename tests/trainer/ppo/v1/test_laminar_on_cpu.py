@@ -440,3 +440,60 @@ def test_step_and_sample_hooks_keep_fixed_placement_and_initialize_timers(monkey
     assert trainer.current_mode == HybridEngineMode.TRAINER
     trainer.on_step_begin()
     assert trainer._step_sample_wait_seconds == 0
+
+
+@pytest.mark.parametrize("warmup_failure", [False, True])
+def test_migration_probe_warms_both_engines_and_preserves_backend_errors(warmup_failure):
+    async def scenario():
+        warmed = set()
+        active = set()
+        migrated = asyncio.Event()
+        events = []
+        controller = object.__new__(LaminarController)
+
+        class ProbeServer:
+            def __init__(self, index):
+                self.index = index
+
+            async def generate(self, **kwargs):
+                assert kwargs["sampling_params"]["ignore_eos"] is True
+                assert kwargs["sampling_params"]["max_tokens"] == 32
+                if self.index == 0:
+                    await asyncio.sleep(0.01)  # One engine starts colder.
+                if warmup_failure and self.index == 1:
+                    raise ValueError("original warmup backend error")
+                warmed.add(self.index)
+                return TokenOutput(token_ids=[1] * 32, log_probs=[-0.1] * 32,
+                                   extra_fields={"global_steps": 50})
+
+            def trajectory_status(self):
+                return {"generated_tokens": {str(self.index): 16} if self.index in active else {}}
+
+        controller.replicas = [SimpleNamespace(load=0, version=50, server=Handle(ProbeServer(i))) for i in range(2)]
+        controller._event = lambda name, **data: events.append((name, data))
+
+        async def generate(request_id, prompt_ids, sampling):
+            assert warmed == {0, 1}, "Both warmups must finish before the overlap check"
+            index = len(active)
+            active.add(index)
+            await migrated.wait()
+            return TokenOutput(token_ids=[1] * 256, log_probs=[-0.1] * 256,
+                               extra_fields={"global_steps": 50, "migrations": index})
+
+        async def migrate(source, target):
+            assert (source, target) == (0, 1) and active == {0, 1}
+            migrated.set()
+            return 1
+
+        controller.generate = generate
+        controller.migrate = migrate
+        if warmup_failure:
+            with pytest.raises(ValueError, match="original warmup backend error"):
+                await controller.migration_probe([1])
+            assert not active and not events
+        else:
+            report = await controller.migration_probe([1])
+            assert report["tokens"] == 512 and report["version"] == 50
+            assert [name for name, _ in events] == ["migration_probe_warmup_passed", "migration_probe_passed"]
+
+    asyncio.run(scenario())

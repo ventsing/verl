@@ -52,6 +52,12 @@ class TestFSDPEngineConfigCPU:
         assert config.optimizer_offload is False
         assert config.fsdp_size == -1
         assert config.use_no_sync_for_gradient_accumulation is True
+        assert config.memory_fraction is None
+
+    @pytest.mark.parametrize("fraction", [0, -0.1, 1.01, float("nan")])
+    def test_invalid_memory_fraction_is_rejected(self, fraction):
+        with pytest.raises(ValueError, match="memory_fraction"):
+            FSDPEngineConfig(memory_fraction=fraction)
 
     def test_gradient_accumulation_sync_can_be_restored_per_micro_batch(self):
         config = FSDPEngineConfig(use_no_sync_for_gradient_accumulation=False)

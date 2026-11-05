@@ -15,11 +15,15 @@
 import importlib
 import logging
 import os
+from typing import TYPE_CHECKING
 
 from packaging.version import parse as parse_version
 
-# `verl.protocol` (imported just below) is the first module that pulls in Ray, so any
-# Ray flag read at import time must be set here first. When the training driver runs
+if TYPE_CHECKING:
+    from .protocol import DataProto
+
+# `verl.protocol` imports Ray when DataProto is requested. Set Ray import-time
+# flags before package utilities or the lazy protocol import can load it. When the training driver runs
 # under `uv run`, Ray >=2.47 registers an automatic "uv" runtime-env hook that fires
 # during `ray.init()`. That hook rewrites `runtime_env["working_dir"]`, and because
 # verl deliberately passes an explicit `working_dir=None` (see
@@ -29,7 +33,19 @@ from packaging.version import parse as parse_version
 # redundant; disable it. `setdefault` keeps it overridable (set "1" to re-enable).
 os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 
-from .protocol import DataProto  # noqa: E402
+def __getattr__(name):
+    if name == "DataProto":
+        from .protocol import DataProto
+
+        globals()[name] = DataProto
+        return DataProto
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | {"DataProto"})
+
+
 from .utils.device import is_npu_available  # noqa: E402
 from .utils.import_utils import import_external_libs  # noqa: E402
 from .utils.logging_utils import set_basic_config  # noqa: E402

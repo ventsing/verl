@@ -156,6 +156,12 @@ class vLLMColocateWorkerExtension:
             if verl_seed is not None:
                 enable_full_determinism(seed=int(verl_seed))
 
+        if is_npu_available and os.environ.get("VLLM_BATCH_INVARIANT", "0") == "1":
+            from verl.utils.vllm.ascend_batch_invariant import prepare_ascend_batch_invariant_sum
+
+            # Prepare before Ascend worker initialization installs its dispatch.
+            prepare_ascend_batch_invariant_sum()
+
         # 1. patch for Lora
         VLLMHijack.hijack()
         vllm_config = kwargs.get("vllm_config")
@@ -197,6 +203,27 @@ class vLLMColocateWorkerExtension:
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
         return instance
+
+    def get_batch_invariant_state(self):
+        """Read initialized dispatch without importing a backend or running an op."""
+        import sys
+
+        backend = sys.modules.get("vllm_ascend.batch_invariant")
+        reducer = getattr(backend, "reduce_sum", None)
+        return {
+            "rank": int(getattr(self, "rank", -1)),
+            "local_rank": int(getattr(self, "local_rank", -1)),
+            "pid": os.getpid(),
+            "is_npu": is_npu_available,
+            "VLLM_BATCH_INVARIANT": os.environ.get("VLLM_BATCH_INVARIANT", "0"),
+            "VERL_FULL_DETERMINISM": os.environ.get("VERL_FULL_DETERMINISM", "0"),
+            "ascend_dispatch_initialized": getattr(backend, "_batch_invariant_LIB", None) is not None,
+            "ascend_sum_compatibility_enabled": bool(
+                getattr(reducer, "_verl_ascend_sum_compat", False)
+                and torch.sum is reducer
+                and torch.Tensor.sum is reducer
+            ),
+        }
 
     def configure_trajectory_roofline(self, options):
         from verl.experimental.trajectory_async.roofline_worker import install_decode_probe
@@ -262,6 +289,42 @@ class vLLMColocateWorkerExtension:
             monkey_patch_compute_logits(model, vocab_size, banned_token_ids)
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
+
+        if is_npu_available:
+            consistent_prefill = os.environ.get("VERL_ASCEND_CONSISTENT_PREFILL", "0")
+            if consistent_prefill not in {"0", "1"}:
+                raise ValueError("VERL_ASCEND_CONSISTENT_PREFILL must be0 or1")
+            if consistent_prefill == "1" and os.environ.get("VERL_ASCEND_GDN_PREFILL_FP32", "0") != "0":
+                raise ValueError("Consistent prefill and legacy FP32 GDN prefill are mutually exclusive")
+            from verl.utils.ascend_gdn_prefill_fp32 import prepare_ascend_fp32_gdn_prefill
+
+            self._ascend_gdn_prefill_precision_preparation = prepare_ascend_fp32_gdn_prefill(
+                self.model_runner.vllm_config
+            )
+            if consistent_prefill == "1":
+                from verl.utils.ascend_consistent_prefill import prepare_ascend_consistent_prefill
+
+                self._ascend_consistent_prefill_preparation = prepare_ascend_consistent_prefill(
+                    self.model_runner.vllm_config, self.model_runner.model
+                )
+
+    def get_consistent_prefill_state(self):
+        from verl.utils.ascend_consistent_prefill import get_ascend_consistent_prefill_state
+
+        return {
+            "rank": int(getattr(self, "rank", 0)),
+            "preparation": getattr(self, "_ascend_consistent_prefill_preparation", None),
+            "live_state": get_ascend_consistent_prefill_state(),
+        }
+
+    def get_gdn_prefill_precision_state(self):
+        from verl.utils.ascend_gdn_prefill_fp32 import get_ascend_gdn_prefill_precision_state
+
+        return {
+            "rank": int(getattr(self, "rank", 0)),
+            "preparation": getattr(self, "_ascend_gdn_prefill_precision_preparation", None),
+            "live_state": get_ascend_gdn_prefill_precision_state(),
+        }
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""

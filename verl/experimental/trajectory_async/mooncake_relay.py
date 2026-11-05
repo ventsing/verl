@@ -598,20 +598,22 @@ class MooncakeRelayCheckpointEngine(CPUSharedMemoryCheckpointEngine):
         started, tensors, nbytes = time.monotonic(), [], 0
         capacity_seconds = cpu_seconds = put_seconds = iterator_seconds = 0.0
         waiting = time.monotonic()
-        reservation = await self.relay.wait_for_capacity.remote(global_steps) if self.is_master else 0
+        # Every rank must wait before advancing the collective FSDP iterator;
+        # a master-only CPU wait leaves its peers inside HCCL ALLGATHER.
+        reservation = await self.relay.wait_for_capacity.remote(global_steps)
         capacity_seconds += time.monotonic() - waiting
         exporting = previous = time.monotonic()
         export_capacity = 0.0
         async for name, tensor in ensure_async_iterator(weights):
             iterator_seconds += time.monotonic() - previous
+            estimate = tensor.numel() * (2 if tensor.is_floating_point() else tensor.element_size())
+            if nbytes + estimate > reservation:
+                waiting = time.monotonic()
+                reservation = await self.relay.wait_for_capacity.remote(global_steps, nbytes + estimate)
+                duration = time.monotonic() - waiting
+                capacity_seconds += duration
+                export_capacity += duration
             if self.is_master:
-                estimate = tensor.numel() * (2 if tensor.is_floating_point() else tensor.element_size())
-                if nbytes + estimate > reservation:
-                    waiting = time.monotonic()
-                    reservation = await self.relay.wait_for_capacity.remote(global_steps, nbytes + estimate)
-                    duration = time.monotonic() - waiting
-                    capacity_seconds += duration
-                    export_capacity += duration
                 dtype = torch.bfloat16 if tensor.is_floating_point() else tensor.dtype
                 copying = time.monotonic()
                 snapshot = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
@@ -628,7 +630,7 @@ class MooncakeRelayCheckpointEngine(CPUSharedMemoryCheckpointEngine):
                         "ref": reference,
                     }
                 )
-                nbytes += snapshot.nbytes
+            nbytes += estimate
             previous = time.monotonic()
         if not self.is_master:
             return {}

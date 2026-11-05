@@ -58,6 +58,33 @@ def test_laminar_has_no_configured_staleness_barrier(store):
     assert "long" in store["train"]
 
 
+def test_behavior_lag_is_measured_without_filtering_old_samples(store):
+    # A newly submitted prompt can run on an old independently loaded replica.
+    prompt(store, "old", status="finished", step=11)
+    response(store, "old", 0, step=0)
+    response(store, "old", 1, step=2)
+    sampler = make_sampler(max_off_policy_strategy="none")
+    batch, metrics = sampler.sample(global_steps=11, partition_id="train", batch_size=1)
+    assert batch.keys == ["old_0_0", "old_1_0"]
+    assert metrics["trajectory/train/behavior_policy/lag_max"] == 10
+    assert metrics["trajectory/train/behavior_policy/lag_mean"] == 9
+    assert metrics["trajectory/train/queue/observed_ready_wait_s_mean"] >= 0
+    assert metrics["trajectory/train/queue/ready_wait_groups"] == 0
+
+
+def test_ready_wait_includes_time_before_trainer_observed_completion(store, monkeypatch):
+    prompt(store, "ready", status="finished", step=11)
+    response(store, "ready", 0, step=0)
+    response(store, "ready", 1, step=0)
+    store["train"]["ready_0_0"]["trajectory_ready_at"] = 880.0
+    store["train"]["ready_1_0"]["trajectory_ready_at"] = 920.0
+    monkeypatch.setattr(tq_sampler.time, "time", lambda: 1000.0)
+    sampler = make_sampler(max_off_policy_strategy="none")
+    _, metrics = sampler.sample(global_steps=11, partition_id="train", batch_size=1)
+    assert metrics["trajectory/train/queue/ready_wait_s_mean"] == 80.0
+    assert metrics["trajectory/train/queue/ready_wait_groups"] == 1
+
+
 def test_producer_failure_interrupts_sampler_wait(store):
     sampler = make_sampler()
 
@@ -238,3 +265,7 @@ def test_length_log_includes_partial_arrivals_once_and_marks_selection(store, tm
     rows = [json.loads(line) for line in (tmp_path / "train.jsonl").read_text().splitlines()]
     assert len([r for r in rows if r["event"] == "arrived"]) == 2
     assert {r["key"] for r in rows if r["event"] == "selected"} == {"long_0_0", "long_1_0"}
+    selected = [row for row in rows if row["event"] == "selected"]
+    assert all(row["model_version"] == 1 and row["actor_version"] == 0 for row in selected)
+    assert all(row["selected_at"] > 0 and row["observed_ready_wait_s"] >= 0 for row in selected)
+    assert all(row["ready_wait_s"] is None for row in selected)

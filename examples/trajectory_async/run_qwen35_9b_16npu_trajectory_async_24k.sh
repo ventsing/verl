@@ -2,7 +2,7 @@
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
-export MODEL_PATH=${MODEL_PATH:-/opt/huawei/dataset/ccb_data/code/ventsing/downloaded_models/Qwen3.5-9B}
+export MODEL_PATH=${MODEL_PATH:-/opt/huawei/dataset/omni_training/downloaded_models/Qwen3.5-9B}
 export UPDATE_WEIGHTS_BUCKET_MB=${UPDATE_WEIGHTS_BUCKET_MB:-2048}
 export VLLM_LOGGING_LEVEL=INFO
 export RUN_NAME=${RUN_NAME:-qwen35_9b_${ALGORITHM:-grpo}_trajectory_async_thinking24k_$(date +%Y%m%d_%H%M%S)}
@@ -40,5 +40,5 @@ exec bash "$SCRIPT_DIR/run_qwen3_4b_16npu_trajectory_async_24k.sh" "${MODE[@]}" 
     actor_rollout_ref.rollout.enable_prefix_caching=False \
     actor_rollout_ref.rollout.temperature=1.0 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mamba_cache_dtype=bfloat16 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.mamba_ssm_cache_dtype=bfloat16 \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.mamba_ssm_cache_dtype=float32 \
     "$@"

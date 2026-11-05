@@ -1074,6 +1074,34 @@ class LaminarController:
             "logprobs": True,
             "ignore_eos": True,
         }
+        # Compile/warm both independent engines before timing their overlap.
+        # A cold engine can still be in prefill when the other has generated
+        # all 256 tokens; that says nothing about migration correctness.
+        async def warm(replica):
+            output = await replica.server.generate.remote(
+                request_id=f"preflight-warmup-{uuid4().hex}",
+                prompt_ids=prompt_ids,
+                sampling_params={**sampling, "max_tokens": 32},
+            )
+            if (
+                output.extra_fields.get("global_steps") != replica.version
+                or len(output.token_ids) != 32
+                or output.log_probs is None
+                or len(output.log_probs) != 32
+                or not all(math.isfinite(value) for value in output.log_probs)
+            ):
+                raise RuntimeError("Migration preflight warmup returned invalid tokens, logprobs or policy version")
+
+        warmups = [asyncio.create_task(warm(replica)) for replica in self.replicas[:2]]
+        try:
+            async with asyncio.timeout(120):
+                await asyncio.gather(*warmups)
+        finally:
+            for task in warmups:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*warmups, return_exceptions=True)
+        self._event("migration_probe_warmup_passed", responses=2, tokens=64)
         requests = [
             asyncio.create_task(self.generate(f"preflight-{uuid4().hex}", prompt_ids, sampling)) for _ in range(2)
         ]
@@ -1087,7 +1115,12 @@ class LaminarController:
                         break
                     for task in requests:
                         if task.done():
-                            await task  # Preserve the backend's original exception, if any.
+                            output = await task  # Preserve the backend's original exception, if any.
+                            self._event(
+                                "migration_probe_no_overlap",
+                                progress=progress,
+                                completed_tokens=len(output.token_ids),
+                            )
                             raise RuntimeError("Preflight request ended before migration could be tested")
                     await asyncio.sleep(0.1)
                 if await self.migrate(0, 1) != 1:

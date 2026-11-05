@@ -164,13 +164,16 @@ class CPUSharedMemoryCheckpointEngine(CheckpointEngine):
         started = time.monotonic()
         tensors = []
         nbytes = 0
-        reservation = await self.relay.wait_for_capacity.remote(global_steps) if self.is_master else 0
+        # full_tensor() is collective. Backpressure must hold every export rank
+        # on the CPU, otherwise peers enqueue ALLGATHER while the master waits
+        # for rollout owners to release old snapshots and hit the HCCL timeout.
+        reservation = await self.relay.wait_for_capacity.remote(global_steps)
         # All FSDP ranks must exhaust the iterator: full_tensor() is collective.
         async for name, tensor in ensure_async_iterator(weights):
+            estimate = tensor.numel() * (2 if tensor.is_floating_point() else tensor.element_size())
+            if nbytes + estimate > reservation:
+                reservation = await self.relay.wait_for_capacity.remote(global_steps, nbytes + estimate)
             if self.is_master:
-                estimate = tensor.numel() * (2 if tensor.is_floating_point() else tensor.element_size())
-                if nbytes + estimate > reservation:
-                    reservation = await self.relay.wait_for_capacity.remote(global_steps, nbytes + estimate)
                 dtype = torch.bfloat16 if tensor.is_floating_point() else tensor.dtype
                 snapshot = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
                 payload = snapshot.reshape(-1).view(torch.uint8).numpy()
@@ -182,7 +185,7 @@ class CPUSharedMemoryCheckpointEngine(CheckpointEngine):
                         "ref": ray.put(payload),
                     }
                 )
-                nbytes += snapshot.nbytes
+            nbytes += estimate
         if not self.is_master:
             return {}
         await self.relay.commit.remote({"version": global_steps, "tensors": tensors, "nbytes": nbytes})

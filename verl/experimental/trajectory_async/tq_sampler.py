@@ -37,6 +37,7 @@ import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 
 from verl.experimental.trajectory_async.group_aggregator import GroupAggregator
+from verl.experimental.trajectory_async.staleness_metrics import compute_behavior_policy_metrics
 from verl.experimental.trajectory_async.types import TrajectorySample
 from verl.trainer.ppo.v1.replay_buffer import ReplayBufferAsync
 
@@ -59,6 +60,8 @@ class TrajectoryReplayBuffer(ReplayBufferAsync):
         self.ready_groups = defaultdict(dict)
         self.seen_keys = defaultdict(set)
         self.last_selected_tags = {}
+        self.last_selected_ready_times = {}
+        self.last_selected_ready_timestamps = {}
         self.selection_strategy = self.sampler_kwargs.get("selection_strategy", "completion")
         if self.selection_strategy not in {"completion", "mixed_ready"}:
             raise ValueError("Unknown trajectory selection_strategy")
@@ -117,6 +120,8 @@ class TrajectoryReplayBuffer(ReplayBufferAsync):
                         "response_tokens": int(tag.get("response_len", 0)),
                         "model_version": int(version),
                         "observed_at": time.time(),
+                        "trajectory_ready_at": tag.get("trajectory_ready_at"),
+                        "reward_compute_s": tag.get("reward_compute_s"),
                         "scheduler_request_id": tag.get("trajectory_request_id"),
                         "migrations": int(tag.get("migrations", 0)),
                     }
@@ -172,6 +177,17 @@ class TrajectoryReplayBuffer(ReplayBufferAsync):
         ]
         tags = [partition_snapshot[key] for key in keys]
         self.last_selected_tags[partition_id] = tags
+        self.last_selected_ready_times[partition_id] = {
+            uid: self.ready_groups[partition_id][uid].complete_time for uid in selected_prompt_uids
+        }
+        self.last_selected_ready_timestamps[partition_id] = {}
+        for uid in selected_prompt_uids:
+            timestamps = [
+                partition_snapshot[row.payload].get("trajectory_ready_at")
+                for row in self.ready_groups[partition_id][uid].trajectories
+            ]
+            if all(stamp is not None for stamp in timestamps):
+                self.last_selected_ready_timestamps[partition_id][uid] = max(timestamps)
         tq.kv_clear(partition_id=partition_id, keys=selected_prompt_uids)
         self._forget_groups(partition_id, set(selected_prompt_uids))
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
@@ -179,6 +195,29 @@ class TrajectoryReplayBuffer(ReplayBufferAsync):
     def sample(self, global_steps, partition_id, batch_size):
         batch, metrics = super().sample(global_steps, partition_id, batch_size)
         tags = self.last_selected_tags[partition_id]
+        versions = [
+            tag["min_global_steps"] if tag.get("min_global_steps") is not None else tag["global_steps"] for tag in tags
+        ]
+        selected_at = time.time()
+        now = time.monotonic()
+        observed_ready_waits = {
+            uid: max(0.0, now - ready_time) for uid, ready_time in self.last_selected_ready_times[partition_id].items()
+        }
+        ready_waits = {
+            uid: selected_at - ready_at for uid, ready_at in self.last_selected_ready_timestamps[partition_id].items()
+        }
+        if partition_id == "train":
+            metrics.update(compute_behavior_policy_metrics(tags, actor_version=global_steps - 1))
+            prefix = "trajectory/train/queue"
+            if observed_ready_waits:
+                metrics[f"{prefix}/observed_ready_wait_s_mean"] = float(np.mean(list(observed_ready_waits.values())))
+            metrics[f"{prefix}/ready_wait_groups"] = len(ready_waits)
+            if ready_waits:
+                metrics[f"{prefix}/ready_wait_s_mean"] = float(np.mean(list(ready_waits.values())))
+                metrics[f"{prefix}/ready_wait_s_max"] = max(ready_waits.values())
+                for percentile in (50, 90, 95, 99):
+                    metrics[f"{prefix}/ready_wait_s_p{percentile}"] = float(
+                        np.percentile(list(ready_waits.values()), percentile))
         lengths = np.array([tag.get("response_len", 0) for tag in tags], dtype=np.int64)
         if lengths.size:
             prefix = f"trajectory/{partition_id}/length"
@@ -190,7 +229,20 @@ class TrajectoryReplayBuffer(ReplayBufferAsync):
             if limit:
                 metrics[f"{prefix}/budget_reached_ratio"] = float(np.mean(lengths >= int(limit)))
         self._record_trajectories(
-            partition_id, [{"event": "selected", "key": key, "step": global_steps} for key in batch.keys]
+            partition_id,
+            [
+                {
+                    "event": "selected",
+                    "key": key,
+                    "step": global_steps,
+                    "selected_at": selected_at,
+                    "model_version": version,
+                    "actor_version": global_steps - 1 if partition_id == "train" else global_steps,
+                    "observed_ready_wait_s": observed_ready_waits[key.rsplit("_", 2)[0]],
+                    "ready_wait_s": ready_waits.get(key.rsplit("_", 2)[0]),
+                }
+                for key, version in zip(batch.keys, versions, strict=True)
+            ],
         )
         metrics.update(
             {

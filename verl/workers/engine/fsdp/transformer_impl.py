@@ -39,7 +39,7 @@ from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -130,6 +130,11 @@ class FSDPEngine(BaseEngine):
         self.mode = None
 
         self.rank = torch.distributed.get_rank()
+
+        if self.engine_config.memory_fraction is not None:
+            fraction = float(self.engine_config.memory_fraction)
+            get_torch_device().set_per_process_memory_fraction(fraction)
+            logger.info("FSDP allocator memory fraction: %.3f", fraction)
 
         # Apply NPU patches for FSDP backend
         from .utils import apply_npu_fsdp_patches

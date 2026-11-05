@@ -18,6 +18,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 import ray
@@ -165,7 +166,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
 
+        reward_started = time.monotonic()
         await self._compute_score(outputs, kwargs=kwargs)
+        reward_compute_s = time.monotonic() - reward_started
 
         final_output = outputs[-1]
         # TODO: Support output:list[AgentLoopOutput]
@@ -216,6 +219,10 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     "prompt_len": prompt_len,
                     "response_len": response_len,
                     "seq_len": prompt_len + response_len,
+                    # Wall time permits joining events across producer/trainer
+                    # processes. Cross-node queue latency requires aligned clocks.
+                    "trajectory_ready_at": time.time(),
+                    "reward_compute_s": reward_compute_s,
                     # These tags are used for off-policy staleness control, if a trajectory
                     # spans too many global steps, we need to filter it out.
                     # global_steps: which global steps this sample is from dataloader

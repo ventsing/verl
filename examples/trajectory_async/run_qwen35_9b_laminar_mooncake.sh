@@ -3,6 +3,7 @@
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+export NDEVICES=${NDEVICES:-$(( ${TRAINER_NNODES:-1} * ${TRAINER_NPUS_PER_NODE:-8} + ${ROLLOUT_NNODES:-1} * ${ROLLOUT_NPUS_PER_NODE:-8} ))}
 export RUN_NAME=${RUN_NAME:-qwen35_9b_laminar_mooncake_$(date +%Y%m%d_%H%M%S)}
 export QWEN_OUTPUT_DIR=${QWEN_OUTPUT_DIR:-$REPO_DIR/outputs/$RUN_NAME}
 MODE=()

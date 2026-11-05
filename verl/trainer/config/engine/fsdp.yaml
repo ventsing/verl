@@ -32,6 +32,9 @@ forward_prefetch: False
 # model dtype of fsdp
 model_dtype: fp32
 
+# Optional per-process allocator limit; leave headroom for device-runtime allocations outside PyTorch.
+memory_fraction: null
+
 # Whether to use original parameters in fsdp. Only avaiable in fsdp1
 use_orig_params: false
 

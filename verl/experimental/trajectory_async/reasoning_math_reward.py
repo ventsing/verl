@@ -17,6 +17,7 @@ from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from weakref import WeakKeyDictionary
 
+from verl.experimental.trajectory_async.math_choice_answer import resolve_choice_answer
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
 
 _pool = None
@@ -162,6 +163,9 @@ async def compute_score(
     }
     if answer is None:
         return result
+    problem = extra_info.get("problem") if isinstance(extra_info, dict) else None
+    answer = resolve_choice_answer(answer, problem)
+    ground_truth = resolve_choice_answer(ground_truth, problem)
     # Canonical package import also makes the worker pickleable if this callback
     # is loaded through an external-module path by an older launcher.
     from verl.experimental.trajectory_async.reasoning_math_reward import verify_answer as worker

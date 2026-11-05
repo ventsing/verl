@@ -20,7 +20,7 @@ if [[ "${1:-}" == --check-config ]]; then
     shift
 fi
 
-export NDEVICES=16
+export NDEVICES=${NDEVICES:-16}
 export ROLLOUT_N=${ROLLOUT_N:-4}
 export RUN_NAME=${RUN_NAME:-qwen3_4b_${ALGORITHM:-grpo}_trajectory_async_8_8_$(date +%Y%m%d_%H%M%S)}
 
