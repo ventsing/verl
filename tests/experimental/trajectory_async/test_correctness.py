@@ -24,9 +24,6 @@ except ImportError:
     import _bootstrap  # noqa: F401
 
 from verl.experimental.trajectory_async.group_aggregator import GroupAggregator
-from verl.experimental.trajectory_async.mini_batcher import MiniBatcher
-from verl.experimental.trajectory_async.trainer import TrainerConfig, TrajectoryTrainer
-from verl.experimental.trajectory_async.trajectory_queue import InProcessTrajectoryQueue
 from verl.experimental.trajectory_async.types import TrajectorySample, TrajectoryStatus
 from verl.experimental.trajectory_async.versioned_weight_store import (
     FakeP2PBackend,
@@ -37,129 +34,6 @@ from verl.experimental.trajectory_async.versioned_weight_store import (
 
 def sample(uid, version=0, index=0, n=1):
     return TrajectorySample(uid=uid, traj_index=index, group_size=n, model_version=version, reward=1.0)
-
-
-class TestTrainerCorrectness(unittest.IsolatedAsyncioTestCase):
-    async def test_filtered_batch_matches_update_callback_and_accounting(self):
-        for versions in ((0, 2), (0, 0)):
-            with self.subTest(versions=versions):
-                queue = InProcessTrajectoryQueue()
-                updates, callbacks = [], []
-
-                async def update(batch, updates=updates):
-                    updates.append([g.uid for g in batch.groups])
-
-                trainer = TrajectoryTrainer(
-                    queue, GroupAggregator(), MiniBatcher(2),
-                    TrainerConfig(max_staleness_drop=0), update_fn=update,
-                    on_batch=lambda batch, metrics, callbacks=callbacks: callbacks.append(
-                        ([g.uid for g in batch.groups], metrics["groups"])
-                    ),
-                )
-                trainer.current_version = 2
-                for i, version in enumerate(versions):
-                    await queue.put(sample(str(i), version))
-                await queue.put(None)
-                stats = await trainer.run()
-                expected = [str(i) for i, version in enumerate(versions) if version == 2]
-                self.assertEqual(updates, [expected] if expected else [])
-                self.assertEqual(callbacks, [(expected, expected)] if expected else [])
-                self.assertEqual(stats.groups_trained, len(expected))
-                self.assertEqual(stats.groups_dropped_stale, 2 - len(expected))
-                self.assertEqual(stats.updates, bool(expected))
-
-    async def test_worker_failure_propagates_with_and_without_end_of_stream(self):
-        for policy in ("per-trajectory", "on-group-complete"):
-            for stage in ("preprocess", "update"):
-                for end_of_stream in (False, True):
-                    with self.subTest(policy=policy, stage=stage, end_of_stream=end_of_stream):
-                        async def fail(_, stage=stage):
-                            raise RuntimeError(f"{stage} failed")
-
-                        queue = InProcessTrajectoryQueue()
-                        trainer = TrajectoryTrainer(
-                            queue, GroupAggregator(), MiniBatcher(1),
-                            TrainerConfig(preprocess_policy=policy, update_time_s=0),
-                            preprocess_fn=fail if stage == "preprocess" else None,
-                            update_fn=fail if stage == "update" else None,
-                        )
-                        await queue.put(sample("broken"))
-                        if end_of_stream:
-                            await queue.put(None)
-                        with self.assertRaisesRegex(RuntimeError, f"{stage} failed"):
-                            await asyncio.wait_for(trainer.run(), timeout=1)
-                        self.assertFalse(trainer._preprocess_tasks)
-                        self.assertEqual(trainer.current_version, 0)
-                        self.assertEqual(trainer.stats.groups_trained, 0)
-
-    async def test_failure_cancels_other_workers(self):
-        started, cleaned = asyncio.Event(), asyncio.Event()
-
-        async def preprocess(traj):
-            if traj.uid == "blocked":
-                started.set()
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    cleaned.set()
-            await started.wait()
-            raise RuntimeError("preprocess failed")
-
-        queue = InProcessTrajectoryQueue()
-        trainer = TrajectoryTrainer(
-            queue, GroupAggregator(), MiniBatcher(1), preprocess_fn=preprocess,
-        )
-        await queue.put(sample("blocked"))
-        await queue.put(sample("broken"))
-        with self.assertRaisesRegex(RuntimeError, "preprocess failed"):
-            await asyncio.wait_for(trainer.run(), timeout=1)
-        self.assertTrue(cleaned.is_set())
-        self.assertFalse(trainer._preprocess_tasks)
-
-    async def test_external_cancellation_cleans_up_workers(self):
-        started, cleaned = asyncio.Event(), asyncio.Event()
-
-        async def preprocess(traj):
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                cleaned.set()
-
-        queue = InProcessTrajectoryQueue()
-        trainer = TrajectoryTrainer(queue, GroupAggregator(), MiniBatcher(1), preprocess_fn=preprocess)
-        await queue.put(sample("blocked"))
-        task = asyncio.create_task(trainer.run())
-        await asyncio.wait_for(started.wait(), timeout=1)
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-        self.assertTrue(cleaned.is_set())
-        self.assertFalse(trainer._preprocess_tasks)
-
-    async def test_failed_group_preprocess_cancels_sibling_rows(self):
-        started, cleaned = asyncio.Event(), asyncio.Event()
-
-        async def preprocess(traj):
-            if traj.traj_index == 0:
-                started.set()
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    cleaned.set()
-            await started.wait()
-            raise RuntimeError("sibling failed")
-
-        queue = InProcessTrajectoryQueue()
-        trainer = TrajectoryTrainer(
-            queue, GroupAggregator(), MiniBatcher(1),
-            TrainerConfig(preprocess_policy="on-group-complete"), preprocess_fn=preprocess,
-        )
-        await queue.put(sample("group", index=0, n=2))
-        await queue.put(sample("group", index=1, n=2))
-        with self.assertRaisesRegex(RuntimeError, "sibling failed"):
-            await asyncio.wait_for(trainer.run(), timeout=1)
-        self.assertTrue(cleaned.is_set())
 
 
 class TestCompletedGroupReplay(unittest.TestCase):
@@ -301,7 +175,9 @@ class TestMooncakeTensorBoundaries(unittest.IsolatedAsyncioTestCase):
         transport = CopyTransport()
         actor = SimpleNamespace(engine=transport, session_id="actor", bucket_size=64)
         receiver = SimpleNamespace(
-            engine=transport, bucket_size=7, buf=torch.zeros(14, dtype=torch.uint8),
+            engine=transport,
+            bucket_size=7,
+            buf=torch.zeros(14, dtype=torch.uint8),
         )
         backend = MooncakeP2PBackend(actor)
         store = VersionedWeightStore(backend)

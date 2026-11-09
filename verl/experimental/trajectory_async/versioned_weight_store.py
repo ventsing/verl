@@ -315,9 +315,7 @@ class VersionedWeightStore:
                 raise LookupError("no version published yet")
             manifest = self._manifests.get(target)
             if manifest is None:
-                raise LookupError(
-                    f"version {version} is not retained (evicted?); retained={self.retained_versions}"
-                )
+                raise LookupError(f"version {version} is not retained (evicted?); retained={self.retained_versions}")
             self._readers[target] = self._readers.get(target, 0) + 1
         try:
             read_stats = await self.backend.read_into(consumer_id, consumer_ctx or {}, manifest, sink or _noop_sink)
@@ -453,9 +451,7 @@ class FakeP2PBackend(P2PWeightBackend):
     ) -> ReadStats:
         payload = self._memory.get(manifest.checkpoint_name)
         if payload is None:
-            raise LookupError(
-                f"{manifest.checkpoint_name} is not staged — registered memory was released"
-            )
+            raise LookupError(f"{manifest.checkpoint_name} is not staged — registered memory was released")
         # per-call latency override: the relay tier distinguishes the
         # network hop (chain distribution) from the local PCIe pull.
         # Real backends ignore this — their latency is physical.
@@ -560,9 +556,7 @@ class KimiP2PBackend(P2PWeightBackend):
         start = time.monotonic()
         nbytes = tensors = 0
         # stock patched receive_tensor, scoped to one consumer group
-        async for name, tensor in ps.receive_tensor(
-            manifest.checkpoint_name, ranks_group, ranks, bucket_size
-        ):
+        async for name, tensor in ps.receive_tensor(manifest.checkpoint_name, ranks_group, ranks, bucket_size):
             sink(name, tensor)
             nbytes += tensor.element_size() * tensor.numel()
             tensors += 1
@@ -640,6 +634,7 @@ class MooncakeP2PBackend(P2PWeightBackend):
         per_tensor: dict[str, tuple[int, Any, Any]] = {}  # name -> (absolute offset, shape, dtype)
         for name, tensor in tensors:
             flat = tensor.detach().contiguous().view(-1).view(torch.uint8)
+            size = flat.numel()
             # CPU staging must finish device-to-host copies before RDMA
             # registration makes these bytes available to consumers.
             view[offset : offset + flat.numel()].copy_(flat)
@@ -713,9 +708,7 @@ class MooncakeP2PBackend(P2PWeightBackend):
                     get_torch_device().synchronize(scratch.device)
                 await asyncio.sleep(0)
             sink(name, tensor)
-        return ReadStats(
-            nbytes=desc["nbytes"], tensors=n_tensors, seconds=time.monotonic() - start
-        )
+        return ReadStats(nbytes=desc["nbytes"], tensors=len(desc["tensors"]), seconds=time.monotonic() - start)
 
     async def unstage(self, manifest: WeightManifest) -> None:
         desc = manifest.descriptor

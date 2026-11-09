@@ -37,33 +37,28 @@ package shrinks the delivery/retry unit from `n` responses to 1.
 
 ## Architecture
 
+The current v1 Laminar path uses TransferQueue for trajectory delivery:
+
+```text
+AgentLoopWorkerTQ
+  generation → reward → per-response TransferQueue write
+                                │
+                                ▼
+TrajectoryReplayBuffer → GroupAggregator → complete-group training batch
+                                │
+                                ▼
+PPOTrainerLaminar → actor update → CPU/Mooncake relay publication
+                                │
+                                ▼
+LaminarController → independent rollout-replica weight pulls and repacking
 ```
-rollout side                              train side
-───────────                              ──────────
-PromptSource
-   │ one prompt = n independent requests
-   ▼
-TrajectoryRollouter ──┐
-  per trajectory:     │  TrajectorySample          TrajectoryTrainer
-  gen → reward → push │  (single response,          consume (FIFO)
-                      │   opaque payload,              │
-                      ▼   version, reward)             ▼
-               TrajectoryQueue ──────────────►  optional per-trajectory
-               (asyncio in-process;             preprocessing stage
-                reuse fully_async_policy's        (policy: per-trajectory
-                MessageQueue actor for            | on-group-complete)
-                multi-process)                       │
-                                                     ▼
-                                              GroupAggregator        ┌──────────────┐
-                                              (uid → n/n rows)  ────►│ MiniBatcher  │
-                                              evicts groups whose     │ K groups =   │
-                                              siblings died           │ one update   │
-                                                                      └──────┬───────┘
-                                                                             ▼
-                                                              update (serialized), version += 1,
-                                                              GRPO group advantages, staleness
-                                                              accounting, weight-sync hook
-```
+
+`agent_loop_tq.py` is the producer; TransferQueue provides storage and delivery,
+while `tq_sampler.py` selects complete groups on the trainer side. The separate
+MessageQueue integration uses `TrajectoryLevelRollouter` and
+`TrajectoryAsyncTrainer` with `TrajectoryBatchCollector`. The retired in-process
+CPU demonstration trainer is not part of either supported execution path.
+
 
 Components (all under `verl/experimental/trajectory_async/`):
 
@@ -183,7 +178,7 @@ validation failures raise an error.
 This path supports single-output agent sessions. It uses the normal checkpoint
 manager for weight updates (`nccl` selects the HCCL implementation on Ascend).
 It does not enable the multi-version P2P weight store or active repacking from
-the demo. Metrics under `trajectory/train/aggregator/*` report received
+the separate MessageQueue integration. Metrics under `trajectory/train/aggregator/*` report received
 trajectories, partial groups, and completed groups.
 
 ### Laminar semantics and the current real-engine gap
@@ -193,7 +188,7 @@ Framework](https://arxiv.org/html/2510.12633v1), particularly §§3–6.
 The table below describes the original `separate_async` Ascend launchers
 (including `examples/trajectory_async/run_qwen35_9b_16npu_trajectory_async_24k.sh`). The new `laminar`
 entry point in the next section replaces this execution path; the CPU demo
-is a separate implementation.
+has been retired.
 
 | Requirement | Current real Ascend path |
 |---|---|
@@ -201,7 +196,7 @@ is a separate implementation.
 | Publish weights to a CPU relay; each rollout pulls independently at its own batch boundary or after repack releases it (§4). | Not connected. V1 `separate_async` still uses the shared checkpoint manager to pause generation and synchronize weights. |
 | Keep one policy version throughout each trajectory, including after migration (§§2.4, 5.1). | Not guaranteed. `FullyAsyncLLMServerClient` can resume an aborted response after a global weight update, potentially mixing policy versions. |
 | Consolidate running long-tail trajectories onto fewer replicas of the same version, freeing sources for new weights and prompts (§5). | Only modeled by `MultiReplicaEngine` and `RepackManager`; no real migration adapter is connected. |
-| Detect ramp-down from KV usage, and respect both KV capacity and the decode batch bound when packing (§5.2). | Available in the demo; real backend telemetry and capacity checks still need integration. |
+| Detect ramp-down from KV usage, and respect both KV capacity and the decode batch bound when packing (§5.2). | The old CPU demonstration is retired; use the current Laminar integration and its hardware validation below. |
 
 Repack is consolidation of **in-progress** work, rather than redistribution
 of pending prompts. Sources stop admitting fresh work, unfinished trajectories
