@@ -4,8 +4,10 @@
 """Laminar execution with independently loaded node-local CPU relays."""
 
 import logging
+import math
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from threading import RLock
 
@@ -19,6 +21,13 @@ from verl.experimental.trajectory_async.laminar_controller import LaminarControl
 from verl.experimental.trajectory_async.prompt_feeder import PromptFeeder
 from verl.experimental.trajectory_async.reward_diagnostics import RewardDiagnostics
 from verl.experimental.trajectory_async.staleness_metrics import CompletionRateTracker, compute_replica_policy_metrics
+from verl.experimental.trajectory_async.supply import (
+    SupplyConfig,
+    SupplyCoordinator,
+    SupplyMonitor,
+    queue_supply_snapshot,
+    should_refill,
+)
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 from verl.trainer.ppo.v1.trainer_separate_async import HybridEngineMode, PPOTrainerSeparateAsync
 from verl.utils.debug import marked_timer
@@ -67,6 +76,28 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             raise ValueError("Laminar prompt production requires data.dataloader_num_workers=0")
         if config.skip.rollout_tq.enable:
             raise ValueError("Laminar requires live rollout; rollout_tq skip mode is unsupported")
+        self.supply_config = SupplyConfig(**dict(config.trainer.v1.laminar.get("supply", {})))
+        if self.supply_config.enabled and self.synchronous:
+            raise ValueError("Just-in-time supply requires asynchronous training")
+        self._supply_monitor = None
+        self._supply_feedback = {}
+        self._supply_runtime = {}
+        self._supply_staleness = deque(maxlen=self.supply_config.staleness_window)
+        self._sample_started_at = None
+        self._supply_training_finished = False
+        self.evaluation = None
+        self.evaluation_config = None
+        if config.trainer.v1.laminar.get("evaluation", {}).get("enabled", False):
+            from verl.trainer.ppo.v1.laminar_evaluation import evaluation_config
+
+            self.evaluation_config = evaluation_config(config)
+            if (
+                self.supply_config.enabled
+                and self.supply_config.elastic_evaluation
+                and rollout.tensor_model_parallel_size
+                != self.evaluation_config.actor_rollout_ref.rollout.tensor_model_parallel_size
+            ):
+                raise ValueError("Elastic evaluation requires matching training/evaluation TP sizes")
         super().__init__(config)
         self._prompt_lock = RLock()
         self._prompt_feeder = None
@@ -93,6 +124,19 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             {"server": replica._server_handle, "workers": replica.workers}
             for replica in self.standalone_server_manager.get_replicas()
         ]
+        training_replica_count = len(replicas)
+        evaluation_replicas = []
+        if self.evaluation_config is not None:
+            self.evaluation_server_manager = LLMServerManager.create(
+                config=self.evaluation_config, start_rank=training_replica_count
+            )
+            evaluation_replicas = [
+                {"server": replica._server_handle, "workers": replica.workers}
+                for replica in self.evaluation_server_manager.get_replicas()
+            ]
+            # Evaluation has its own devices and controller, but participates in
+            # the same Mooncake publication tree (including node-local relays).
+            replicas.extend(evaluation_replicas)
         self.relay_nodes = []
         backend = self.config.actor_rollout_ref.rollout.checkpoint_engine.backend
         if backend == "mooncake_relay":
@@ -148,6 +192,35 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
                 self.actor_rollout_wg.execute_checkpoint_engine(
                     method=["configure"] * world_size,
                     relay=[self.weight_relay] * world_size,
+                )
+            )
+        replicas = replicas[:training_replica_count]
+        elastic = self.supply_config.enabled and self.supply_config.elastic_evaluation and bool(evaluation_replicas)
+        if elastic:
+            evaluation_replicas = evaluation_replicas + [{**replica, "owned": False} for replica in replicas]
+        if evaluation_replicas:
+            from verl.experimental.trajectory_async.evaluation_controller import EvaluationController
+
+            self.evaluation_controller = (
+                ray.remote(EvaluationController)
+                .options(num_cpus=1, max_concurrency=4096)
+                .remote(
+                    replicas=evaluation_replicas,
+                    relay=self.weight_relay,
+                    batch_quota=(
+                        options.evaluation.get("max_inflight_per_replica")
+                        or self.evaluation_config.actor_rollout_ref.rollout.max_num_seqs
+                    ),
+                    max_running=(
+                        options.evaluation.get("max_inflight_per_replica")
+                        or self.evaluation_config.actor_rollout_ref.rollout.max_num_seqs
+                    ),
+                    allocation_policy=options.evaluation.get("allocation_policy", "finish_first"),
+                    enable_repack=options.evaluation.enable_repack,
+                    check_interval_s=options.evaluation.repack_interval_s,
+                    event_path=str(
+                        Path(options.event_dir or self.config.trainer.default_local_dir) / "evaluation_scheduler.jsonl"
+                    ),
                 )
             )
         recovery = options.partial_store
@@ -215,6 +288,22 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             )
         )
 
+        if self.supply_config.enabled:
+            self.supply_coordinator = (
+                ray.remote(SupplyCoordinator)
+                .options(num_cpus=1, max_concurrency=16)
+                .remote(
+                    self.laminar_controller,
+                    getattr(self, "evaluation_controller", None) if elastic else None,
+                    training_replica_count,
+                    len(evaluation_replicas) - training_replica_count if elastic else 0,
+                    OmegaConf.to_container(options.supply, resolve=True),
+                    event_path=str(
+                        Path(options.event_dir or self.config.trainer.default_local_dir) / "supply_scheduler.jsonl"
+                    ),
+                )
+            )
+
     def get_llm_client(self):
         return LaminarServerClient(self.config, controller=self.laminar_controller)
 
@@ -246,6 +335,11 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
     def on_step_begin(self):
         self._check_prompt_feeder()
         ray.get(self.laminar_controller.status.remote())
+        if getattr(self, "evaluation", None) is not None:
+            metrics = self.evaluation.collect()
+            if metrics:
+                self.logger.log(data=metrics, step=self.global_steps)
+            self.evaluation.pump_pending()
         # Preserve the inherited sampling timers. In fixed TRAINER mode this
         # resets accounting and returns without touching rollout replicas.
         super().on_step_begin()
@@ -255,6 +349,7 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
         if getattr(self, "synchronous", False):
             self._assert_synchronous_idle(self.global_steps - 1)
         if self.global_steps >= self.total_training_steps:
+            self._supply_training_finished = True
             self._stop_prompt_feeder()
         with marked_timer("publish_weights", self.timing_raw, color="red"):
             self._pending_sync_metrics = self._publish()
@@ -274,18 +369,119 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             "quarantined_replicas",
         ):
             self._pending_sync_metrics[f"laminar/{name}"] = status[name]
+        self._pending_sync_metrics["laminar/drain_moves"] = status.get("drain_moves", 0)
         self._pending_sync_metrics.update(compute_replica_policy_metrics(status))
         self._pending_sync_metrics.update(self._completion_rate_metrics.update(status["completed"], time.monotonic()))
         self._pending_sync_metrics["laminar/queue/prompt_groups"] = self._pending_prompt_count()
         self._pending_sync_metrics["laminar/queue/prompt_capacity"] = (
             self.config.trainer.v1.laminar.prompt_buffer_groups
         )
+        if getattr(self, "evaluation", None) is not None:
+            evaluation_metrics = self.evaluation.collect()
+            if evaluation_metrics:
+                # Validation below may return a newer version in the same step.
+                self.logger.log(data=evaluation_metrics, step=self.global_steps)
+            self._pending_sync_metrics.update(self.evaluation.queue_metrics())
+            evaluation_status = ray.get(self.evaluation_controller.status.remote())
+            self._pending_sync_metrics.update(
+                {
+                    "evaluation/pool/active_versions": len(evaluation_status["evaluation_requests"]),
+                    "evaluation/pool/active_requests": sum(r["active"] for r in evaluation_status["replicas"]),
+                    "evaluation/pool/busy_replicas": sum(
+                        bool(r["active"] or r["reserved"]) for r in evaluation_status["replicas"]
+                    ),
+                    "evaluation/pool/pulls": evaluation_status["pulls"],
+                    "evaluation/pool/migrations": evaluation_status["migrations"],
+                    "evaluation/pool/drain_moves": evaluation_status.get("drain_moves", 0),
+                }
+            )
+
+    def on_sample_begin(self):
+        self._sample_started_at = time.monotonic()
+        super().on_sample_begin()
+
+    def on_sample_end(self):
+        super().on_sample_end()
+        self._sample_started_at = None
+
+    def _compute_metrics(self, batch, metrics, timing_raw, global_steps, epoch):
+        super()._compute_metrics(batch, metrics, timing_raw, global_steps, epoch)
+        if getattr(self, "supply_config", None) is not None and self.supply_config.enabled:
+            self._supply_staleness.append(float(metrics["training/off_policy/trajectory_staleness/mean"]))
+            self._supply_feedback = {"window_staleness": sum(self._supply_staleness) / len(self._supply_staleness)}
+            status = ray.get(self.supply_coordinator.status.remote(), timeout=10)
+            metrics.update(
+                {
+                    "laminar/supply/paused": int(status.get("paused", False)),
+                    "laminar/supply/borrowed_replicas": len(status["borrowed"]),
+                    "laminar/supply/transitions": len(status["transitions"]),
+                    "laminar/supply/transfers": status["transfers"],
+                    "laminar/supply/window_staleness": self._supply_feedback["window_staleness"],
+                    "laminar/supply/ready_groups": status["feedback"].get("ready_groups", 0),
+                    "laminar/supply/ready_batches": status["feedback"].get("ready_batches", 0),
+                    "laminar/supply/pending_groups": status["feedback"].get("pending_groups", 0),
+                    "laminar/supply/unfinished_trajectories": status["feedback"].get("unfinished_trajectories", 0),
+                    "laminar/supply/admission_total": status["feedback"].get("admission_total", 0),
+                    "laminar/supply/active_total": status["feedback"].get("active_total", 0),
+                    "laminar/supply/idle_replicas": status["feedback"].get("idle_replicas", 0),
+                    "laminar/supply/feedback_fresh": int(status.get("feedback_fresh", False)),
+                }
+            )
+
+    def _poll_supply(self):
+        partitions = tq.kv_list() or {}
+        feedback = queue_supply_snapshot(
+            partitions.get("train", {}), self.config.actor_rollout_ref.rollout.n, self.config.data.train_batch_size
+        )
+        feedback.update(self._supply_feedback)
+        started = self._sample_started_at
+        feedback["sample_wait_s"] = max(0.0, time.monotonic() - started) if started is not None else 0.0
+        feedback["training_finished"] = self._supply_training_finished
+        training_status = ray.get(self.laminar_controller.status.remote(), timeout=10)
+        owned = [
+            r
+            for r in training_status["replicas"]
+            if r.get("owned", True) and r["healthy"] and not r.get("releasing", False)
+        ]
+        self._supply_runtime = {
+            "observed_at": time.monotonic(),
+            "admission_total": sum(r["admission_limit"] for r in owned),
+            "active_total": sum(r["active"] for r in owned),
+            "idle_replicas": sum(not r["active"] and not r["pulling"] for r in owned),
+        }
+        feedback.update(self._supply_runtime)
+        ray.get(self.supply_coordinator.update.remote(feedback), timeout=10)
+        ray.get(self.supply_coordinator.status.remote(), timeout=10)
+
+    def _can_refill_supply(self):
+        queue = queue_supply_snapshot(
+            (tq.kv_list() or {}).get("train", {}),
+            self.config.actor_rollout_ref.rollout.n,
+            self.config.data.train_batch_size,
+        )
+        return should_refill(
+            self.supply_config, queue, self._supply_runtime, self.config.data.train_batch_size, time.monotonic()
+        )
+
+    def _stop_supply(self):
+        try:
+            if getattr(self, "_supply_monitor", None) is not None:
+                self._supply_monitor.stop()
+        finally:
+            if hasattr(self, "supply_coordinator"):
+                try:
+                    ray.get(self.supply_coordinator.stop.remote(), timeout=30)
+                finally:
+                    ray.kill(self.supply_coordinator, no_restart=True)
 
     def _pending_prompt_count(self):
         partitions = tq.kv_list() or {}
         return sum(bool(tag.get("is_prompt")) for tag in partitions.get("train", {}).values())
 
     def _check_prompt_feeder(self):
+        monitor = getattr(self, "_supply_monitor", None)
+        if monitor is not None:
+            monitor.check()
         feeder = getattr(self, "_prompt_feeder", None)
         if feeder is not None:
             feeder.check()
@@ -295,6 +491,7 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             self._prompt_feeder.stop()
 
     def on_train_begin(self):
+        self._laminar_training_started = True
         if getattr(self, "synchronous", False):
             # No warmup or producer thread: prepare_step submits exactly one batch.
             self._wait_synchronous_version(self.global_steps - 1)
@@ -338,17 +535,31 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
                 f"Replayed {len(records)} initial-policy experiences; longest groups selected for memory validation",
                 flush=True,
             )
-        super().on_train_begin()
+        if not self.supply_config.enabled:
+            super().on_train_begin()
+        # With demand-based supply the feeder also owns bounded warmup.
         capacity = self.config.trainer.v1.laminar.prompt_buffer_groups
         batch_size = self.config.data.train_batch_size
+        if self.supply_config.enabled:
+            capacity = min(capacity, math.floor(self.supply_config.max_pending_batches * batch_size))
+            ray.get(self.supply_coordinator.start.remote())
+            self._supply_monitor = SupplyMonitor(self._poll_supply, self.supply_config.poll_interval_s)
+            self._supply_monitor.start()
         if capacity < batch_size:
             raise ValueError("Laminar prompt_buffer_groups must hold at least one training batch")
+        refill = (self.supply_config.refill_groups or batch_size) if self.supply_config.enabled else batch_size
+        granularity = self.config.data.get("gen_batch_size", None) or batch_size
+        if refill % granularity:
+            raise ValueError("Supply refill_groups must be a multiple of data.gen_batch_size")
         self._prompt_feeder = PromptFeeder(
             count_pending=self._pending_prompt_count,
-            submit_batch=self._add_batch_to_generate,
-            batch_size=batch_size,
+            submit_batch=(lambda: self._add_prompts_to_generate(refill))
+            if refill != batch_size
+            else self._add_batch_to_generate,
+            batch_size=refill,
             capacity=capacity,
             lock=self._prompt_lock,
+            can_submit=self._can_refill_supply if self.supply_config.enabled else None,
         )
         self._prompt_feeder.start()
 
@@ -431,12 +642,67 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
         return self.reward_diagnostics.update(records, self.config.actor_rollout_ref.rollout.response_length)
 
     def on_validate_begin(self):
+        if getattr(self, "evaluation_config", None) is not None:
+            return
         # New validation requests wait for a freshly updated replica; old
         # training trajectories continue on the remaining replicas.
         ray.get(self.laminar_controller.set_minimum_version.remote(self.global_steps))
 
     def on_validate_end(self):
+        if getattr(self, "evaluation_config", None) is not None:
+            return
         ray.get(self.laminar_controller.set_minimum_version.remote(-1))
+
+    def _validate(self):
+        if self.evaluation_config is None:
+            return super()._validate()
+        if self.evaluation is None:
+            from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopManagerTQ
+            from verl.trainer.ppo.v1.laminar_evaluation import LaminarEvaluation
+            from verl.utils.import_utils import load_class_from_fqn
+
+            manager_fqn = self.evaluation_config.actor_rollout_ref.rollout.agent.get("agent_loop_manager_class")
+            manager_cls = load_class_from_fqn(manager_fqn, "AgentLoopManager") if manager_fqn else AgentLoopManagerTQ
+
+            def manager(version):
+                return manager_cls.create(
+                    config=self.evaluation_config,
+                    llm_client=LaminarServerClient(
+                        self.evaluation_config, controller=self.evaluation_controller, policy_version=version
+                    ),
+                    reward_loop_worker_handles=self.get_reward_handles(),
+                )
+
+            self.evaluation = LaminarEvaluation(
+                self,
+                self.evaluation_config,
+                self.evaluation_controller,
+                manager,
+                # Pin every relay: hierarchy recovery/GC can run independently
+                # on each node while training publishes subsequent versions.
+                self.relay_nodes,
+            )
+        # Initial/final validation are barriers; intermediate versions share
+        # the evaluation pool without accumulating an unbounded backlog.
+        wait = not getattr(self, "_laminar_training_started", False)
+        wait = wait or self.global_steps >= self.total_training_steps
+        wait = wait or self.config.trainer.get("val_only", False)
+        if wait:
+            self.evaluation.discard_pending(replaced=True)
+        metrics = self.evaluation.collect(wait=wait)
+        if wait and metrics:
+            # The final barrier drains older versions before submitting the
+            # final version; keep their scores before collecting that result.
+            self.logger.log(data=metrics, step=self.global_steps)
+            metrics = {}
+        if self.evaluation.busy:
+            self.evaluation.defer(self.global_steps)
+            return {**metrics, **self.evaluation.queue_metrics()}
+        self.evaluation.discard_pending(replaced=True)
+        self.evaluation.submit(self.global_steps)
+        if wait:
+            metrics.update(self.evaluation.collect(wait=True))
+        return {**metrics, **self.evaluation.queue_metrics()}
 
     def _close_relay_hierarchy(self):
         # Upstream first: wait native writes before releasing downstream memory.
@@ -453,13 +719,33 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             for actor in dict.fromkeys(resources):
                 ray.kill(actor, no_restart=True)
 
+    def _close_evaluation_resources(self):
+        """Release only the actors and placement groups owned by evaluation."""
+        actors = [self.evaluation_controller]
+        manager = self.evaluation_server_manager
+        actors.append(manager.global_load_balancer)
+        pools = []
+        for replica in manager.get_replicas():
+            actors.extend(replica.workers)
+            actors.extend(replica.servers)
+            pools.extend(replica.resource_pool.pgs or [])
+        for actor in dict.fromkeys(actors):
+            ray.kill(actor, no_restart=True)
+        for pool in pools:
+            ray.util.remove_placement_group(pool)
+
     def fit(self, agent_loop_manager):
         try:
             return super().fit(agent_loop_manager)
         finally:
             original_error = sys.exc_info()[0] is not None
             errors = []
-            cleanups = [self._stop_prompt_feeder]
+            cleanups = [self._stop_prompt_feeder, self._stop_supply]
+            if getattr(self, "evaluation", None) is not None:
+                cleanups.append(lambda: self.evaluation.close(cancel=original_error))
+            if hasattr(self, "evaluation_controller"):
+                cleanups.append(lambda: ray.get(self.evaluation_controller.stop.remote()))
+                cleanups.append(self._close_evaluation_resources)
             if hasattr(agent_loop_manager, "shutdown"):
                 cleanups.append(agent_loop_manager.shutdown)
             cleanups.append(lambda: ray.get(self.laminar_controller.stop.remote()))

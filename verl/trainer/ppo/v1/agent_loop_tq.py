@@ -115,7 +115,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
     async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
-        uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
+        uid = prompt["uid"]
+        partition_id = prompt.get("__partition_id__", "val") if trajectory["validate"] else "train"
         await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
         tasks = []
         try:
@@ -240,7 +241,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             keys=keys,
             fields=list_of_dict_to_tensordict(fields),
             tags=tags,
-            partition_id="train" if not validate else "val",
+            partition_id=kwargs.get("__partition_id__", "val") if validate else "train",
         )
 
 

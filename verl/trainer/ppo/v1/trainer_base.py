@@ -973,7 +973,7 @@ class PPOTrainer(ABC):
             trainer=self, global_step=self.global_steps, checkpoint_dir=local_global_step_folder, async_save=False
         )
 
-    def _validate(self) -> dict[str, float]:
+    def _validate(self, partition_id="val") -> dict[str, float]:
         # Lists to collect samples for the table
         sample_uids = []
         sample_inputs = []
@@ -996,17 +996,19 @@ class PPOTrainer(ABC):
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
+            if partition_id != "val":
+                tu.assign_non_tensor_data(batch, "__partition_id__", partition_id)
             # Register each prompt (GRPO group) in TransferQueue as a tag-only status marker.
             # global_steps is required by ReplayBuffer's metadata sync / staleness ordering.
             tags = [
                 {"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))
             ]
-            tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
+            tq.kv_batch_put(keys=list(batch["uid"]), partition_id=partition_id, tags=tags)
             self.agent_loop_manager.generate_sequences(batch)
 
             # 2. sample batch from replay buffer: one prompt (GRPO group) per submitted row.
             batch, _ = self.replay_buffer.sample(
-                global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
+                global_steps=self.global_steps, partition_id=partition_id, batch_size=len(batch)
             )
 
             # 3. [OPTIONAL] compute reward score with colocated reward model

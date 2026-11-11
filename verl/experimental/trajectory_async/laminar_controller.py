@@ -39,6 +39,9 @@ class Replica:
     relay: object = None
     healthy: bool = True
     recovering: bool = False
+    owned: bool = True
+    releasing: bool = False
+    admission_ceiling: int | None = None
 
     @property
     def load(self):
@@ -164,11 +167,13 @@ class LaminarController:
         self.enable_repack = enable_repack
         self.latest = -1
         self.minimum_version = -1
+        self.supply_paused = False
         self.condition = asyncio.Condition()
         self.wakeup = asyncio.Event()
         self.repack_requested = False
         self.task = None
         self.pulls = set()
+        self.scheduled_pulls = set()
         self.failure = None
         self.stopped = False
         self.pending = set()
@@ -180,6 +185,7 @@ class LaminarController:
         self.metrics = {
             "completed": 0,
             "migrations": 0,
+            "drain_moves": 0,
             "pulls": 0,
             "repack_checks": 0,
             "roofline_polls": 0,
@@ -226,7 +232,7 @@ class LaminarController:
         if self.partial_store is None:
             return
         needed = set(await self.partial_store.versions.remote()) | {self.latest}
-        needed.update(r.version for r in self.replicas if r.healthy and r.version >= 0)
+        needed.update(r.version for r in self.replicas if r.owned and r.healthy and r.version >= 0)
         for version in list(self.pinned_versions - needed):
             for relay in self._relays():
                 await relay.release_owner.remote(f"{self.pin_owner}:{version}")
@@ -246,6 +252,185 @@ class LaminarController:
             self.wakeup.set()
             self.condition.notify_all()
 
+    async def set_supply_paused(self, paused):
+        async with self.condition:
+            self.supply_paused = bool(paused)
+            self.condition.notify_all()
+
+    async def release_replica(self, index):
+        """Fence admission, then relinquish an idle instance without stopping it."""
+        replica = self.replicas[index]
+        replica.releasing = True
+        replica.closed = True
+        self.wakeup.set()
+        if replica.load:
+            await self._drain_replica(index)
+        if replica.load or replica.pulling or replica.recovering or index in self.scheduled_pulls:
+            return False
+        replica.owned = False
+        return True
+
+    def _migration_target_available(self, index, version):
+        replica = self.replicas[index]
+        return (
+            replica.owned
+            and replica.healthy
+            and not replica.releasing
+            and not replica.recovering
+            and not replica.pulling
+            and index not in self.scheduled_pulls
+            and not any(request.destination is not None for request in replica.active.values())
+            and replica.version == version
+        )
+
+    async def _drain_replica(self, index):
+        """Evacuate to same-version capacity without waiting for a ramp-down phase.
+
+        Plan partial moves across multiple targets if one cannot hold the whole
+        source. Reserve every arrival before aborting any source request. The
+        normal generation path preserves tokens/logprobs and confirms completion
+        of the move before release_replica can acknowledge the handoff.
+        """
+        source = self.replicas[index]
+        if (
+            not source.owned
+            or not source.healthy
+            or not source.releasing
+            or source.pulling
+            or source.recovering
+            or source.reserved
+            or index in self.scheduled_pulls
+            or not source.active
+        ):
+            return 0
+        candidates = [
+            i for i in range(len(self.replicas)) if i != index and self._migration_target_available(i, source.version)
+        ]
+        if not candidates:
+            return 0
+        indices = [index] + candidates
+        packets = await asyncio.gather(
+            *[
+                asyncio.wait_for(
+                    self.replicas[i].server.trajectory_status.remote(),
+                    self.recovery_options.get("heartbeat_timeout_s", 10.0),
+                )
+                for i in indices
+            ],
+            return_exceptions=True,
+        )
+        telemetry = {
+            i: packet for i, packet in zip(indices, packets, strict=True) if not isinstance(packet, BaseException)
+        }
+        now = time.time()
+
+        def fresh(i):
+            data = telemetry.get(i, {})
+            usage = data.get("kv_usage", math.inf)
+            return (
+                math.isfinite(usage)
+                and usage >= 0
+                and data.get("version", self.replicas[i].version) == self.replicas[i].version
+                and 0 <= now - data.get("observed_at", -math.inf) < 2 * self.check_interval
+            )
+
+        # Ownership and weight loads may change during the telemetry RPCs.
+        if (
+            not fresh(index)
+            or not source.owned
+            or not source.releasing
+            or not source.healthy
+            or source.pulling
+            or source.recovering
+            or source.reserved
+        ):
+            return 0
+        counts = {i: self.replicas[i].load for i in candidates}
+        usages = {}
+        for target in candidates:
+            if not fresh(target):
+                continue
+            replica = self.replicas[target]
+            backend_ids = set(telemetry[target].get("request_ids", []))
+            unobserved = len(replica.reserved) + sum(
+                request.backend_id not in backend_ids for request in replica.active.values()
+            )
+            governor = self.capacity.get(target)
+            # Metadata may include arrivals not yet visible in backend KV usage.
+            usages[target] = (
+                governor.projected_usage(telemetry[target]["kv_usage"], unobserved)
+                if governor is not None
+                else math.inf
+                if unobserved
+                else telemetry[target]["kv_usage"]
+            )
+        moves = []
+        charged_targets = set()
+        for request in list(source.active.values()):
+            if request.destination is not None or request.backend_id not in telemetry[index].get("request_ids", []):
+                continue
+            fits = []
+            for target in usages:
+                if not self._migration_target_available(target, request.version) or telemetry[target].get("waiting", 0):
+                    continue
+                context = max(telemetry[i].get("roofline", {}).get("max_context_tokens", 0) for i in (index, target))
+                limit = self._repack_limit(target, telemetry, context)
+                governor = self.capacity.get(target)
+                # Without a calibrated pool, charge the full source once per
+                # destination: this bounds any subset of the source's prefixes.
+                projected = (
+                    governor.projected_usage(usages[target], 1)
+                    if governor is not None
+                    else usages[target] + (0 if target in charged_targets else telemetry[index]["kv_usage"])
+                )
+                margin = governor.config.kv_usage_limit if governor is not None else 0.9
+                if counts[target] < limit and projected <= margin:
+                    fits.append((counts[target], target, projected))
+            if not fits:
+                continue
+            _, target, projected = min(fits)
+            destination = self.replicas[target]
+            destination.closed = True
+            destination.reserved.add(request.request_id)
+            request.destination = target
+            counts[target] += 1
+            usages[target] = projected
+            charged_targets.add(target)
+            moves.append((index, request, request.backend_id))
+        if moves:
+            self.metrics["drain_moves"] += len(moves)
+            self._event(
+                "drain_repack",
+                source=index,
+                version=source.version,
+                targets=[request.destination for _, request, _ in moves],
+                requests=len(moves),
+            )
+        return await self._execute_moves(moves)
+
+    async def acquire_replica(self, index, admission_ceiling=None):
+        """Called only after the other controller acknowledged release."""
+        replica = self.replicas[index]
+        if replica.owned or replica.load or replica.pulling or replica.recovering:
+            raise RuntimeError("Replica acquisition requires an unowned idle slot")
+        replica.admission_ceiling = admission_ceiling
+        replica.version = -1  # The other pool may have loaded a different version.
+        replica.admitted = 0
+        replica.previous_usage = 0.0
+        replica.ramp_down = False
+        replica.releasing = False
+        replica.closed = True
+        replica.owned = True
+        self._event("replica_acquired", replica=index)
+        self.wakeup.set()
+
+    async def cancel_release(self, index):
+        replica = self.replicas[index]
+        if not replica.owned:
+            raise RuntimeError("Cannot cancel release after ownership was transferred")
+        replica.releasing = False
+        self.wakeup.set()
+
     async def set_minimum_version(self, version):
         async with self.condition:
             self.minimum_version = version
@@ -254,7 +439,7 @@ class LaminarController:
     async def _pull(self, index, exact_version=None):
         replica = self.replicas[index]
         # Reserve before any await, so admission cannot race a load.
-        if replica.load or replica.pulling:
+        if not replica.owned or replica.releasing or replica.load or replica.pulling:
             return
         replica.pulling = True
         manifest = None
@@ -326,14 +511,16 @@ class LaminarController:
                 self._check()
                 if self.partial_store is not None and not any(r.healthy for r in self.replicas):
                     raise RuntimeError("No healthy rollout replica remains; durable prefixes are retained")
-                if self.minimum_version >= 0 and not is_validation:
+                if (self.minimum_version >= 0 or self.supply_paused) and not is_validation:
                     await self.condition.wait()
                     continue
                 required_version = max(self.minimum_version, self.latest) if is_validation else -1
                 available = [
                     i
                     for i, r in enumerate(self.replicas)
-                    if r.healthy
+                    if r.owned
+                    and not r.releasing
+                    and r.healthy
                     and not r.recovering
                     and not r.closed
                     and not r.pulling
@@ -522,13 +709,11 @@ class LaminarController:
         cause = getattr(error, "cause", error)
         return isinstance(
             cause,
-            (
-                ConnectionError,
-                TimeoutError,
-                ray.exceptions.RayActorError,
-                ray.exceptions.RaySystemError,
-                ray.exceptions.ObjectLostError,
-            ),
+            ConnectionError
+            | TimeoutError
+            | ray.exceptions.RayActorError
+            | ray.exceptions.RaySystemError
+            | ray.exceptions.ObjectLostError,
         ) or (type(cause).__name__ == "EngineDeadError")
 
     async def _recover_slot(self, request):
@@ -543,7 +728,7 @@ class LaminarController:
             while True:
                 async with self.condition:
                     self._check()
-                    healthy = [i for i, r in enumerate(self.replicas) if r.healthy]
+                    healthy = [i for i, r in enumerate(self.replicas) if r.owned and not r.releasing and r.healthy]
                     if not healthy:
                         raise RuntimeError("No healthy rollout replica remains; durable prefix is retained")
                     same = [
@@ -829,7 +1014,7 @@ class LaminarController:
             return
         # Only this polling path drains samples. Heartbeat/manual status calls
         # read cached metadata and cannot steal points before manager fitting.
-        indices = list(self.roofline)
+        indices = [i for i in self.roofline if self.replicas[i].owned]
         packets = await asyncio.gather(
             *[
                 asyncio.wait_for(
@@ -851,7 +1036,8 @@ class LaminarController:
                 }
             )
         async with self.roofline_lock:
-            for index, estimator in self.roofline.items():
+            for index in indices:
+                estimator = self.roofline[index]
                 observations = telemetry[index].get("roofline", {})
                 samples = observations.get("samples", []) if observations.get("available", False) else []
                 before = estimator.accepted
@@ -869,10 +1055,15 @@ class LaminarController:
                     self._event("roofline_update", replica=index, **status)
 
     def _admission_limit(self, index):
-        return self.capacity[index].limit() if index in self.capacity else min(self.batch_quota, self.max_running)
+        limit = self.capacity[index].limit() if index in self.capacity else min(self.batch_quota, self.max_running)
+        ceiling = self.replicas[index].admission_ceiling if index < len(self.replicas) else None
+        return min(limit, ceiling) if ceiling is not None else limit
 
     def _repack_limit(self, index, telemetry, context_tokens=None):
         fallback = min(self.max_running, self.repack_max_running)
+        ceiling = self.replicas[index].admission_ceiling if index < len(self.replicas) else None
+        if ceiling is not None:
+            fallback = min(fallback, ceiling)
         if index in self.capacity:
             fallback = min(fallback, self.capacity[index].limit())
         estimator = self.roofline.get(index)
@@ -893,6 +1084,10 @@ class LaminarController:
                 asyncio.wait_for(
                     r.server.trajectory_status.remote(), self.recovery_options.get("heartbeat_timeout_s", 10.0)
                 )
+                if r.owned
+                else asyncio.sleep(
+                    0, result={"kv_usage": 0.0, "waiting": 0, "request_ids": [], "observed_at": time.time()}
+                )
                 for r in self.replicas
             ],
             return_exceptions=self.partial_store is not None,
@@ -905,13 +1100,17 @@ class LaminarController:
 
         await self._ingest_roofline(telemetry)
         for index, governor in self.capacity.items():
+            if not self.replicas[index].owned:
+                continue
             if governor.update(telemetry[index], self.roofline.get(index), time.time()):
                 self._event("capacity_update", replica=index, **governor.status())
             replica = self.replicas[index]
             # Exploration only tops up the current version's batch. A newer
             # actor version, migration reservations or drain operations win.
             if (
-                replica.healthy
+                replica.owned
+                and not replica.releasing
+                and replica.healthy
                 and not replica.recovering
                 and not replica.pulling
                 and not replica.reserved
@@ -928,6 +1127,8 @@ class LaminarController:
         self.last_telemetry = [
             {
                 "replica": index,
+                "owned": replica.owned,
+                "releasing": replica.releasing,
                 "version": replica.version,
                 "active": len(replica.active),
                 "reserved": len(replica.reserved),
@@ -961,7 +1162,8 @@ class LaminarController:
             ids = set(data["request_ids"])
             ready = all(q.backend_id in ids and q.destination is None for q in replica.active.values())
             if (
-                replica.healthy
+                replica.owned
+                and replica.healthy
                 and not replica.recovering
                 and replica.closed
                 and not replica.pulling
@@ -990,7 +1192,9 @@ class LaminarController:
             for source, target in consolidation_plan(
                 group,
                 self.repack_max_running,
-                request_limit=lambda target, context: self._repack_limit(target, telemetry, context),
+                request_limit=lambda target, context: 0
+                if self.replicas[target].releasing
+                else self._repack_limit(target, telemetry, context),
                 capacity=next(iter(self.capacity.values())).config.kv_usage_limit if self.capacity else 0.9,
                 usage_projection=(lambda target, usage, count: self.capacity[target].projected_usage(usage, count))
                 if self.capacity
@@ -1028,9 +1232,14 @@ class LaminarController:
         if source == target or not (0 <= source < len(self.replicas) and 0 <= target < len(self.replicas)):
             raise ValueError("Migration requires distinct valid source/destination replicas")
         src, dst = self.replicas[source], self.replicas[target]
+        if not src.owned or not dst.owned or dst.releasing:
+            raise ValueError("Migration requires owned source and destination replicas")
         before = await asyncio.gather(src.server.trajectory_status.remote(), dst.server.trajectory_status.remote())
         if (
-            not src.healthy
+            not src.owned
+            or not dst.owned
+            or dst.releasing
+            or not src.healthy
             or not dst.healthy
             or src.version != dst.version
             or src.version < 0
@@ -1074,6 +1283,7 @@ class LaminarController:
             "logprobs": True,
             "ignore_eos": True,
         }
+
         # Compile/warm both independent engines before timing their overlap.
         # A cold engine can still be in prefill when the other has generated
         # all 256 tokens; that says nothing about migration correctness.
@@ -1144,6 +1354,13 @@ class LaminarController:
                     request.cancel()
             await asyncio.gather(*requests, return_exceptions=True)
 
+    async def _load_idle_replica(self, index):
+        try:
+            await self._pull(index)
+        finally:
+            self.scheduled_pulls.discard(index)
+            self.wakeup.set()
+
     async def _run(self):
         last_repack = time.monotonic()
         try:
@@ -1160,10 +1377,18 @@ class LaminarController:
                 if any(replica.relay is not None for replica in self.replicas):
                     await self.relay.health.remote()
                 for index, replica in enumerate(self.replicas):
-                    if not replica.healthy or replica.recovering or replica.load or replica.pulling:
+                    if (
+                        not replica.owned
+                        or replica.releasing
+                        or not replica.healthy
+                        or replica.recovering
+                        or replica.load
+                        or replica.pulling
+                    ):
                         continue
                     if replica.version < self.latest:
-                        task = asyncio.create_task(self._pull(index))
+                        self.scheduled_pulls.add(index)
+                        task = asyncio.create_task(self._load_idle_replica(index))
                         self.pulls.add(task)
                         task.add_done_callback(self.pulls.discard)
                         task.add_done_callback(self._pull_done)
@@ -1199,19 +1424,23 @@ class LaminarController:
             "latest": self.latest,
             **self.metrics,
             "pending": len(self.pending),
+            "supply_paused": self.supply_paused,
             "repack_max_running": self.repack_max_running,
             "capacity": {i: governor.status() for i, governor in self.capacity.items()},
             "roofline": {i: estimator.status() for i, estimator in self.roofline.items()},
             "replicas": [
                 {
                     "version": r.version,
+                    "owned": r.owned,
+                    "admission_limit": self._admission_limit(i),
+                    "releasing": r.releasing,
                     "healthy": r.healthy,
                     "active": len(r.active),
                     "reserved": len(r.reserved),
                     "pulling": r.pulling,
                     "closed": r.closed,
                 }
-                for r in self.replicas
+                for i, r in enumerate(self.replicas)
             ],
         }
 
@@ -1231,12 +1460,15 @@ class LaminarController:
 
 
 class LaminarServerClient(LLMServerClient):
-    def __init__(self, config, controller, **kwargs):
+    def __init__(self, config, controller, policy_version=None, **kwargs):
         super().__init__(config=config, **kwargs)
         self.controller = controller
+        self.policy_version = policy_version
 
     async def generate(self, request_id, prompt_ids, sampling_params, **kwargs):
         params = dict(sampling_params)
+        if self.policy_version is not None:
+            params["_laminar_policy_version"] = self.policy_version
         if "max_tokens" not in params and "max_new_tokens" not in params:
             params["max_tokens"] = self.config.actor_rollout_ref.rollout.response_length
         logical_id = params.pop("_laminar_trajectory_id", None) or f"{request_id}-{uuid4().hex}"

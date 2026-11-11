@@ -1016,6 +1016,37 @@ trainer:
   v1:
     trainer_mode: sync
     laminar:
+      evaluation:
+        enabled: false
+        nnodes: 1
+        n_gpus_per_node: 1
+        tensor_model_parallel_size: null
+        num_workers: 1
+        max_num_seqs: null
+        max_inflight_per_replica: null
+        cudagraph_capture_sizes: null
+        max_concurrent_versions: 3
+        overflow_policy: latest
+        allocation_policy: finish_first
+        enable_repack: true
+        repack_interval_s: 5.0
+        timeout_s: 3600.0
+      supply:
+        enabled: false
+        elastic_evaluation: true
+        min_training_replicas: 2
+        low_ready_batches: 0.5
+        target_ready_batches: 1.0
+        high_ready_batches: 1.5
+        max_pending_batches: 2.0
+        refill_groups: 0
+        target_staleness: 3.0
+        staleness_window: 5
+        healthy_polls: 3
+        loan_cooldown_s: 60.0
+        poll_interval_s: 2.0
+        feedback_timeout_s: 15.0
+        starvation_wait_s: 5.0
       synchronous: false
       parameter_sync_step: 1
       batch_per_replica: 8

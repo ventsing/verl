@@ -7,7 +7,7 @@ import threading
 
 
 class PromptFeeder:
-    def __init__(self, count_pending, submit_batch, batch_size, capacity, lock, poll_interval=0.2):
+    def __init__(self, count_pending, submit_batch, batch_size, capacity, lock, poll_interval=0.2, can_submit=None):
         if batch_size < 1 or capacity < batch_size or poll_interval <= 0:
             raise ValueError("Prompt capacity must hold a positive batch and polling must be positive")
         self.count_pending = count_pending
@@ -16,6 +16,7 @@ class PromptFeeder:
         self.capacity = capacity
         self.lock = lock
         self.poll_interval = poll_interval
+        self.can_submit = can_submit
         self.stop_event = threading.Event()
         self.thread = None
         self.error = None
@@ -30,7 +31,9 @@ class PromptFeeder:
         try:
             while not self.stop_event.is_set():
                 with self.lock:
-                    if self.count_pending() + self.batch_size <= self.capacity:
+                    if self.count_pending() + self.batch_size <= self.capacity and (
+                        self.can_submit is None or self.can_submit()
+                    ):
                         self.submit_batch()
                         self.batches += 1
                         continue

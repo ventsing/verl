@@ -177,9 +177,7 @@ def nested_tensor_from_tensor_list(tensors: list[torch.Tensor], ragged_idx: int 
     offsets = torch.zeros(len(tensors) + 1, dtype=torch.long, device=values.device)
     torch.cumsum(lengths, dim=0, out=offsets[1:])
 
-    nested_tensor = torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets)
-    nested_tensor._ragged_idx = ragged_idx
-    return nested_tensor
+    return torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets, jagged_dim=ragged_idx)
 
 
 def concat_nested_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -908,11 +906,28 @@ def contiguous(data: TensorDict) -> TensorDict:
 
 
 def maybe_fix_3d_position_ids(data: TensorDict):
-    # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
-    # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
-    # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+    """Normalize multi-axis position IDs to a jagged sequence dimension.
+
+    Equal-length rows can arrive from storage as jagged coordinate axes
+    (B, j, T), whereas unequal rows use (B, C, j). Changing _ragged_idx alone
+    reinterprets coordinate offsets as token lengths and corrupts unbind().
+    Rebuild both the values and metadata instead, also handling serialization
+    that resets _ragged_idx on an otherwise correct sequence layout.
+    """
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+        positions = data["position_ids"]
+        values, offsets = positions.values(), positions.offsets()
+        lengths = offsets.diff().tolist()
+        input_ids = data.get("input_ids")
+        expected_lengths = (
+            input_ids.offsets().diff().tolist() if input_ids is not None and input_ids.is_nested else None
+        )
+        sequence_layout = values.shape[-1] == sum(lengths) and (expected_lengths is None or lengths == expected_lengths)
+        if sequence_layout:
+            data["position_ids"] = torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets, jagged_dim=2)
+        else:
+            rows = list(values.split(lengths, dim=0))
+            data["position_ids"] = nested_tensor_from_tensor_list(rows, ragged_idx=2)
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:

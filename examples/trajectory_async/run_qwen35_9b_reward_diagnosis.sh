@@ -6,6 +6,7 @@ REPO_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 unset VERL_USE_EXTERNAL_MODULES
 export VERL_USE_EXTERNAL_PLUGINS=none
 export TOTAL_STEPS=${TOTAL_STEPS:-50}
+export EVALUATION_INTERVAL=${EVALUATION_INTERVAL:-10}
 export TRAIN_SAMPLES=${TRAIN_SAMPLES:--1}
 export VAL_SAMPLES=${VAL_SAMPLES:-128}
 export MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-32768}
@@ -39,6 +40,7 @@ exec bash "$SCRIPT_DIR/run_qwen35_9b_16npu_laminar_reasoning.sh" "${MODE[@]}" \
     "actor_rollout_ref.actor.fsdp_config.memory_fraction=$FSDP_MEMORY_FRACTION" \
     "actor_rollout_ref.ref.fsdp_config.memory_fraction=$FSDP_MEMORY_FRACTION" \
     actor_rollout_ref.model.enable_activation_offload=True \
+    "trainer.test_freq=$EVALUATION_INTERVAL" \
     trainer.save_freq=5 \
     trainer.max_actor_ckpt_to_keep=2 \
     "$@"

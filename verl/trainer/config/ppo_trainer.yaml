@@ -235,6 +235,50 @@ trainer:
 
     # Single-node asynchronous rollout controller and CPU weight relay
     laminar:
+      # Extra rollout devices reserved exclusively for checkpoint-free validation.
+      # Uses data.val_files, rollout.val_kwargs, and trainer.test_freq (1 = every update).
+      evaluation:
+        enabled: false
+        nnodes: 1
+        n_gpus_per_node: 1
+        # null inherits rollout TP; TP must fit within an evaluation node.
+        tensor_model_parallel_size: null
+        num_workers: 1
+        # null inherits the training rollout engine limit.
+        max_num_seqs: null
+        # Admission/repack ceiling, bounded by max_num_seqs.
+        max_inflight_per_replica: null
+        # null extends inherited graph gears when the evaluation limit grows.
+        cudagraph_capture_sizes: null
+        # Each version evaluates the complete validation set in a separate partition.
+        max_concurrent_versions: 3
+        # Preserve one latest pending snapshot while version slots are occupied.
+        overflow_policy: latest
+        # Keep one replica per version and prioritize the closest completion.
+        allocation_policy: finish_first
+        # Capacity/telemetry checked recompute migration stays within one version.
+        enable_repack: true
+        repack_interval_s: 5.0
+        # Bounds validation metadata polling and weight-sync RPC waits.
+        timeout_s: 3600.0
+      # Demand-based admission within the roofline/KV safety envelope. Opt in
+      # to loan complete TP instances to evaluation without changing devices.
+      supply:
+        enabled: false
+        elastic_evaluation: true
+        min_training_replicas: 2
+        low_ready_batches: 0.5
+        target_ready_batches: 1.0
+        high_ready_batches: 1.5
+        max_pending_batches: 2.0
+        refill_groups: 0
+        target_staleness: 3.0
+        staleness_window: 5
+        healthy_polls: 3
+        loan_cooldown_s: 60.0
+        poll_interval_s: 2.0
+        feedback_timeout_s: 15.0
+        starvation_wait_s: 5.0
       # Strict 8+8 synchronous control: one batch, then update, then all-replica barrier.
       synchronous: false
       parameter_sync_step: 1

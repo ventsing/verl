@@ -65,7 +65,7 @@ def compute_behavior_policy_metrics(tags, actor_version):
 
 
 def compute_replica_policy_metrics(status):
-    replicas = status.get("replicas", [])
+    replicas = [row for row in status.get("replicas", []) if row.get("owned", True)]
     loaded = [row for row in replicas if row["version"] >= 0]
     prefix = "laminar/replicas"
     result = {f"{prefix}/count": len(replicas), f"{prefix}/unloaded_count": len(replicas) - len(loaded),

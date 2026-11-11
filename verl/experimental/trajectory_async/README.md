@@ -590,6 +590,124 @@ the complete V1/Qwen3.5 CPU suite passed **201 tests, with 2 skipped**. Other
 test suites calling unisolated `tq.init()`/`tq.close()` must not share an active
 training cluster.
 
+### Dedicated evaluation through Mooncake
+
+`trainer.v1.laminar.evaluation.enabled=true` reserves extra standalone vLLM
+replicas exclusively for evaluation. Training replicas and evaluation replicas
+have separate controllers, devices, agent-loop workers and sampler state. This
+currently supports the V1 `laminar` trainer with the `mooncake_relay` backend;
+`separate_async` and the shared-memory `cpu_relay` backend are not supported.
+
+Evaluation reads `data.val_files`, uses `actor_rollout_ref.rollout.val_kwargs`
+and the existing reward/scoring service, and reports the usual `val-core/*`
+and `val-aux/*` metrics. Set `trainer.test_freq=1` for every update, or a positive
+N for every N updates. The final update is always evaluated when test_freq is
+positive. `trainer.val_before_train` controls initial evaluation, including
+validation immediately after checkpoint resume.
+
+For long full-set evaluations, `trainer.test_freq=5` evaluates versions
+5, 10, ..., 80 in an 80-update run. Keep the complete validation set and compare
+scores against behavior-policy age from the same training version. The existing
+`training/off_policy/trajectory_staleness/mean` measures mean behavior age in
+weight versions relative to the actor before the update consuming that batch;
+it does not measure how late an evaluation result arrives.
+
+```bash
+python examples/trajectory_async/monitor_evaluation_staleness.py /path/to/run
+```
+
+This read-only monitor writes `staleness_report.json` with the latest training
+age and a five-step rolling mean. `evaluation_staleness.csv` joins logged scores
+to the evaluated policy version's training age and trailing five-step mean,
+even when scoring finishes several training updates later. Missing training
+versions remain missing rather than borrowing a newer batch's age. The window
+mean averages per-step means and reports how many steps were observed.
+
+Each evaluation pulls its **exact training version** from the node-local
+Mooncake relay. That version stays pinned on the relay hierarchy until scoring
+and generation dumping finish, even as training publishes newer weights. No
+checkpoint export or model file reload is needed. `trainer.save_freq` remains
+independent; set it to `-1` to disable periodic checkpoint saving.
+
+Intermediate evaluations run in the background, with up to
+`evaluation.max_concurrent_versions` versions in flight (default 3, capped by
+the number of evaluation replicas). Each version owns a separate validation
+iterator, TransferQueue partition, sampler and agent-loop workers. Scores and
+sample counts remain version-specific; each version evaluates the full set.
+When all version slots are occupied, `evaluation.overflow_policy=latest`
+retains one pending exact snapshot on the relay hierarchy. New triggers replace
+that pending snapshot; the next training-step boundary with a free slot admits
+it. Active evaluations always finish their complete validation sets. This bounds
+memory and queue growth when training produces versions faster than evaluation.
+Use `overflow_policy=skip` to drop busy triggers immediately instead.
+Initial and final evaluations wait for completion. Metrics include
+`evaluation/policy_version`, `evaluation/seconds` and cumulative
+`evaluation/skipped`, `evaluation/deferred`, `evaluation/coalesced` and
+`evaluation/pending_version` (-1 when empty). Skipped includes pending snapshots
+replaced before admission; deferred counts requests retained for later admission.
+Background scores are logged when collected by the
+training thread, so use policy_version to identify the evaluated weights.
+Validation JSONL dumps, when enabled, retain the evaluated version as filename.
+`EvaluationController` dynamically shares replicas among exact-version request
+cohorts. Idle replicas load the versions with pending work; surplus busy
+replicas drain. The default `evaluation.allocation_policy=finish_first` reserves
+one replica per active version, then gives spare replicas to the version with
+the fewest remaining requests. Use `fair` for equal sharing instead.
+With `evaluation.enable_repack=true`, the existing Laminar
+telemetry/capacity checks consolidate same-version tails using abort and prefix
+recompute, releasing replicas for other versions. Requests never migrate across
+policy versions. This reuses the recompute transport, not KV/SSM state transfer.
+Pool utilization, pulls and migrations are logged under `evaluation/pool/*`;
+`evaluation_scheduler.jsonl` records scheduling and migration events.
+
+Evaluation engine capacity can be configured independently of training rollout.
+For the 64-device, TP=2, 32K setup whose engines reported about 35 simultaneous
+full-length requests per replica, a conservative candidate is:
+
+```bash
+trainer.v1.laminar.evaluation.max_num_seqs=32 \
+trainer.v1.laminar.evaluation.max_inflight_per_replica=24 \
+trainer.v1.laminar.evaluation.cudagraph_capture_sizes=[1,2,4,8,16,24,32]
+```
+
+The first limit sizes the engine; the second bounds admission and repacking.
+When the engine limit is overridden without explicit graph gears, inherited
+gears are extended through the admission ceiling. Graph gears must cover that
+ceiling. Preserve graph mode (`enforce_eager=false`) and the configured graph
+backend. Measure throughput and memory before raising admission further; more
+concurrent requests do not imply proportional throughput. If a full evaluation
+still takes longer than a training update, increase `trainer.test_freq` rather
+than increasing the number of pinned versions indefinitely. These engine
+settings require recreating the evaluation servers.
+
+Rollout/scoring errors propagate to training rather than becoming empty scores.
+`evaluation.timeout_s` bounds validation polling and weight-sync RPC waits.
+
+For example, divide a 16-device allocation into 8 training, 6 training-rollout
+and 2 evaluation devices (TP=2):
+
+```bash
+NDEVICES=16 TRAINER_NPUS_PER_NODE=8 ROLLOUT_NPUS_PER_NODE=6 \
+  bash examples/trajectory_async/run_qwen35_9b_laminar_mooncake.sh \
+  trainer.v1.laminar.evaluation.enabled=true \
+  trainer.v1.laminar.evaluation.nnodes=1 \
+  trainer.v1.laminar.evaluation.n_gpus_per_node=2 \
+  trainer.v1.laminar.evaluation.tensor_model_parallel_size=2 \
+  trainer.v1.laminar.evaluation.num_workers=1 \
+  trainer.test_freq=5 trainer.val_before_train=true trainer.save_freq=-1
+```
+
+Evaluation resources are **additional** to trainer/rollout/reward resources;
+reserve sufficient devices and CPU slots in the Ray cluster. Evaluation TP must
+divide its per-node device count and fit within one node. The model, checkpoint
+representation, sampling configuration and engine options otherwise inherit the
+training rollout configuration. Reward-model resources, if used, remain owned
+by the existing standalone reward service. Long evaluations retain each in-flight
+weight version on every relay; allow host-memory/version budget headroom in
+`trainer.v1.laminar.weight_budget` or training publication may backpressure.
+This also participates in the configured relay recovery path; it does not
+require enabling disk persistence.
+
 ### 16-NPU long-sequence validation and scaling baseline
 
 Keep the current correctness baseline at 16 NPUs: eight FSDP2 trainer ranks
@@ -1651,3 +1769,82 @@ Qwen3.5 Laminar launcher 的引擎硬上限默认预留 64（LAMINAR_ENGINE_MAX_
 
 Strict synchronous 8+8 reasoning control and comparison curves: [SYNC_COMPARISON.md](SYNC_COMPARISON.md).
 >>>>>>> 46d068d7 (Implemented Laminar-stype trajectory-level asynchronous trraining for verl  which including:)
+
+### Just-in-time supply and elastic evaluation
+
+Enable `trainer.v1.laminar.supply.enabled=true` to control training admission by
+whole ready GRPO groups rather than maximizing rollout production. Roofline and
+KV/SSM capacity remain hard per-instance ceilings. With the default watermarks,
+new requests pause at 1.5 ready training batches, or at one ready batch when the
+trailing five-update mean policy lag exceeds three versions. Admission resumes
+below half a batch or after five seconds of live sampling wait. Existing
+trajectories finish without changing behavior policy or being discarded. Prompt
+production is also bounded to two outstanding batches by default.
+
+When dedicated evaluation is enabled, `supply.elastic_evaluation=true` loans
+surplus training-rollout instances to its controller. The unit of transfer is a
+complete TP replica; trainer devices and the dedicated evaluation minimum pool
+stay fixed. Training/evaluation TP must match. The destination reuses the
+existing engine, graph captures and node-local Mooncake relay, with admission
+bounded by both the evaluation limit and the donor's current safe limit.
+
+A controller first closes the donor to new admissions, then waits for active
+requests, migration reservations, recovery and scheduled/in-progress weight loads
+to finish. Active requests are proactively migrated to same-version instances
+with fresh backend telemetry and available request/KV capacity, without waiting
+for ramp-down detection or for the entire source to fit one destination. Atomic
+reservations allow partial evacuation across multiple targets. Same-version
+prefix recomputation preserves generated tokens and behavior logprobs. Draining,
+loading, recovering and unowned instances cannot receive these migrations.
+Only after all active requests and reservations have left can the other
+controller acquire the instance and load its own exact policy version. There is
+no simultaneous admission by two controllers and no cross-version continuation.
+
+Defaults reserve two healthy training-rollout replicas, require three healthy
+supply observations, and loan at most one additional replica per 60 seconds.
+Low ready watermarks or a live sampling stall immediately request all loans back;
+return first migrates evaluation requests to eligible same-version peers before
+loading the latest training weights. When no safe same-version destination has
+capacity, remaining requests continue in place and migration is retried on the
+next polling cycle. This is not an instantaneous preemption guarantee, so tune
+the training reserve and watermarks against observed tail latency. At the final update all training-rollout replicas may help
+drain evaluation. Lost feedback resumes training admission and recalls loans.
+
+For the 32 trainer / 16 rollout / 16 evaluation NPU layout with TP=2:
+
+```bash
+trainer.v1.laminar.supply.enabled=true \
+trainer.v1.laminar.supply.elastic_evaluation=true \
+trainer.v1.laminar.supply.min_training_replicas=2 \
+trainer.v1.laminar.supply.target_ready_batches=1.0 \
+trainer.v1.laminar.supply.target_staleness=3.0
+```
+
+During training this keeps at least four rollout NPUs and allows the other twelve
+rollout NPUs to help evaluation when supply permits. Device placement never
+changes. Track `laminar/supply/*` for ready groups, trailing staleness, paused
+admission, loans and transfers. `supply_scheduler.jsonl` records decisions,
+draining, cancellations and completed ownership handoffs. Enablement is opt-in;
+the previously completed 100-step run did not use this policy.
+
+For long-response workloads, distinguish the target of complete ready groups
+from the hard bound on unsampled prompts. A two-batch prompt bound can strand
+idle engines when many groups each lack one long response. Set
+`data.gen_batch_size=4` and `supply.refill_groups=4` to replenish four groups at a
+time. The producer now checks both the complete-group target and remaining
+trajectory work against owned engine admission capacity. Completed members of
+incomplete groups do not consume the work budget; the prompt bound still caps
+experience accumulation. A ready target of 1.5 batches, low watermark of 1,
+high watermark of 2.5 and hard prompt bound of 4 batches provide a buffer while
+allowing small refills around tails.
+
+A throughput-oriented 64-NPU configuration uses 32 trainer NPUs, 24 training
+rollout NPUs and 8 dedicated evaluation NPUs. On four 16-NPU nodes, configure
+rollout as two groups of 12 NPUs and evaluation as two groups of 4 so they fit
+together on the two inference nodes. With TP=2 and
+`supply.min_training_replicas=8`, training retains 16 rollout NPUs and can loan
+up to 8 NPUs to evaluation. An initial admission of 24 avoids repeatedly
+restarting from 8 at each context bucket; the profiled full-context KV/SSM
+budget and calibrated bounds still clamp it, irrespective of engine ceiling 64.
+These settings require throughput validation; they do not guarantee zero wait
+under arbitrary sequence lengths.
