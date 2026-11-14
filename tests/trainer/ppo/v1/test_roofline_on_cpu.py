@@ -531,3 +531,12 @@ def test_retained_latency_cap_must_still_be_a_currently_passing_shape():
     result = guard.update(("eager", 0), profile, 200)
     assert result["status"] == "ready" and result["limit"] == 8
     assert 16 in result["unsafe_observed_batches"]
+
+
+def test_continuous_sampling_survives_policy_updates_without_unbounding_events():
+    probe, device, scheduled, _ = probe_rig({"continuous_sampling": True, "max_pending_events": 2})
+    for version in range(10):
+        probe.set_version(version)
+        timed_step(probe, device, scheduled)
+    assert probe.enabled
+    assert len(probe.pending) == 2

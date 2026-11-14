@@ -18,7 +18,7 @@ from omegaconf import OmegaConf
 from verl.experimental.trajectory_async.cpu_relay import CPUWeightRelay
 from verl.experimental.trajectory_async.experience_cache import load_initial_groups
 from verl.experimental.trajectory_async.laminar_controller import LaminarController, LaminarServerClient
-from verl.experimental.trajectory_async.prompt_feeder import PromptFeeder
+from verl.experimental.trajectory_async.prompt_feeder import AdaptivePromptBuffer, PromptFeeder
 from verl.experimental.trajectory_async.reward_diagnostics import RewardDiagnostics
 from verl.experimental.trajectory_async.staleness_metrics import CompletionRateTracker, compute_replica_policy_metrics
 from verl.experimental.trajectory_async.supply import (
@@ -76,9 +76,18 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             raise ValueError("Laminar prompt production requires data.dataloader_num_workers=0")
         if config.skip.rollout_tq.enable:
             raise ValueError("Laminar requires live rollout; rollout_tq skip mode is unsupported")
+        self._length_calibration_enabled = config.trainer.v1.laminar.online_capacity.get(
+            "response_step_calibration", True
+        )
         self.supply_config = SupplyConfig(**dict(config.trainer.v1.laminar.get("supply", {})))
         if self.supply_config.enabled and self.synchronous:
             raise ValueError("Just-in-time supply requires asynchronous training")
+        self.adaptive_buffer_options = dict(config.trainer.v1.laminar.get("adaptive_buffer", {}))
+        if self.adaptive_buffer_options.get("enabled", False) and (self.synchronous or self.supply_config.enabled):
+            raise ValueError("Adaptive buffer requires asynchronous training without the separate supply controller")
+        self._adaptive_buffer = None
+        self._adaptive_buffer_monitor = None
+        self._buffer_staleness = 0.0
         self._supply_monitor = None
         self._supply_feedback = {}
         self._supply_runtime = {}
@@ -266,7 +275,7 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
         configurations = []
         if roofline["enabled"]:
             configurations = ray.get([r["server"].configure_trajectory_roofline.remote(roofline) for r in replicas])
-            logger.info("Laminar online roofline probes: %s", configurations)
+            logger.debug("Laminar online roofline probes: %s", configurations)
         event_path = str(Path(options.event_dir) / "scheduler.jsonl") if options.event_dir else None
         self.laminar_controller = (
             ray.remote(LaminarController)
@@ -330,7 +339,7 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
                 enable_thinking=True,
             )
             report = ray.get(self.laminar_controller.migration_probe.remote(tokens))
-            print(f"Laminar real-backend migration preflight passed: {report}", flush=True)
+            logger.debug("Laminar real-backend migration preflight passed: %s", report)
 
     def on_step_begin(self):
         self._check_prompt_feeder()
@@ -402,10 +411,31 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
 
     def on_sample_end(self):
         super().on_sample_end()
+        if getattr(self, "_length_calibration_enabled", False):
+            tags = self.replay_buffer.last_selected_tags.get("train", [])
+            records = []
+            for tag in tags:
+                oldest = tag.get("min_global_steps")
+                oldest = tag["global_steps"] if oldest is None else oldest
+                newest = tag.get("max_global_steps")
+                newest = oldest if newest is None else newest
+                length = int(tag.get("response_len", 0))
+                if not tag.get("is_padding", False) and oldest == newest and length > 0:
+                    records.append((int(oldest), length))
+            if records:
+                # This ordered step RPC follows the controller's normal lifecycle;
+                # a busy expanded rollout pool must not turn a short deadline into a fatal error.
+                ray.get(self.laminar_controller.calibrate_response_lengths.remote(self.global_steps, records))
         self._sample_started_at = None
 
     def _compute_metrics(self, batch, metrics, timing_raw, global_steps, epoch):
         super()._compute_metrics(batch, metrics, timing_raw, global_steps, epoch)
+        buffer = getattr(self, "_adaptive_buffer", None)
+        if buffer is not None:
+            self._buffer_staleness = float(metrics["training/off_policy/trajectory_staleness/mean"])
+            metrics.update(
+                {"laminar/buffer/capacity_groups": buffer.current, "laminar/buffer/adjustments": buffer.adjustments}
+            )
         if getattr(self, "supply_config", None) is not None and self.supply_config.enabled:
             self._supply_staleness.append(float(metrics["training/off_policy/trajectory_staleness/mean"]))
             self._supply_feedback = {"window_staleness": sum(self._supply_staleness) / len(self._supply_staleness)}
@@ -453,6 +483,64 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
         ray.get(self.supply_coordinator.update.remote(feedback), timeout=10)
         ray.get(self.supply_coordinator.status.remote(), timeout=10)
 
+    def _poll_adaptive_buffer(self):
+        # This optional tuning loop must not fail training because a busy
+        # controller takes longer than one poll to answer. Keep only one RPC
+        # outstanding, and never make adjustments from a late response.
+        now = time.monotonic()
+        ref = getattr(self, "_adaptive_buffer_status_ref", None)
+        if ref is None:
+            ref = self.laminar_controller.status.remote()
+            self._adaptive_buffer_status_ref = ref
+            self._adaptive_buffer_status_requested_at = now
+            self._adaptive_buffer_status_warned = False
+        ready, _ = ray.wait([ref], timeout=0)
+        if not ready:
+            if (
+                now - self._adaptive_buffer_status_requested_at > self._adaptive_buffer.feedback_timeout
+                and not self._adaptive_buffer_status_warned
+            ):
+                logger.warning(
+                    "Adaptive buffer status delayed; keeping capacity=%d until fresh feedback arrives",
+                    self._adaptive_buffer.current,
+                )
+                self._adaptive_buffer_status_warned = True
+            return
+        self._adaptive_buffer_status_ref = None
+        status = ray.get(ref)  # Surface real controller errors; the result is ready.
+        observed_at = self._adaptive_buffer_status_requested_at
+        if now - observed_at > self._adaptive_buffer.feedback_timeout:
+            return
+        queue = queue_supply_snapshot(
+            (tq.kv_list() or {}).get("train", {}),
+            self.config.actor_rollout_ref.rollout.n,
+            self.config.data.train_batch_size,
+        )
+        owned = [
+            r for r in status["replicas"] if r.get("owned", True) and r["healthy"] and not r.get("releasing", False)
+        ]
+        now = time.monotonic()
+        runtime = {
+            "observed_at": observed_at,
+            "admission_total": sum(r["admission_limit"] for r in owned),
+            "active_total": sum(r["active"] for r in owned),
+        }
+        wait = max(0.0, now - self._sample_started_at) if self._sample_started_at is not None else 0.0
+        with self._prompt_lock:
+            previous = self._adaptive_buffer.current
+            capacity = self._adaptive_buffer.observe(queue, runtime, self._buffer_staleness, wait, now)
+            self._prompt_feeder.capacity = capacity
+            if capacity != previous:
+                logger.info(
+                    "Adaptive prompt buffer: %d -> %d groups; reason=%s ready=%d unfinished=%d active=%d",
+                    previous,
+                    capacity,
+                    self._adaptive_buffer.reason,
+                    queue["ready_groups"],
+                    queue["unfinished_trajectories"],
+                    runtime["active_total"],
+                )
+
     def _can_refill_supply(self):
         queue = queue_supply_snapshot(
             (tq.kv_list() or {}).get("train", {}),
@@ -482,11 +570,17 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
         monitor = getattr(self, "_supply_monitor", None)
         if monitor is not None:
             monitor.check()
+        adaptive = getattr(self, "_adaptive_buffer_monitor", None)
+        if adaptive is not None:
+            adaptive.check()
         feeder = getattr(self, "_prompt_feeder", None)
         if feeder is not None:
             feeder.check()
 
     def _stop_prompt_feeder(self):
+        adaptive = getattr(self, "_adaptive_buffer_monitor", None)
+        if adaptive is not None:
+            adaptive.stop()
         if self._prompt_feeder is not None:
             self._prompt_feeder.stop()
 
@@ -548,6 +642,11 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
         if capacity < batch_size:
             raise ValueError("Laminar prompt_buffer_groups must hold at least one training batch")
         refill = (self.supply_config.refill_groups or batch_size) if self.supply_config.enabled else batch_size
+        adaptive_options = getattr(self, "adaptive_buffer_options", {})
+        if adaptive_options.get("enabled", False):
+            self._adaptive_buffer = AdaptivePromptBuffer(batch_size, capacity, adaptive_options)
+            capacity = self._adaptive_buffer.current
+            refill = self._adaptive_buffer.refill_groups
         granularity = self.config.data.get("gen_batch_size", None) or batch_size
         if refill % granularity:
             raise ValueError("Supply refill_groups must be a multiple of data.gen_batch_size")
@@ -562,6 +661,12 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             can_submit=self._can_refill_supply if self.supply_config.enabled else None,
         )
         self._prompt_feeder.start()
+        if adaptive_options.get("enabled", False):
+            interval = float(adaptive_options.get("poll_interval_s", 5.0))
+            if not math.isfinite(interval) or interval <= 0:
+                raise ValueError("Adaptive buffer poll interval must be finite and positive")
+            self._adaptive_buffer_monitor = SupplyMonitor(self._poll_adaptive_buffer, interval)
+            self._adaptive_buffer_monitor.start()
 
     def prepare_step(self):
         if getattr(self, "synchronous", False):
@@ -594,7 +699,7 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
                 raise RuntimeError(f"Synchronous weight barrier has an unhealthy replica: {status}")
             if replicas and all(r["version"] == version and not r["pulling"] for r in replicas):
                 self._assert_synchronous_idle(version)
-                logger.info("Synchronous rollout barrier passed: version=%d replicas=%d", version, len(replicas))
+                logger.debug("Synchronous rollout barrier passed: version=%d replicas=%d", version, len(replicas))
                 return
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Synchronous weight barrier timed out for version {version}: {status}")
@@ -696,8 +801,11 @@ class PPOTrainerLaminar(PPOTrainerSeparateAsync):
             self.logger.log(data=metrics, step=self.global_steps)
             metrics = {}
         if self.evaluation.busy:
-            self.evaluation.defer(self.global_steps)
-            return {**metrics, **self.evaluation.queue_metrics()}
+            if self.evaluation_config.trainer.v1.laminar.evaluation.get("overflow_policy", "latest") == "block":
+                metrics.update(self.evaluation.wait_for_slot())
+            else:
+                self.evaluation.defer(self.global_steps)
+                return {**metrics, **self.evaluation.queue_metrics()}
         self.evaluation.discard_pending(replaced=True)
         self.evaluation.submit(self.global_steps)
         if wait:

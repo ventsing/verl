@@ -252,7 +252,9 @@ trainer:
         cudagraph_capture_sizes: null
         # Each version evaluates the complete validation set in a separate partition.
         max_concurrent_versions: 3
-        # Preserve one latest pending snapshot while version slots are occupied.
+        # Optional final-only validation files; null keeps data.val_files.
+        final_val_files: null
+        # latest merges pending versions; skip drops them; block waits for a free slot.
         overflow_policy: latest
         # Keep one replica per version and prioritize the closest completion.
         allocation_policy: finish_first
@@ -263,6 +265,19 @@ trainer:
         timeout_s: 3600.0
       # Demand-based admission within the roofline/KV safety envelope. Opt in
       # to loan complete TP instances to evaluation without changing devices.
+      # Bounded adaptive prompt horizon, independent of evaluation resource loans.
+      adaptive_buffer:
+        enabled: false
+        min_batches: 2.0
+        max_batches: 4.0
+        initial_batches: 4.0
+        step_groups: 16
+        refill_groups: 16
+        adjust_interval_s: 60.0
+        healthy_polls: 3
+        target_staleness: 1.0
+        poll_interval_s: 5.0
+        feedback_timeout_s: 15.0
       supply:
         enabled: false
         elastic_evaluation: true
@@ -289,6 +304,26 @@ trainer:
       repack_max_running: 0  # 0 uses the engine limit until calibration is confident.
       online_capacity:
         enabled: true
+        token_budget_admission: false
+        rolling_kv_enabled: false
+        rolling_kv_horizon_s: 30.0
+        rolling_kv_rate_margin: 1.25
+        rolling_kv_rate_ttl_s: 60.0
+        rolling_kv_pressure_threshold: 0.90
+        rolling_kv_resume_threshold: 0.80
+        rolling_kv_max_moves: 4
+        rolling_kv_migration_cooldown_s: 60.0
+        response_prior_tokens: 8192
+        response_history_window: 1024
+        response_step_calibration: true
+        response_calibration_online_weight: 0.2
+        response_calibration_versions: 8
+        response_min_samples: 8
+        response_quantile: 0.75
+        response_ewma_alpha: 0.1
+        response_safety_factor: 1.15
+        telemetry_guard_tokens: 256
+        response_history_path: null
         kv_usage_limit: 0.9  # Safety margin, not a model/device capacity estimate.
         healthy_polls: 3
         growth_factor: 1.25
@@ -299,6 +334,7 @@ trainer:
       roofline:
         enabled: true
         calibration_rounds: 3  # Per-replica policy versions; not guaranteed convergence.
+        continuous_sampling: false
         sample_every: 8
         coverage_sample_every: 1  # Brief dense sampling for new batch/context bins.
         warmup_per_shape: 2

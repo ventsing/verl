@@ -26,6 +26,8 @@ from verl.checkpoint_engine.base import CheckpointEngineRegistry
 from verl.experimental.trajectory_async.cpu_relay import CPUSharedMemoryCheckpointEngine, CPUWeightRelay
 from verl.workers.rollout.utils import ensure_async_iterator
 
+MAX_BATCH_CHUNKS = 64
+
 
 def worker_node_info():
     return {"node_id": ray.get_runtime_context().get_node_id(), "host": ray.util.get_node_ip_address().strip("[]")}
@@ -47,14 +49,24 @@ class MooncakeTransport:
     """Use the installed TransferEngine API; never silently switch protocols."""
 
     def __init__(self, host, protocol="rdma", device_name="", engine=None):
-        if protocol not in {"rdma", "tcp"}:
-            raise ValueError("CPU relays support explicit rdma or tcp transport")
+        if protocol not in {"rdma", "tcp", "ascend"}:
+            raise ValueError("Host-memory relays require explicit rdma, tcp or ascend transport")
+        self.protocol = protocol
+        self.ascend_device = int(device_name or 0) if protocol == "ascend" else None
+        self._ascend_context = None
+        self._bind_device()
         if engine is None:
             # Classic Mooncake auto-discovery may otherwise ignore the Python
             # protocol argument. These affect only this dedicated relay process.
-            force, other = ("MC_FORCE_TCP", "MC_FORCE_HCA") if protocol == "tcp" else ("MC_FORCE_HCA", "MC_FORCE_TCP")
-            os.environ[force] = "1"
-            os.environ.pop(other, None)
+            if protocol == "ascend":
+                os.environ.pop("MC_FORCE_TCP", None)
+                os.environ.pop("MC_FORCE_HCA", None)
+            else:
+                force, other = (
+                    ("MC_FORCE_TCP", "MC_FORCE_HCA") if protocol == "tcp" else ("MC_FORCE_HCA", "MC_FORCE_TCP")
+                )
+                os.environ[force] = "1"
+                os.environ.pop(other, None)
             try:
                 from mooncake.engine import TransferEngine
             except ImportError as error:
@@ -63,7 +75,6 @@ class MooncakeTransport:
                 ) from error
             engine = TransferEngine()
         self.engine = engine
-        self.protocol = protocol
         ret = engine.initialize(host, "P2PHANDSHAKE", protocol, device_name)
         if ret != 0:
             raise RuntimeError(
@@ -72,22 +83,56 @@ class MooncakeTransport:
             )
         self.session = f"{host}:{engine.get_rpc_port()}"
 
+    def _bind_device(self):
+        if self.protocol == "ascend":
+            # Native calls also run in executor threads, each requiring a context.
+            torch.npu.set_device(self.ascend_device)
+            if self._ascend_context is None:
+                self._ascend_context = torch.empty(1, device=f"npu:{self.ascend_device}")
+
+    def allocate(self, size):
+        self._bind_device()
+        if self.protocol == "ascend":
+            # ADXL can accept pageable registration but fail at HcclCommPrepare.
+            # The NumPy view retains the pinned allocation's Tensor owner.
+            return torch.empty(size, dtype=torch.uint8, pin_memory=True).numpy()
+        return np.empty(size, dtype=np.uint8)
+
     def register(self, buffer):
+        self._bind_device()
         if buffer.nbytes:
             ret = self.engine.register_memory(buffer.ctypes.data, buffer.nbytes)
             if ret != 0:
                 raise RuntimeError(f"Mooncake register_memory failed: {ret}")
 
     def unregister(self, buffer):
+        self._bind_device()
         if buffer.nbytes:
             ret = self.engine.unregister_memory(buffer.ctypes.data)
             if ret != 0:
                 raise RuntimeError(f"Mooncake unregister_memory failed: {ret}")
 
     def write(self, session, buffer, source_offset, destination, size):
+        self._bind_device()
         ret = self.engine.transfer_sync_write(session, buffer.ctypes.data + source_offset, destination, size)
         if ret != 0:
             raise RuntimeError(f"Mooncake transfer_sync_write failed: {ret}")
+
+    def write_batch(self, session, buffers, chunks, addresses):
+        self._bind_device()
+        batch_write = getattr(self.engine, "batch_transfer_sync_write", None)
+        if batch_write is None:
+            for index, offset, size in chunks:
+                self.write(session, buffers[index], offset, addresses[index] + offset, size)
+            return
+        ret = batch_write(
+            session,
+            [buffers[index].ctypes.data + offset for index, offset, _ in chunks],
+            [addresses[index] + offset for index, offset, _ in chunks],
+            [size for _, _, size in chunks],
+        )
+        if ret != 0:
+            raise RuntimeError(f"Mooncake batch_transfer_sync_write failed: {ret}")
 
 
 @dataclass
@@ -152,7 +197,7 @@ class MooncakeRelayNode(CPUWeightRelay):
         self.condition = asyncio.Condition()
         self.publish_lock = asyncio.Lock()
         self.quarantined = []
-        self.stats = {"sent_bytes": 0, "received_bytes": 0, "sent_chunks": 0}
+        self.stats = {"sent_bytes": 0, "received_bytes": 0, "sent_chunks": 0, "sent_batches": 0}
 
     def configure_successor(self, successor):
         if self.transfers or self.latest is not None:
@@ -257,6 +302,16 @@ class MooncakeRelayNode(CPUWeightRelay):
                 amount += size * (1 if state.sealed else 2)
         return amount
 
+    def _allocate_buffers(self, schema, buffers, copy_source):
+        if buffers is None:
+            return [self.transport.allocate(x["nbytes"]) for x in schema]
+        if copy_source:
+            pinned = [self.transport.allocate(buffer.nbytes) for buffer in buffers]
+            for destination, source in zip(pinned, buffers, strict=True):
+                np.copyto(destination, source)
+            return pinned
+        return buffers
+
     async def _new_transfer(self, version, schema, buffers=None, replay=False, reuse=False):
         self.health()
         validate_schema(schema)
@@ -264,18 +319,20 @@ class MooncakeRelayNode(CPUWeightRelay):
             raise ValueError("Invalid or duplicate transfer version")
         if not replay and self.latest is not None and version <= self.latest:
             raise ValueError("Relay versions must increase monotonically")
-        shared_source = buffers is not None
+        copy_source = self.transport.protocol == "ascend" and buffers is not None
+        shared_source = buffers is not None and not copy_source
         if not reuse:
             await self.wait_for_capacity(
                 version, sum(e["nbytes"] for e in schema), reserve_copies=1 if shared_source else 2
             )
-        buffers = buffers if buffers is not None else [np.empty(x["nbytes"], dtype=np.uint8) for x in schema]
-        state = _Transfer(
-            version, schema, buffers, received=[0] * len(schema), shared_source=shared_source, replay=replay
-        )
+        state = _Transfer(version, schema, [], received=[0] * len(schema), shared_source=shared_source, replay=replay)
+        # Account for the whole reservation before yielding to the allocator.
+        # Host pinning/copying may take seconds for a model; do not block RPCs
+        # serving old versions or make the coordinator's heartbeat time out.
         self.transfers[version] = state
         try:
-            for buffer in buffers:
+            state.buffers = await self._native_call(self._allocate_buffers, schema, buffers, copy_source)
+            for buffer in state.buffers:
                 registration = asyncio.create_task(asyncio.to_thread(self.transport.register, buffer))
                 try:
                     await asyncio.shield(registration)
@@ -406,36 +463,67 @@ class MooncakeRelayNode(CPUWeightRelay):
 
     async def chunk_ready(self, version, index, offset, size, digest=None, epoch=None):
         """Acknowledge a completed native write, then queue next-hop transfer."""
+        return await self.chunks_ready(version, [(index, offset, size)], [digest], epoch)
+
+    async def chunks_ready(self, version, chunks, digests, epoch=None):
+        """Validate a bounded native batch atomically, preserving tensor order."""
         self._check_epoch(epoch)
         self.health()
         state = self.transfers[version]
         async with state.lock:
             self.health()
-            if state.sealed or not 0 <= index < len(state.schema):
-                raise ValueError("Chunk targets a sealed version or invalid tensor")
-            expected = min(self.chunk_bytes, state.schema[index]["nbytes"] - state.received[index])
-            if offset != state.received[index] or size != expected or size <= 0:
-                raise ValueError("Duplicate, overlapping or incorrectly sized Mooncake chunk")
-            if any(state.received[i] != state.schema[i]["nbytes"] for i in range(index)):
-                raise ValueError("Chunks must arrive in tensor order")
+            if (
+                not chunks
+                or len(chunks) > MAX_BATCH_CHUNKS
+                or len(chunks) != len(digests)
+                or sum(c[2] for c in chunks) > self.chunk_bytes
+            ):
+                raise ValueError("Invalid or oversized Mooncake batch")
+            received = list(state.received)
+            for index, offset, size in chunks:
+                if state.sealed or not 0 <= index < len(state.schema):
+                    raise ValueError("Chunk targets a sealed version or invalid tensor")
+                expected = min(self.chunk_bytes, state.schema[index]["nbytes"] - received[index])
+                if offset != received[index] or size != expected or size <= 0:
+                    raise ValueError("Duplicate, overlapping or incorrectly sized Mooncake chunk")
+                if any(received[i] != state.schema[i]["nbytes"] for i in range(index)):
+                    raise ValueError("Chunks must arrive in tensor order")
+                received[index] += size
             if self.verify_checksums:
-                actual = await asyncio.to_thread(self._digest, state.buffers[index], offset, size)
-                if digest != actual:
+                actual = await asyncio.to_thread(self._digests, state.buffers, chunks)
+                if list(digests) != actual:
                     error = RuntimeError("Mooncake chunk checksum mismatch")
                     await self._failed(error)
                     raise error
-            state.received[index] += size
-            self.stats["received_bytes"] += size
+            state.received = received
+            self.stats["received_bytes"] += sum(c[2] for c in chunks)
             if self.successor is not None:
                 previous = state.tail
-                state.tail = asyncio.create_task(self._forward_chunk(state, previous, index, offset, size, digest))
+                state.tail = asyncio.create_task(self._forward_chunks(state, previous, chunks, digests))
                 state.tail.add_done_callback(self._consume_exception)
 
     @staticmethod
     def _digest(buffer, offset, size):
         return hashlib.sha256(memoryview(buffer)[offset : offset + size]).hexdigest()
 
-    async def _forward_chunk(self, state, previous, index, offset, size, digest):
+    @classmethod
+    def _digests(cls, buffers, chunks):
+        return [cls._digest(buffers[index], offset, size) for index, offset, size in chunks]
+
+    def _chunk_batches(self, schema):
+        batch, total = [], 0
+        for index, entry in enumerate(schema):
+            for offset in range(0, entry["nbytes"], self.chunk_bytes):
+                size = min(self.chunk_bytes, entry["nbytes"] - offset)
+                if batch and (total + size > self.chunk_bytes or len(batch) == MAX_BATCH_CHUNKS):
+                    yield batch
+                    batch, total = [], 0
+                batch.append((index, offset, size))
+                total += size
+        if batch:
+            yield batch
+
+    async def _forward_chunks(self, state, previous, chunks, digests):
         try:
             if previous is not None:
                 await previous
@@ -443,16 +531,16 @@ class MooncakeRelayNode(CPUWeightRelay):
             if destination.get("cached"):
                 return
             await self._native_call(
-                self.transport.write,
+                self.transport.write_batch,
                 destination["session"],
-                state.buffers[index],
-                offset,
-                destination["addresses"][index] + offset,
-                size,
+                state.buffers,
+                chunks,
+                destination["addresses"],
             )
-            self.stats["sent_bytes"] += size
-            self.stats["sent_chunks"] += 1
-            await self.successor.chunk_ready.remote(state.version, index, offset, size, digest, **self._epoch_kwargs())
+            self.stats["sent_bytes"] += sum(c[2] for c in chunks)
+            self.stats["sent_chunks"] += len(chunks)
+            self.stats["sent_batches"] += 1
+            await self.successor.chunks_ready.remote(state.version, chunks, digests, **self._epoch_kwargs())
         except BaseException as error:
             await self._failed(error)
             raise
@@ -482,17 +570,15 @@ class MooncakeRelayNode(CPUWeightRelay):
             if source and self.successor is not None:
                 state.prepare = asyncio.create_task(self._prepare_next(state))
                 destination = await state.prepare
-                for index, entry in enumerate(state.schema):
+                for chunks in self._chunk_batches(state.schema):
                     if destination.get("cached"):
                         break
-                    for offset in range(0, entry["nbytes"], self.chunk_bytes):
-                        size = min(self.chunk_bytes, entry["nbytes"] - offset)
-                        digest = (
-                            await asyncio.to_thread(self._digest, state.buffers[index], offset, size)
-                            if self.verify_checksums
-                            else None
-                        )
-                        await self._forward_chunk(state, None, index, offset, size, digest)
+                    digests = (
+                        await asyncio.to_thread(self._digests, state.buffers, chunks)
+                        if self.verify_checksums
+                        else [None] * len(chunks)
+                    )
+                    await self._forward_chunks(state, None, chunks, digests)
             elif state.tail is not None:
                 await state.tail
             if self.successor is not None:
@@ -575,6 +661,90 @@ class MooncakeRelayNode(CPUWeightRelay):
         return {"quarantined_buffers": len(self.quarantined), "failure": self.failure}
 
 
+class _PinnedWeightExport:
+    """Cast on the source device, then drain bounded asynchronous host copies.
+
+    Copies use the producer's current stream so a generator may safely enqueue
+    subsequent operations there. Retain source and pinned destination storage
+    until that stream completes; Ray must never see an unfinished host buffer.
+    """
+
+    def __init__(self, bucket_size):
+        if bucket_size <= 0:
+            raise ValueError("Export bucket size must be positive")
+        self.bucket_size = bucket_size
+        self.pending = []
+        self.streams = {}
+        self.pending_bytes = self.peak_bytes = self.flushes = 0
+        self.copy_seconds = self.cast_seconds = self.wait_seconds = self.put_seconds = 0.0
+        self.tensors = []
+
+    def append(self, name, tensor):
+        dtype = torch.bfloat16 if tensor.is_floating_point() else tensor.dtype
+        size = tensor.numel() * (2 if tensor.is_floating_point() else tensor.element_size())
+        if size > self.bucket_size:
+            raise ValueError(f"Export tensor {name} exceeds the configured weight-transfer bucket")
+        if self.pending and self.pending_bytes + size > self.bucket_size:
+            self.flush()
+        copying = time.monotonic()
+        casting = time.monotonic()
+        # On Ascend a combined .to(cpu, dtype=bf16) can transfer FP32 and
+        # perform the conversion on the host. Cast before crossing devices.
+        source = tensor.detach().to(dtype=dtype).contiguous()
+        self.cast_seconds += time.monotonic() - casting
+        if source.device.type == "cpu":
+            snapshot = source.clone()
+        else:
+            backend = getattr(torch, source.device.type)
+            stream = backend.current_stream(source.device)
+            snapshot = torch.empty(source.shape, dtype=dtype, device="cpu", pin_memory=True)
+            self.streams[source.device] = stream
+        self.pending.append((name, source, snapshot))
+        self.pending_bytes += size
+        self.peak_bytes = max(self.peak_bytes, self.pending_bytes)
+        if source.device.type != "cpu":
+            snapshot.copy_(source, non_blocking=True)
+        self.copy_seconds += time.monotonic() - copying
+        if self.pending_bytes >= self.bucket_size:
+            self.flush()
+
+    def _synchronize(self):
+        waiting = time.monotonic()
+        for stream in self.streams.values():
+            stream.synchronize()
+        duration = time.monotonic() - waiting
+        self.wait_seconds += duration
+        self.copy_seconds += duration
+        self.streams.clear()
+
+    def flush(self):
+        if not self.pending:
+            return
+        self._synchronize()
+        for name, _source, snapshot in self.pending:
+            putting = time.monotonic()
+            ref = ray.put(snapshot.reshape(-1).view(torch.uint8).numpy())
+            self.put_seconds += time.monotonic() - putting
+            self.tensors.append(
+                {
+                    "name": name,
+                    "shape": tuple(snapshot.shape),
+                    "dtype": str(snapshot.dtype).removeprefix("torch."),
+                    "ref": ref,
+                }
+            )
+        self.flushes += 1
+        self.pending.clear()
+        self.pending_bytes = 0
+
+    def close(self):
+        # Also join copies when the iterator, capacity wait or ray.put raises.
+        # No partial snapshot is published on those paths.
+        self._synchronize()
+        self.pending.clear()
+        self.pending_bytes = 0
+
+
 @CheckpointEngineRegistry.register("mooncake_relay")
 class MooncakeRelayCheckpointEngine(CPUSharedMemoryCheckpointEngine):
     """Actor-to-local-master publication and local-only rollout consumption."""
@@ -596,7 +766,7 @@ class MooncakeRelayCheckpointEngine(CPUSharedMemoryCheckpointEngine):
         if self.relay is None:
             raise RuntimeError("Configure the Mooncake relay before publication")
         started, tensors, nbytes = time.monotonic(), [], 0
-        capacity_seconds = cpu_seconds = put_seconds = iterator_seconds = 0.0
+        capacity_seconds = iterator_seconds = 0.0
         waiting = time.monotonic()
         # Every rank must wait before advancing the collective FSDP iterator;
         # a master-only CPU wait leaves its peers inside HCCL ALLGATHER.
@@ -604,34 +774,27 @@ class MooncakeRelayCheckpointEngine(CPUSharedMemoryCheckpointEngine):
         capacity_seconds += time.monotonic() - waiting
         exporting = previous = time.monotonic()
         export_capacity = 0.0
-        async for name, tensor in ensure_async_iterator(weights):
-            iterator_seconds += time.monotonic() - previous
-            estimate = tensor.numel() * (2 if tensor.is_floating_point() else tensor.element_size())
-            if nbytes + estimate > reservation:
-                waiting = time.monotonic()
-                reservation = await self.relay.wait_for_capacity.remote(global_steps, nbytes + estimate)
-                duration = time.monotonic() - waiting
-                capacity_seconds += duration
-                export_capacity += duration
-            if self.is_master:
-                dtype = torch.bfloat16 if tensor.is_floating_point() else tensor.dtype
-                copying = time.monotonic()
-                snapshot = tensor.detach().to(device="cpu", dtype=dtype).contiguous()
-                payload = snapshot.reshape(-1).view(torch.uint8).numpy()
-                cpu_seconds += time.monotonic() - copying
-                putting = time.monotonic()
-                reference = ray.put(payload)
-                put_seconds += time.monotonic() - putting
-                tensors.append(
-                    {
-                        "name": name,
-                        "shape": tuple(snapshot.shape),
-                        "dtype": str(dtype).removeprefix("torch."),
-                        "ref": reference,
-                    }
-                )
-            nbytes += estimate
-            previous = time.monotonic()
+        exporter = _PinnedWeightExport(self.bucket_size) if self.is_master else None
+        try:
+            async for name, tensor in ensure_async_iterator(weights):
+                iterator_seconds += time.monotonic() - previous
+                estimate = tensor.numel() * (2 if tensor.is_floating_point() else tensor.element_size())
+                if nbytes + estimate > reservation:
+                    waiting = time.monotonic()
+                    reservation = await self.relay.wait_for_capacity.remote(global_steps, nbytes + estimate)
+                    duration = time.monotonic() - waiting
+                    capacity_seconds += duration
+                    export_capacity += duration
+                if exporter is not None:
+                    exporter.append(name, tensor)
+                nbytes += estimate
+                previous = time.monotonic()
+            if exporter is not None:
+                exporter.flush()
+                tensors = exporter.tensors
+        finally:
+            if exporter is not None:
+                exporter.close()
         if not self.is_master:
             return {}
         export_seconds = time.monotonic() - exporting - export_capacity
@@ -645,8 +808,12 @@ class MooncakeRelayCheckpointEngine(CPUSharedMemoryCheckpointEngine):
             "laminar/publish_capacity_seconds": capacity_seconds,
             "laminar/publish_export_seconds": export_seconds,
             "laminar/publish_iterator_seconds": iterator_seconds,
-            "laminar/publish_cpu_copy_seconds": cpu_seconds,
-            "laminar/publish_ray_put_seconds": put_seconds,
+            "laminar/publish_cpu_copy_seconds": exporter.copy_seconds,
+            "laminar/publish_device_cast_seconds": exporter.cast_seconds,
+            "laminar/publish_copy_wait_seconds": exporter.wait_seconds,
+            "laminar/publish_staging_peak_bytes": exporter.peak_bytes,
+            "laminar/publish_staging_flushes": exporter.flushes,
+            "laminar/publish_ray_put_seconds": exporter.put_seconds,
             "laminar/publish_relay_seconds": time.monotonic() - committing,
             "laminar/publish_tensors": len(tensors),
         }

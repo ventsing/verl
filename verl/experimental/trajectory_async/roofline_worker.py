@@ -63,7 +63,7 @@ class DecodeStepProbe:
             raise ValueError("Roofline requires a nonnegative policy version")
         self.version = version
         self.versions.add(version)
-        if len(self.versions) > self.config.calibration_rounds:
+        if not self.config.continuous_sampling and len(self.versions) > self.config.calibration_rounds:
             self.enabled = False
 
     def fail(self, error):
@@ -362,7 +362,9 @@ def set_decode_probe_sampling(worker, enabled, fresh_measurement=False):
     if fresh_measurement:
         if probe.pending or probe.samples:
             raise RuntimeError("Drain the previous measurement before starting another")
-        if probe.error or len(probe.versions) > probe.config.calibration_rounds:
+        if probe.error or (
+            not probe.config.continuous_sampling and len(probe.versions) > probe.config.calibration_rounds
+        ):
             raise RuntimeError("Cannot restart a failed or version-expired probe")
         probe.bins.clear()
         probe.coverage_attempts.clear()

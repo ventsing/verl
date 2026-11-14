@@ -493,3 +493,188 @@ def test_receive_budget_reserves_native_buffer_and_imminent_ray_copy():
             await close(nodes, engines)
 
     asyncio.run(scenario())
+
+
+def test_ascend_transport_pins_sources_and_receivers_and_binds_threads(monkeypatch):
+    bindings, allocations = [], []
+    real_empty = torch.empty
+
+    def bind(self):
+        if self.protocol == "ascend":
+            bindings.append(threading.get_ident())
+
+    def pinned_empty(*args, **kwargs):
+        if kwargs.pop("pin_memory", False):
+            allocations.append(args[0])
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(module.MooncakeTransport, "_bind_device", bind)
+    monkeypatch.setattr(module.torch, "empty", pinned_empty)
+
+    async def scenario():
+        engines = [NativeCopy(), NativeCopy()]
+        nodes = [
+            module.MooncakeRelayNode(node_id=node, host="127.0.0.1", engine=engine, protocol="ascend", chunk_bytes=8)
+            for node, engine in zip(["a", "b"], engines, strict=True)
+        ]
+        nodes[0].configure_successor(Remote(nodes[1]))
+        source = manifest(0)
+        try:
+            await nodes[0].commit(source)
+            await nodes[0].wait_distributed(0)
+            for node in nodes:
+                view = await node.acquire(0)
+                for expected, actual in zip(source["tensors"], view["tensors"], strict=True):
+                    np.testing.assert_array_equal(expected["ref"], actual["ref"])
+                node.release(view["lease"])
+            assert len(allocations) == 2 * len(source["tensors"])
+            assert any(thread != threading.get_ident() for thread in bindings)
+        finally:
+            await close(nodes, engines)
+
+    asyncio.run(scenario())
+
+
+def test_export_snapshots_survive_generator_storage_reuse_and_preserve_types():
+    exporter = module._PinnedWeightExport(32)
+    source = torch.arange(24, dtype=torch.float32).reshape(4, 6)[:, ::2]
+    expected = source.to(torch.bfloat16).clone()
+    exporter.append("strided", source)
+    source.fill_(-99)  # A producer may reuse its storage after yielding.
+    exporter.append("scalar", torch.tensor(17, dtype=torch.int64))
+    exporter.append("empty", torch.empty(0))
+    exporter.flush()
+    exporter.close()
+    restored = [
+        torch.tensor(e["ref"]).view(getattr(torch, e["dtype"])).reshape(e["shape"]) for e in exporter.tensors[:2]
+    ]
+    torch.testing.assert_close(restored[0], expected, rtol=0, atol=0)
+    assert restored[1].item() == 17 and restored[1].dtype == torch.int64
+    assert exporter.tensors[2]["shape"] == (0,)
+    assert exporter.tensors[2]["ref"].nbytes == 0
+    assert exporter.tensors[2]["dtype"] == "bfloat16"
+    assert exporter.peak_bytes <= 32
+
+
+def test_failed_export_never_commits_partial_weight_version():
+    class Relay:
+        def __init__(self):
+            self.commits = []
+
+        def wait_for_capacity(self, *args):
+            return 1024
+
+        def commit(self, manifest):
+            self.commits.append(manifest)
+
+    def broken_iterator():
+        yield "first", torch.arange(16, dtype=torch.float32)
+        raise RuntimeError("producer failed")
+
+    async def scenario():
+        relay = Relay()
+        engine = module.MooncakeRelayCheckpointEngine(bucket_size=32, is_master=True)
+        engine.relay = Remote(relay)
+        with pytest.raises(RuntimeError, match="producer failed"):
+            await engine.send_weights(broken_iterator(), global_steps=4)
+        assert not relay.commits
+
+    asyncio.run(scenario())
+
+
+def test_oversized_export_is_rejected_before_host_staging():
+    exporter = module._PinnedWeightExport(8)
+    with pytest.raises(ValueError, match="exceeds the configured"):
+        exporter.append("too_large", torch.ones(16))
+    assert not exporter.pending and exporter.peak_bytes == 0
+
+
+def test_native_batches_combine_small_tensors_and_keep_exact_snapshots():
+    async def scenario():
+        nodes, engines = chain(3)
+        for node in nodes:
+            node.chunk_bytes = 128
+        batch_calls = []
+        for engine in engines:
+
+            def batch_write(session, sources, destinations, sizes, engine=engine):
+                batch_calls.append(len(sizes))
+                for source, destination, size in zip(sources, destinations, sizes, strict=True):
+                    engine.transfer_sync_write(session, source, destination, size)
+                return 0
+
+            engine.batch_transfer_sync_write = batch_write
+        tensors = []
+        for i in range(14):
+            raw = np.array([i], dtype=np.int32).view(np.uint8)
+            tensors.append({"name": f"n{i}", "shape": (1,), "dtype": "int32", "ref": raw})
+        source = {"version": 0, "node_id": "a", "tensors": tensors, "nbytes": 56}
+        try:
+            await nodes[0].commit(source)
+            await nodes[0].wait_distributed(0)
+            assert batch_calls == [14, 14]
+            for node in nodes:
+                view = await node.acquire(0)
+                for actual, expected in zip(view["tensors"], tensors, strict=True):
+                    np.testing.assert_array_equal(actual["ref"], expected["ref"])
+                node.release(view["lease"])
+            assert nodes[0].stats["sent_batches"] == nodes[1].stats["sent_batches"] == 1
+        finally:
+            await close(nodes, engines)
+
+    asyncio.run(scenario())
+
+
+def test_corrupt_batch_does_not_acknowledge_earlier_valid_chunks():
+    async def scenario():
+        nodes, engines = chain(1)
+        node = nodes[0]
+        schema = [{"name": name, "shape": (1,), "dtype": "int32", "nbytes": 4} for name in ["a", "b"]]
+        try:
+            await node.begin(0, schema)
+            state = node.transfers[0]
+            digests = [node._digest(buffer, 0, 4) for buffer in state.buffers]
+            with pytest.raises(RuntimeError, match="checksum mismatch"):
+                await node.chunks_ready(0, [(0, 0, 4), (1, 0, 4)], [digests[0], "corrupt"])
+            assert state.received == [0, 0]
+            assert node.latest is None
+        finally:
+            await close(nodes, engines)
+
+    asyncio.run(scenario())
+
+
+def test_host_preparation_keeps_heartbeat_live_and_joins_before_cancel(monkeypatch):
+    async def scenario():
+        nodes, engines = chain(1, max_bytes=128)
+        node = nodes[0]
+        entered, gate = threading.Event(), threading.Event()
+        original = node._allocate_buffers
+
+        def blocked(*args):
+            buffers = original(*args)
+            entered.set()
+            assert gate.wait(5)
+            return buffers
+
+        monkeypatch.setattr(node, "_allocate_buffers", blocked)
+        schema = [{"name": "x", "shape": (16,), "dtype": "float32", "nbytes": 64}]
+        task = asyncio.create_task(node.begin(0, schema))
+        try:
+            await wait_for_thread(entered)
+            assert node.health()  # Event loop runs while host preparation is blocked.
+            assert node.resident_bytes() == 128  # Includes the future Ray snapshot.
+            assert not engines[0].memory
+            task.cancel()
+            await asyncio.sleep(0.02)
+            assert not task.done(), "cancellation must join the allocation thread"
+            gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not node.transfers and not engines[0].memory
+        finally:
+            gate.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await close(nodes, engines)
+
+    asyncio.run(scenario())

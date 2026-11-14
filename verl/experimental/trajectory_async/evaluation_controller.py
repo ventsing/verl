@@ -102,7 +102,7 @@ class EvaluationController(LaminarController):
             self.request_versions.pop(request_id, None)
             self.wakeup.set()
 
-    async def _assign(self, request_id, is_validation=False):
+    async def _assign(self, request_id, is_validation=False, prompt_tokens=0, response_budget=0):
         version = self.request_versions[request_id]
         async with self.condition:
             while True:
@@ -121,9 +121,10 @@ class EvaluationController(LaminarController):
                     and r.version == version
                     and r.load < self._admission_limit(i)
                 ]
-                if available:
-                    index = min(available, key=lambda i: self.replicas[i].load)
-                    request = Request(request_id, index, version)
+                request = Request(request_id, -1, version, prompt_tokens=prompt_tokens, response_budget=response_budget)
+                index = self._select_admission(available, request)
+                if index is not None:
+                    request.slot = index
                     self.replicas[index].active[request_id] = request
                     return request
                 await self.condition.wait()

@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Mapping
 from functools import partial
@@ -1009,6 +1010,7 @@ class vLLMHttpServer:
         roofline = getattr(self, "_roofline_status", {"available": False})
         return {
             **self._trajectory_stats,
+            "sampled_at": time.time(),
             "roofline": roofline,
             "version": self.global_steps,
             "request_ids": [s.external_req_id for s in self.engine.output_processor.request_states.values()],

@@ -23,7 +23,9 @@ flowchart LR
   并用硬节点亲和性放置；同节点的多个副本共享一个 relay。
 - actor 到 master 的快照在同节点 Ray object store 中传递。跨节点 RPC 只传
   元数据、地址、摘要和完成通知，权重数据由 Mooncake 传输。
-- 默认分块为 64 MiB。中间 relay 收到一个块并校验后即可转发，无须等完整版本
+- 默认每批最多 64 MiB、64 个块。小张量共用一次原生 batch write 和一次
+  接收确认；每块仍独立校验，整批校验通过后才确认接收进度。中间 relay 可转发
+  已校验的批次，无须等完整版本
   收齐；不同版本按顺序传播。默认至多两个待传播版本，超出后出版端施加背压。
 - master 本地版本提交后，actor 可以继续训练，不等待广播完成或所有 rollout 拉取。
   该承诺不消除 master 本地 staging 的耗时，也不取消传播积压时的背压。
@@ -36,19 +38,44 @@ flowchart LR
 - 每条生成轨迹继续固定 policy version，old_log_probs 继续沿用实际 vLLM behavior
   logprob；轨迹迁移机制仍然是同版本 abort + prefix re-prefill。
 
-RDMA 内存注册由 Mooncake 负责；这里没有实现独立的 Torch pinned-memory slab
-分配器，也没有 relay 侧 TP 预重分片。下游 vLLM 仍按原接口加载完整命名张量。
+内存注册由 Mooncake 负责；Ascend 模式使用 Torch pinned-memory 分配，
+没有独立 slab 分配器或 relay 侧 TP 预重分片。下游 vLLM 仍按原接口加载完整命名张量。
+
+## 权重导出
+
+发布端先在源设备把浮点参数转换为 BF16，再异步复制到 CPU 锁页内存。
+避免将精度转换与设备迁移合并在一次 `.to(cpu, dtype=bf16)` 调用中；
+部分 Ascend/PyTorch 组合会因此在主机端执行转换，显著增加导出耗时。
+临时快照按 `update_weights_bucket_megabytes` 分批，每批复制完成后才交给
+Ray，源张量和锁页缓冲区在同步完成前保持存活；失败时也先等待复制结束。
+单张量超过 bucket 会在导出时直接报错。
+relay 侧锁页缓冲区的分配和复制在后台线程完成，提前计入容量预算；
+准备新版本时，事件循环仍可处理旧版本请求和心跳，取消时等待后台操作结束。
+
+数据仍经过 CPU 版本快照；这项优化不把分层 CPU relay 改成 NPU 到 NPU 直传。
+版本、读租约、原子发布和 SHA256 校验保持相同语义。
+`publish_cpu_copy_seconds` 包括源设备转换、主机分配、入队和等待复制；
+`publish_device_cast_seconds` 记录转换入队时间，`publish_copy_wait_seconds`
+记录批次等待时间，二者不代表独立的设备执行耗时。另有
+`publish_staging_peak_bytes` 和 `publish_staging_flushes` 记录临时快照峰值与批次数。
 
 ## 依赖与配置
 
 所有 relay 节点需要可用于 **CPU host-memory** 传输的 Mooncake。协议明确配置为
-`rdma` 或 `tcp`；默认 `rdma`，失败时不会静默切换成 TCP。
+`rdma`、`tcp` 或 `ascend`；默认 `rdma`，失败时不会静默切换成 TCP。
 RDMA 模式要求节点具备可用设备及匹配的网络配置。TCP 可用于数据路径正确性测试。
 
 部分 Ascend 版 Mooncake 即使选择 TCP，也会在初始化时自动建立设备 transport，
 而普通上游 CUDA wheel 在纯 Ascend 环境可能因缺少 libcuda/libcudart 无法导入。
 可以通过 `trainer.v1.laminar.mooncake.runtime_env.env_vars` 仅为 relay actor 提供
 隔离的 CPU 版本，保留训练/vLLM 的 Ascend 环境。
+
+Ascend ADXL 模式设置 `trainer.v1.laminar.mooncake.protocol=ascend`。
+该模式在每个执行原生调用的线程绑定 NPU 上下文，使用锁页 host-memory
+收发缓冲区；普通 NumPy 内存可能注册成功、却在跨节点建链时失败。
+`device_name` 在此模式下为本进程可见的 NPU 索引，空字符串使用 `0`。
+relay 虽然保存 CPU 权重，仍需要对应 NPU 的访问权限和上下文内存。
+上游 Ray 快照会复制到锁页内存，接收端也会复制回 Ray 快照。
 
 当前配置：
 
@@ -181,3 +208,25 @@ partial_store.persist_to_disk 也默认 false。内存 catalog/partial-store 丢
 同 schema、同一组不可变 Ray ObjectRef 复用本地验证结果，避免重复扫描全模型。
 新增导出、CPU 拷贝、Ray put、catalog/native/endpoint 分阶段计时。配置、验证边界和
 实测结果见 [WEIGHT_PUBLICATION.md](WEIGHT_PUBLICATION.md)。
+
+## 周期与最终评测
+
+独立评测使用 `data.val_files` 作为常规数据集；
+`trainer.v1.laminar.evaluation.final_val_files` 可配置最终版本的数据集。
+最终版本在私有评测视图中加载该数据集，保留常规训练视图和其他评测任务的数据集。
+设为 null 时，最终评测继续使用 `data.val_files`。
+
+例如常规只评测 MATH-500，训练结束评测 MATH-lighteval：
+
+```text
+data.val_files=['/datasets/math500_test.parquet']
+trainer.test_freq=10
+trainer.v1.laminar.evaluation.final_val_files=['/datasets/math_lighteval_test.parquet']
+trainer.v1.laminar.evaluation.max_concurrent_versions=3
+trainer.v1.laminar.evaluation.overflow_policy=block
+```
+
+`block` 在三个评测任务满载时等待任意一个任务完成，再提交当前触发版本；
+其余任务继续运行，不合并或丢弃待评版本。训练会在评测触发点承受背压。
+默认 `latest` 仍保留最多一个最新待评版本，`skip` 则跳过满载时的触发版本。
+`trainer.test_freq=-1` 会同时跳过周期和最终评测，适用于只验证训练链路的短跑。

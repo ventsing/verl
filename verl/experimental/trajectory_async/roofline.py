@@ -20,6 +20,7 @@ import numpy as np
 class RooflineConfig:
     enabled: bool = True
     calibration_rounds: int = 3
+    continuous_sampling: bool = False
     sample_every: int = 8
     coverage_sample_every: int = 1
     warmup_per_shape: int = 2
@@ -42,6 +43,8 @@ class RooflineConfig:
     fit_interval_s: float = 10.0
 
     def __post_init__(self):
+        if type(self.continuous_sampling) is not bool:
+            raise ValueError("continuous_sampling must be boolean")
         positive = (
             "calibration_rounds",
             "sample_every",

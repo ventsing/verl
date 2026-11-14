@@ -57,6 +57,11 @@ class Request:
     destination: int | None = None
     migrations: int = 0
     recoveries: int = 0
+    prompt_tokens: int = 0
+    response_budget: int = 0
+    generated_tokens: int = 0
+    generated_base: int = 0
+    last_pressure_migration: float = -math.inf
 
 
 def consolidation_plan(snapshots, max_requests, capacity=0.9, request_limit=None, usage_projection=None):
@@ -149,12 +154,24 @@ class LaminarController:
 
             self.roofline = {i: OnlineRoofline(roofline_options) for i in range(len(replicas))}
         self.capacity = {}
-        if self.roofline and capacity_options and capacity_options.get("enabled", False):
+        self._budget_cache = {}
+        if (
+            capacity_options
+            and capacity_options.get("enabled", False)
+            and (self.roofline or capacity_options.get("token_budget_admission", False))
+        ):
             from verl.experimental.trajectory_async.capacity import OnlineCapacity
 
             self.capacity = {
                 i: OnlineCapacity(batch_quota, self.max_running, capacity_options) for i in range(len(replicas))
             }
+        if self.capacity:
+            shared = next(iter(self.capacity.values())).responses
+            for governor in self.capacity.values():
+                governor.responses = shared
+            history_path = next(iter(self.capacity.values())).config.response_history_path
+            if history_path and next(iter(self.capacity.values())).config.token_budget_admission:
+                shared.seed(history_path)
         for index, profile in enumerate(capacity_profiles or []):
             if index in self.capacity and profile and profile.get("available"):
                 governor = self.capacity[index]
@@ -163,7 +180,14 @@ class LaminarController:
                     raise ValueError("Initial KV/SSM pool cannot fit one request within its safety margin")
                 governor.current = min(governor.current, governor.memory_limit())
                 governor.reason = "profiled_initial_pool"
+        if any(g.config.token_budget_admission and not g.pool.get("available") for g in self.capacity.values()):
+            raise ValueError("Token-budget admission requires an actual profiled KV pool before startup")
         self.check_interval = check_interval_s
+        if any(
+            g.config.rolling_kv_enabled and g.config.rolling_kv_horizon_s < 2 * check_interval_s
+            for g in self.capacity.values()
+        ):
+            raise ValueError("Rolling KV horizon must cover at least two telemetry polling intervals")
         self.enable_repack = enable_repack
         self.latest = -1
         self.minimum_version = -1
@@ -465,6 +489,8 @@ class LaminarController:
             )
             await asyncio.gather(*[worker.update_weights.remote(global_steps=version) for worker in replica.workers])
             replica.version = version
+            if self._continuous_admission(index):
+                self.capacity[index].reset_observation()
             replica.admitted = 0
             replica.previous_usage = 0.0
             replica.ramp_down = False
@@ -505,7 +531,92 @@ class LaminarController:
                     replica.pulling = False
                     self.condition.notify_all()
 
-    async def _assign(self, request_id, is_validation=False):
+    def _continuous_admission(self, index):
+        return index in self.capacity and self.capacity[index].token_budget_enabled()
+
+    def _admission_projection(self, index, request=None):
+        governor = self.capacity.get(index)
+        if governor is None or not governor.token_budget_enabled():
+            return None
+        replica = self.replicas[index]
+        reserved = {
+            q.request_id: q for r in self.replicas for q in r.active.values() if q.request_id in replica.reserved
+        }
+        if len(reserved) != len(replica.reserved):
+            return math.inf  # Unknown migration arrivals cannot spend free KV.
+        now = time.time()
+
+        def signature(q):
+            return (
+                q.request_id,
+                q.backend_id,
+                q.prompt_tokens,
+                q.response_budget,
+                q.generated_tokens,
+                q.generated_base,
+            )
+
+        # Thousands of condition waiters can retry against exactly the same
+        # ledger. Cache only its existing-reservation sum, never an incoming
+        # request's cost. Identity, progress, arrivals, history and freshness
+        # all invalidate it, including expiry without a new telemetry tick.
+        key = (
+            id(governor.pool),
+            governor.profile_available,
+            governor.last_observed,
+            governor.observed_usage,
+            governor.fresh(now),
+            governor.responses.revision,
+            governor.rate_revision,
+            governor.config.rolling_kv_enabled,
+            int(max(0, now - governor.last_observed)) if math.isfinite(governor.last_observed) else -1,
+            tuple(signature(q) for q in replica.active.values()),
+            tuple(signature(q) for q in reserved.values()),
+        )
+        cached = self._budget_cache.get(index)
+        if cached is None or cached[0] != key:
+            base = governor.reserved_usage(list(replica.active.values()), list(reserved.values()), now)
+            self._budget_cache[index] = (key, base)
+        else:
+            base = cached[1]
+        if request is None or base is None:
+            return base
+        return base + governor.request_reserve(request, now, incoming=True, version=replica.version)
+
+    def _select_admission(self, available, request):
+        scores = {}
+        for index in available:
+            if index in self.capacity and self.capacity[index].pressure_paused:
+                continue
+            projected = self._admission_projection(index, request)
+            if projected is None:
+                scores[index] = (self.replicas[index].load, self.replicas[index].load)
+            elif projected <= self.capacity[index].config.kv_usage_limit:
+                scores[index] = (projected, self.replicas[index].load)
+        return min(scores, key=scores.get) if scores else None
+
+    def _reserved_usage_status(self, index):
+        projection = self._admission_projection(index)
+        return projection if projection is not None and math.isfinite(projection) else None
+
+    def calibrate_response_lengths(self, step, records):
+        """Calibrate once per consumed batch, preserving completion-history counts."""
+        if not self.capacity:
+            return {"updated": False}
+        estimator = next(iter(self.capacity.values())).responses
+        if not getattr(estimator.config, "response_step_calibration", False):
+            return {"updated": False}
+        updated = estimator.calibrate(step, records)
+        if updated:
+            self._budget_cache.clear()
+            self._event("response_length_calibration", step=step, records=len(records), **estimator.status())
+        return {"updated": updated, **estimator.status()}
+
+    def _observe_response(self, tokens, is_probe=False):
+        if self.capacity and not is_probe:
+            next(iter(self.capacity.values())).responses.observe(tokens)
+
+    async def _assign(self, request_id, is_validation=False, prompt_tokens=0, response_budget=0):
         async with self.condition:
             while True:
                 self._check()
@@ -526,15 +637,18 @@ class LaminarController:
                     and not r.pulling
                     and r.load < self._admission_limit(i)
                     and r.version >= required_version
-                    and r.admitted < self._admission_limit(i)
+                    and (self._continuous_admission(i) or r.admitted < self._admission_limit(i))
                 ]
-                if available:
-                    index = min(available, key=lambda i: self.replicas[i].load)
+                request = Request(request_id, -1, -1, prompt_tokens=prompt_tokens, response_budget=response_budget)
+                index = self._select_admission(available, request)
+                if index is not None:
                     replica = self.replicas[index]
-                    request = Request(request_id, index, replica.version)
+                    request.slot, request.version = index, replica.version
                     replica.active[request_id] = request
                     replica.admitted += 1
-                    replica.closed = replica.admitted >= self._admission_limit(index)
+                    replica.closed = not self._continuous_admission(
+                        index
+                    ) and replica.admitted >= self._admission_limit(index)
                     return request
                 await self.condition.wait()
 
@@ -559,7 +673,9 @@ class LaminarController:
         started = time.monotonic()
         self.request_tasks[request_id] = asyncio.current_task()
         try:
-            request = await self._assign(request_id, is_validation=is_validation)
+            request = await self._assign(
+                request_id, is_validation=is_validation, prompt_tokens=len(prompt_ids), response_budget=budget
+            )
             is_probe = request_id.startswith("preflight-")
             self._event(
                 "request_begin", request=request_id, replica=request.slot, version=request.version, is_probe=is_probe
@@ -569,6 +685,8 @@ class LaminarController:
                 if replica.version != request.version or replica.pulling:
                     raise RuntimeError("In-flight trajectory policy version changed")
                 request.backend_id = f"laminar-{request_id}-{uuid4().hex}"
+                request.generated_base = len(tokens)
+                request.generated_tokens = len(tokens)
                 output = await replica.server.generate.remote(
                     request_id=request.backend_id,
                     prompt_ids=list(prompt_ids) + tokens,
@@ -583,6 +701,7 @@ class LaminarController:
                 if not all(math.isfinite(value) for value in output.log_probs):
                     raise RuntimeError("Non-finite behavior log probability")
                 tokens.extend(output.token_ids)
+                request.generated_tokens = len(tokens)
                 logprobs.extend(output.log_probs)
                 if len(tokens) > budget:
                     raise RuntimeError("Backend exceeded the remaining trajectory budget")
@@ -598,6 +717,7 @@ class LaminarController:
                     experts.append(output.routed_experts)
                 if output.stop_reason not in ("aborted", "abort") or len(tokens) == budget:
                     self.metrics["preflight_completed" if is_probe else "completed"] += 1
+                    self._observe_response(len(tokens), is_probe)
                     self._event(
                         "request_end",
                         request=request_id,
@@ -830,13 +950,18 @@ class LaminarController:
                     state["version"],
                     migrations=state["extra_fields"].get("migrations", 0),
                     recoveries=state["extra_fields"].get("recoveries", 0),
+                    prompt_tokens=len(prompt_ids),
+                    response_budget=budget,
+                    generated_tokens=len(state["token_ids"]),
                 )
                 # There is no live source on a reattach; fence any previous writer.
                 await self.partial_store.fence.remote(request_id)
                 request.slot = 0
                 await self._recover_slot(request)
             else:
-                request = await self._assign(request_id, is_validation=is_validation)
+                request = await self._assign(
+                    request_id, is_validation=is_validation, prompt_tokens=len(prompt_ids), response_budget=budget
+                )
                 await self._retain_version(request.version)
                 state = await self.partial_store.create.remote(request_id, prompt_ids, params, budget, request.version)
             is_probe = request_id.startswith("preflight-")
@@ -858,6 +983,7 @@ class LaminarController:
                 attempt = await self.partial_store.begin_attempt.remote(request_id, uuid4().hex)
                 request.backend_id = f"laminar-{request_id}-{uuid4().hex}"
                 base = len(state["token_ids"])
+                request.generated_base = request.generated_tokens = base
                 context = {
                     **attempt,
                     "store": self.partial_store,
@@ -938,6 +1064,7 @@ class LaminarController:
                     self.wakeup.set()
                     self.condition.notify_all()
             self.metrics["preflight_completed" if is_probe else "completed"] += 1
+            self._observe_response(len(state["token_ids"]), is_probe)
             self._event(
                 "request_end",
                 request=request_id,
@@ -1105,6 +1232,31 @@ class LaminarController:
             if governor.update(telemetry[index], self.roofline.get(index), time.time()):
                 self._event("capacity_update", replica=index, **governor.status())
             replica = self.replicas[index]
+            if (
+                governor.token_budget_enabled()
+                and not replica.load
+                and not replica.pulling
+                and not telemetry[index].get("request_ids")
+                and telemetry[index].get("version", replica.version) == replica.version
+                and not governor.fresh(time.time())
+            ):
+                governor.reset_observation(telemetry[index].get("roofline", {}).get("capacity"))
+            for request in replica.active.values():
+                generated = governor.generated_tokens.get(request.backend_id, 0)
+                request.generated_tokens = max(request.generated_tokens, request.generated_base + generated)
+            was_paused = governor.pressure_paused
+            governor.update_pressure(self._admission_projection(index), time.time())
+            if governor.pressure_paused != was_paused:
+                self._event(
+                    "kv_pressure_admission",
+                    replica=index,
+                    paused=governor.pressure_paused,
+                    kv_usage=governor.observed_usage,
+                    predicted_kv_usage=self._reserved_usage_status(index),
+                )
+            continuous = self._continuous_admission(index)
+            if continuous and replica.version == self.latest:
+                replica.ramp_down = False
             # Exploration only tops up the current version's batch. A newer
             # actor version, migration reservations or drain operations win.
             if (
@@ -1116,11 +1268,14 @@ class LaminarController:
                 and not replica.reserved
                 and not any(q.destination is not None for q in replica.active.values())
                 and replica.version == self.latest
-                and replica.admitted < governor.limit()
+                and (continuous or replica.admitted < governor.limit())
                 and not replica.ramp_down
-                and telemetry[index].get("kv_usage", 0) >= replica.previous_usage
+                and not governor.pressure_paused
+                and (continuous or telemetry[index].get("kv_usage", 0) >= replica.previous_usage)
             ):
                 replica.closed = False
+            if governor.pressure_paused:
+                replica.closed = True
         if self.capacity:
             async with self.condition:
                 self.condition.notify_all()
@@ -1141,10 +1296,12 @@ class LaminarController:
                 "repack_limit": self._repack_limit(index, telemetry),
                 "admission_limit": self._admission_limit(index),
                 "capacity": self.capacity[index].status() if index in self.capacity else {"enabled": False},
+                "predicted_kv_usage": self._reserved_usage_status(index),
                 "roofline": {k: v for k, v in data.get("roofline", {}).items() if k != "samples"},
             }
             for index, (replica, data) in enumerate(zip(self.replicas, telemetry, strict=True))
         ]
+        moves = self._reserve_pressure_moves(telemetry) if perform_moves else []
         groups = {}
         for index, (replica, data) in enumerate(zip(self.replicas, telemetry, strict=True)):
             usage = data["kv_usage"]
@@ -1166,12 +1323,14 @@ class LaminarController:
                 and replica.healthy
                 and not replica.recovering
                 and replica.closed
+                and not (self._continuous_admission(index) and replica.version == self.latest)
                 and not replica.pulling
                 and not replica.reserved
                 and ready
                 and 0 < replica.load < self.max_running
                 and data["waiting"] == 0
                 and replica.ramp_down
+                and not (index in self.capacity and self.capacity[index].pressure_paused)
                 and 0 < usage < capacity_limit
                 and time.time() - data["observed_at"] < 2 * self.check_interval
             ):
@@ -1186,9 +1345,16 @@ class LaminarController:
         self._event("replica_snapshot", latest=self.latest, replicas=self.last_telemetry)
         if not perform_moves:
             return 0  # Keep identical calibration telemetry in repack-off A/B runs.
-        moves = []
         # No await during reservations: admission/completion cannot interleave.
         for group in groups.values():
+            if all(self._continuous_admission(row["id"]) for row in group):
+                plan = self._plan_request_consolidation(group, telemetry)
+                for source, target, request in plan:
+                    self.replicas[target].closed = True
+                    request.destination = target
+                    self.replicas[target].reserved.add(request.request_id)
+                    moves.append((source, request, request.backend_id))
+                continue
             for source, target in consolidation_plan(
                 group,
                 self.repack_max_running,
@@ -1207,6 +1373,156 @@ class LaminarController:
                     destination.reserved.add(request.request_id)
                     moves.append((source, request, request.backend_id))
         return await self._execute_moves(moves)
+
+    def _reserve_pressure_moves(self, telemetry):
+        """Reserve bounded partial evacuations before any abort RPC is issued.
+
+        Unlike consolidation this does not require a draining/closed batch.
+        A pressured instance may have no safe peer: it stays admission-paused.
+        """
+        now = time.time()
+        moves = []
+        for source, governor in self.capacity.items():
+            src = self.replicas[source]
+            if not (
+                governor.config.rolling_kv_enabled
+                and governor.pressure_paused
+                and governor.fresh(now)
+                and src.owned
+                and src.healthy
+                and not src.pulling
+                and not src.recovering
+                and not src.reserved
+            ):
+                continue
+            projected = self._admission_projection(source)
+            if projected is None or not math.isfinite(projected):
+                continue
+            actual = governor.observed_usage
+            moved = 0
+            for request in sorted(
+                src.active.values(), key=lambda q: q.prompt_tokens + q.generated_tokens, reverse=True
+            ):
+                if (
+                    request.destination is not None
+                    or request.backend_id not in governor.backend_ids
+                    or now - getattr(request, "last_pressure_migration", -math.inf)
+                    < governor.config.rolling_kv_migration_cooldown_s
+                ):
+                    continue
+                fits = []
+                for target, peer in self.capacity.items():
+                    if (
+                        target == source
+                        or not peer.config.rolling_kv_enabled
+                        or peer.pressure_paused
+                        or not peer.fresh(now)
+                        or not self._migration_target_available(target, src.version)
+                    ):
+                        continue
+                    dst = self.replicas[target]
+                    context = max(
+                        telemetry[source].get("roofline", {}).get("max_context_tokens", 0),
+                        telemetry[target].get("roofline", {}).get("max_context_tokens", 0),
+                    )
+                    if dst.load + 1 > min(
+                        self._admission_limit(target), self._repack_limit(target, telemetry, context)
+                    ):
+                        continue
+                    base = self._admission_projection(target)
+                    cost = peer.request_reserve(request, now, incoming=True)
+                    if (
+                        base is not None
+                        and math.isfinite(base)
+                        and base + cost < peer.config.rolling_kv_pressure_threshold
+                    ):
+                        fits.append((base + cost, target))
+                if not fits:
+                    continue
+                target_usage, target = min(fits)
+                self.replicas[target].closed = True
+                self.replicas[target].reserved.add(request.request_id)
+                request.destination = target
+                request.last_pressure_migration = now
+                moves.append((source, request, request.backend_id))
+                # Only credit prefix pages already visible on the source, never
+                # forecasted completions. Source remains paused until telemetry
+                # confirms the actual reclamation on a subsequent poll.
+                visible = governor.generated_tokens.get(request.backend_id, 0)
+                released = governor.fraction_for_tokens(request.prompt_tokens + request.generated_base + visible)
+                projected -= released + governor.request_reserve(request, now)
+                actual -= released
+                moved += 1
+                self._event(
+                    "pressure_migration_reserved",
+                    source=source,
+                    destination=target,
+                    request=request.request_id,
+                    version=request.version,
+                    source_kv=governor.observed_usage,
+                    target_projected_kv=target_usage,
+                )
+                if moved >= governor.config.rolling_kv_max_moves or (
+                    actual <= governor.config.rolling_kv_resume_threshold
+                    and projected < governor.config.rolling_kv_pressure_threshold
+                ):
+                    break
+        return moves
+
+    def _plan_request_consolidation(self, group, telemetry):
+        """Drain complete sources across same-version targets using request KV budgets.
+
+        Plan against a private ledger first: a source that cannot be fully drained
+        contributes no migrations or reservations. Recipients never become sources
+        in the same round, and every target includes all earlier planned arrivals.
+        """
+        now = time.time()
+        rows = {row["id"]: row for row in group}
+        arrivals = {index: [] for index in rows}
+        contexts = {index: row["context_tokens"] for index, row in rows.items()}
+        emptied, recipients, plan = set(), set(), []
+        for source in sorted(rows, key=lambda index: (rows[index]["count"], rows[index]["usage"])):
+            if source in emptied or source in recipients:
+                continue
+            requests = list(self.replicas[source].active.values())
+            # Place expensive prefixes first to reduce fragmentation.
+            requests.sort(key=lambda q: q.prompt_tokens + q.generated_tokens, reverse=True)
+            trial = {index: list(pending) for index, pending in arrivals.items()}
+            trial_contexts = dict(contexts)
+            assignments = []
+            for request in requests:
+                fits = []
+                for target in rows:
+                    if target == source or target in emptied or self.replicas[target].releasing:
+                        continue
+                    if self.replicas[target].version != self.replicas[source].version:
+                        continue
+                    governor = self.capacity[target]
+                    context = max(trial_contexts[target], contexts[source])
+                    count = self.replicas[target].load + len(trial[target]) + 1
+                    if count > self._repack_limit(target, telemetry, context):
+                        continue
+                    base = self._admission_projection(target)
+                    if base is None or not math.isfinite(base):
+                        continue
+                    projected = base + sum(
+                        governor.request_reserve(q, now, incoming=True) for q in trial[target] + [request]
+                    )
+                    if projected <= governor.config.kv_usage_limit:
+                        fits.append((projected, target, context))
+                if not fits:
+                    break
+                _, target, context = max(fits)
+                trial[target].append(request)
+                trial_contexts[target] = context
+                assignments.append((source, target, request))
+            if len(assignments) != len(requests) or not assignments:
+                continue
+            arrivals, contexts = trial, trial_contexts
+            emptied.add(source)
+            recipients.update(target for _, target, _ in assignments)
+            plan.extend(assignments)
+        return plan
 
     async def _execute_moves(self, moves):
         for source, request, backend_id in moves:
@@ -1393,7 +1709,8 @@ class LaminarController:
                         task.add_done_callback(self.pulls.discard)
                         task.add_done_callback(self._pull_done)
                     else:
-                        replica.admitted, replica.closed = 0, False
+                        replica.admitted = 0
+                        replica.closed = index in self.capacity and self.capacity[index].pressure_paused
                         replica.ramp_down = False
                 await self._collect_versions()
                 async with self.condition:
@@ -1433,6 +1750,7 @@ class LaminarController:
                     "version": r.version,
                     "owned": r.owned,
                     "admission_limit": self._admission_limit(i),
+                    "predicted_kv_usage": self._reserved_usage_status(i),
                     "releasing": r.releasing,
                     "healthy": r.healthy,
                     "active": len(r.active),

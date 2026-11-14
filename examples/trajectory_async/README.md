@@ -1,5 +1,66 @@
 # Ascend trajectory asynchronous training examples
 
+## A2 job entrypoints (Qwen3-8B, 64 NPUs)
+
+Submit either repository-root entrypoint as the command on **every job node**:
+
+```bash
+# Trajectory asynchronous training.
+bash run_a2_job_trajectory_async.sh
+```
+
+```bash
+# Strict synchronous control on the same resource placement.
+bash run_a2_job_sync.sh
+```
+
+`VC_TASK_INDEX=0` starts/reuses the Ray head and submits training after all
+configured NPUs are free. Other ranks join that head and remain attached.
+The scheduler supplies `VC_WORKER_HOSTS` (comma-separated) and `VC_WORKER_NUM`.
+For manual launches set `VC_TASK_INDEX`, `MASTER_ADDR`, `RAY_NODE_IP` and
+`TOTAL_NODES` on each node. Defaults are Ray port 6925 and dashboard port 8960.
+Existing raylets are reused; neither entrypoint stops or restarts Ray.
+Submit the two modes as separate jobs for comparison.
+
+Both default to Qwen3-8B, DeepScaleR training, **16 training + 40 rollout + 8
+evaluation NPUs**, TP2 rollout/evaluation, 64 prompt groups × 8 responses per
+update, 2,048 prompt / 32,768 response tokens and 200 updates from initial
+weights. Baseline evaluation runs at step 0 before training, then every 10
+updates on MATH-500; the terminal evaluation uses MATH-lighteval. Checkpoints
+are saved every 10 updates. Dedicated evaluation continuously queues its inputs.
+KV admission uses a 90-second forecast window with a 95% budget and same-version
+pressure migration. Asynchronous mode uses a 192–320-group adaptive buffer
+(initial 192). Synchronous mode disables prefetch/adaptive buffering, submits
+only 64 groups per round, and waits for every rollout replica to load the new
+weight version before submitting the next round. Its trainer implementation is
+Laminar with `synchronous=True`, preserving the async run's physical placement.
+
+Configuration and help commands do not connect to or start Ray:
+
+```bash
+bash run_a2_job_trajectory_async.sh --check-config
+bash run_a2_job_sync.sh --check-config
+bash run_a2_job_trajectory_async.sh --help
+```
+
+Defaults can be changed with environment variables, for example `MODEL_PATH`,
+`DATA_DIR`, `OUTPUT_ROOT`, `RUN_NAME`, `TOTAL_STEPS`, `TRAIN_BATCH_SIZE`,
+`ROLLOUT_N`, `ROLLOUT_TP`, `EVAL_TP`, `SOCKET_IFNAME`, `BUFFER_MIN_BATCHES`,
+`BUFFER_MAX_BATCHES` and `KV_HORIZON_SECONDS`. Configure node counts with
+`TRAINER_NNODES`, `ROLLOUT_NNODES`, `EVAL_NNODES` and `NPUS_PER_NODE` so cluster
+readiness and training placement agree. All positive node counts default to
+2/5/1/8 respectively. Native CANN/vLLM-Ascend and the correct A2 custom-op build
+must already be installed on each node; these scripts do not build/install them.
+
+Hydra `key=value` arguments pass through as individual arguments, including
+quoted values containing spaces. Scheduler metadata such as `--NAME=value` is
+ignored, except Hydra's supported own options. Optional `A2_ENV_FILE` is an
+exports/settings file, not another cluster launcher. Training artifacts go to
+`OUTPUT_ROOT/RUN_NAME` (default `outputs/RUN_NAME`); node logs go to
+`A2_JOB_LOG_DIR` or `OUTPUT_ROOT/cluster/VC_JOB_ID` (fallback `a2_<mode>`).
+The two entrypoints share `a2_job_common.sh` in this directory.
+
+
 Run these launchers from the repository root, or use their absolute paths from
 another directory. They resolve the repository root themselves. Default logs
 and outputs stay under the repository's `outputs/` directory; `QWEN_OUTPUT_DIR`

@@ -224,3 +224,120 @@ capacity（初值、当前值、物理上限、池描述、退避原因）。roo
 5%，真实 KV 高水位退避通过。验收发现的无膝点 P95 保护缺口已修复，并通过独立真卡复验。
 没有将缓存上限或经验延迟界标为硬件膝点；完整数据与适用边界见
 [CALIBRATION_ACCEPTANCE.md](CALIBRATION_ACCEPTANCE.md)。
+
+## Request-aware KV admission
+
+`online_capacity.token_budget_admission=true` enables continuous refill for
+profiled `FullAttentionSpec` pools. Other layouts retain full-context accounting.
+The controller reserves actual KV occupancy plus expected remaining output for
+running requests, full prefix/output for arrivals not yet visible to the engine,
+and incoming migration reservations. TP ranks use the tightest real block pool;
+all token estimates round up to the engine's block size.
+
+The bounded shared response history combines EWMA and a conditional P75 estimate.
+Already-long requests condition on completed responses longer than their current
+output; responses reaching the output budget remain in the history. An optional
+`response_history_path` seeds the predictor from `arrived` trajectory diagnostics.
+A multiplicative length margin and telemetry guard cover estimation uncertainty.
+These are statistical forecasts, not a promise that every request finishes at its
+predicted length. Stale telemetry blocks expansion, while cold start and unknown
+cache layouts retain conservative full-context reservations. Cache pressure,
+waiting requests or new preemptions immediately back off the admission limit.
+
+For example:
+
+```yaml
+online_capacity:
+  enabled: true
+  token_budget_admission: true
+  kv_usage_limit: 0.8
+  response_prior_tokens: 8192
+  response_quantile: 0.75
+  response_safety_factor: 1.15
+  response_history_path: null
+roofline:
+  enabled: true
+  continuous_sampling: true
+```
+
+At the latest policy version, completions free slots for immediate refill without
+waiting for a cumulative batch quota to drain. A newer publication still closes
+old-version admission, and requests retain their original behavior-policy version.
+Routine latest-version consolidation is suppressed to avoid repeated prefix
+recomputation; stale-version draining still uses destination-specific conservative
+KV checks. With request-aware token budgets enabled, a drained-version source
+may be split across several same-version destinations. The planner budgets each
+arrival's prefix, predicted remaining response and token guard alongside the
+destination's current usage, active requests, existing reservations and all
+arrivals already planned in this round. A source is migrated only when every
+request fits; an incomplete plan leaves no reservations. Recipients cannot become
+sources in the same round. Unknown or stale telemetry continues to block arrivals.
+The forecast budget is controlled by `kv_usage_limit`; evolving response
+lengths can still take a later forecast above the admission threshold.
+
+Continuous sampling keeps bounded device-event probes active across policy
+versions. Fits remain conditional on actual execution mode and context strata;
+only measured, sufficiently supported knees or latency guards constrain admission.
+Insufficient evidence remains an explicit status, never a fabricated roofline.
+`capacity.response_history`, `predicted_kv_usage`, `kv_headroom_fraction`, and the
+existing roofline profiles expose the live decisions in scheduler diagnostics.
+
+An optional `trainer.v1.laminar.adaptive_buffer` controls the prompt horizon
+independently of per-engine KV admission and evaluation ownership. It is disabled
+by default and cannot run alongside the separate supply controller or synchronous
+mode. For a 64-prompt training batch, the defaults vary the horizon between 128
+and 256 unsampled groups in steps of 16, with three confirming polls and a
+60-second adjustment cooldown. Ready-group surplus, stale training samples, or
+excess queued work behind busy engines reduce future prefetch. Expansion requires
+training starvation, a nearly full prompt window, spare engine slots and fewer
+unfinished trajectories than the available admission capacity. Low ready count
+alone never expands the window. Existing groups are retained when the target
+shrinks. Metrics `laminar/buffer/capacity_groups` and
+`laminar/buffer/adjustments`, plus adjustment logs, expose the decisions.
+
+Response-length prediction also supports `online_capacity.response_step_calibration`
+(enabled by default). At each consumed training batch, real positive response
+lengths are grouped by their single behavior-policy version; padding and
+mixed-version rows are excluded. Each version keeps at most the configured
+history window, and at most `response_calibration_versions` (default 8) version
+baselines are retained. A step ID is applied once. Calibration does not append
+those responses to the completion history again.
+
+Requests use their exact behavior-version baseline when sufficiently populated;
+newer versions temporarily inherit the latest older baseline. Conditional means
+and P75 lengths above the request's generated prefix still protect long tails.
+The batch estimate contributes 80%, with the existing completion-based online
+estimate contributing `response_calibration_online_weight` (default 0.2); the
+existing response safety factor and token guard are then retained. Progress and
+new completions continue invalidating cached KV reservations. Scheduler events
+`response_length_calibration` and response-history fields `calibration_step` and
+`calibration_versions` expose the applied baselines.
+
+The adaptive buffer monitor keeps at most one controller-status query outstanding
+and polls its readiness without blocking. A delayed or stale reply holds the
+current window rather than failing training or creating more queries. Fresh
+feedback resumes adjustments; a completed query containing a real controller
+error still propagates through the monitor health check. Ordered per-step length
+calibration follows the controller lifecycle without a short monitoring deadline.
+
+## 短窗口 KV 准入与压力迁移
+
+`online_capacity.rolling_kv_enabled=true` 在已启用 token-budget admission 的
+FullAttention 池上使用短窗口预留。默认窗口 30 秒，另加遥测年龄；实例 decode
+速度从同一请求的 token 增量和纯 decode 设备采样估计，按 BS 与上下文匹配，
+取较高分位并乘 1.25。已有请求只追加窗口内增长；新请求、尚未观测到的请求及
+迁移到达项还需完整预留 prompt 和已生成前缀。结果按实际 KV block 向上取整。
+不抵扣预测完成请求可能释放的空间。没有新鲜速度或 KV 遥测时，回退到原来的
+剩余长度预算；过期遥测仍禁止扩张。窗口至少覆盖两次遥测轮询间隔。
+
+实际 KV 达到 90%、窗口预测达到 KV 上限（实验为 95%），或观察到新的引擎抢占，
+会暂停该实例准入。实际 KV 回落到 80% 且窗口预测低于 90% 后才恢复。
+压力迁移不要求 batch drain/ramp-down：每实例每轮至多迁移 4 条可见请求，
+同一请求的压力迁移冷却 60 秒。目标必须健康、同版本、有新鲜容量观测，
+且包含本轮所有预留后仍低于 90%。先预留目标，再主动 abort 源请求，沿现有
+保留 token/logprob 的前缀重算路径续跑。无可用目标时保持暂停准入，交由引擎
+抢占兜底。上述预留模型不假设引擎抢占会自动变成跨实例迁移信号。
+
+快照记录 `rolling_kv_enabled`、`rolling_kv_horizon_s`、
+`decode_tokens_per_sequence_s`、`pressure_paused`；压力准入切换和迁移分别记录
+`kv_pressure_admission`、`pressure_migration_reserved` 事件。

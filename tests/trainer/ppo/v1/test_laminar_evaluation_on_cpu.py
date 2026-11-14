@@ -442,3 +442,170 @@ def test_sampler_rejects_a_response_from_another_version(monkeypatch):
     sampler = evaluation.EvaluationReplayBuffer(config(), lambda: None, "val-evaluation-1")
     with pytest.raises(ValueError, match="changed policy version"):
         sampler.sample(1, "val-evaluation-1", 1)
+
+
+@pytest.mark.parametrize("version,expected_rows", [(190, 500), (200, 5000)])
+def test_final_validation_files_are_private_to_terminal_version(monkeypatch, version, expected_rows):
+    import copy
+
+    cfg = config()
+    cfg.data = {"val_files": ["math500.parquet"], "val_max_samples": -1}
+    cfg.trainer.v1.laminar.evaluation.final_val_files = ["math_lighteval.parquet"]
+    trainer = SimpleNamespace(
+        config=cfg,
+        val_dataset=list(range(500)),
+        total_training_steps=200,
+        global_steps=version,
+        tokenizer=object(),
+        processor=None,
+    )
+    view = copy.copy(trainer)
+    calls = []
+
+    def dataset(files, data, tokenizer, processor, **kwargs):
+        calls.append(list(files))
+        assert list(data.val_files) == ["math_lighteval.parquet"]
+        assert tokenizer is trainer.tokenizer and processor is None
+        assert kwargs == {"is_train": False, "max_samples": -1}
+        return list(range(5000))
+
+    monkeypatch.setattr("verl.trainer.ppo.utils.create_rl_dataset", dataset)
+    evaluation.prepare_validation_dataset(view)
+    assert len(view.val_dataset) == expected_rows
+    assert len(trainer.val_dataset) == 500
+    assert list(trainer.config.data.val_files) == ["math500.parquet"]
+    assert calls == ([["math_lighteval.parquet"]] if version == 200 else [])
+    assert (view.config is trainer.config) == (version < 200)
+
+
+def test_background_final_evaluation_scores_only_final_files(monkeypatch):
+    instance, trainer, versions, pins, released = runner(monkeypatch)
+    instance.config.data = {"val_files": ["math500.parquet"], "val_batch_size": 64, "val_max_samples": -1}
+    instance.config.trainer.v1.laminar.evaluation.final_val_files = ["math_lighteval.parquet"]
+    trainer.val_dataset = list(range(500))
+    trainer.tokenizer, trainer.processor = object(), None
+    trainer.total_training_steps = 200
+    monkeypatch.setattr("verl.trainer.ppo.utils.create_rl_dataset", lambda *args, **kwargs: list(range(5000)))
+    seen = []
+
+    def validate(view, **kwargs):
+        seen.append((view.global_steps, list(view.config.data.val_files), len(view.val_dataset)))
+        view.replay_buffer.sampled_rows = len(view.val_dataset)
+        return {"score": 1.0}
+
+    monkeypatch.setattr(PPOTrainer, "_validate", validate)
+    try:
+        instance.submit(10)
+        assert instance.collect(wait=True)["evaluation/samples"] == 500
+        instance.submit(200)
+        result = instance.collect(wait=True)
+        assert result["evaluation/samples"] == 5000
+        assert result["evaluation/policy_version"] == 200
+        assert seen == [(10, ["math500.parquet"], 500), (200, ["math_lighteval.parquet"], 5000)]
+        assert len(trainer.val_dataset) == 500
+        assert list(instance.config.data.val_files) == ["math500.parquet"]
+        assert not pins and released == [10, 200]
+    finally:
+        instance.close()
+
+
+def test_blocking_policy_waits_for_one_slot_without_skipping_versions(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    instance, trainer, versions, pins, released = runner(monkeypatch, concurrency=3)
+    instance.overflow_policy = "block"
+    entered = {v: Event() for v in [10, 20, 30, 40]}
+    resume = {v: Event() for v in entered}
+    logged = []
+    trainer.logger = SimpleNamespace(log=lambda data, step: logged.append(dict(data)))
+
+    def validate(view, **kwargs):
+        entered[view.global_steps].set()
+        assert resume[view.global_steps].wait(5)
+        return {"score": float(view.global_steps)}
+
+    monkeypatch.setattr(PPOTrainer, "_validate", validate)
+    try:
+        for version in [10, 20, 30]:
+            instance.submit(version)
+        assert all(entered[v].wait(2) for v in [10, 20, 30])
+        with ThreadPoolExecutor(max_workers=1) as caller:
+            waiting = caller.submit(instance.wait_for_slot)
+            assert not waiting.done()
+            resume[20].set()
+            metrics = waiting.result(timeout=2)
+        assert metrics["evaluation/policy_version"] == 20
+        assert set(instance.futures) == {10, 30} and not instance.busy
+        instance.submit(40)
+        assert entered[40].wait(2)
+        for event in resume.values():
+            event.set()
+        final = instance.collect(wait=True)
+        scored = [metrics, *logged, final]
+        assert sorted(row["evaluation/policy_version"] for row in scored) == [10, 20, 30, 40]
+        assert versions == [10, 20, 30, 40]
+        assert not pins and sorted(released) == [10, 20, 30, 40]
+        assert instance.skipped == instance.coalesced == 0 and instance.pending is None
+    finally:
+        for event in resume.values():
+            event.set()
+        instance.close()
+
+
+def test_validation_backpressures_full_pool_instead_of_deferring():
+    trainer = object.__new__(PPOTrainerLaminar)
+    trainer.config = OmegaConf.create({"trainer": {"val_only": False}})
+    trainer.evaluation_config = config()
+    trainer.evaluation_config.trainer.v1.laminar.evaluation.overflow_policy = "block"
+    resolved = evaluation.evaluation_config(trainer.evaluation_config)
+    assert resolved.trainer.v1.laminar.evaluation.overflow_policy == "block"
+    trainer._laminar_training_started = True
+    trainer.global_steps, trainer.total_training_steps = 40, 200
+    state, submitted = {"busy": True}, []
+
+    def slot():
+        state["busy"] = False
+        return {"evaluation/policy_version": 20}
+
+    class Evaluator:
+        busy = property(lambda self: state["busy"])
+
+    trainer.evaluation = Evaluator()
+    trainer.evaluation.collect = lambda wait=False: {}
+    trainer.evaluation.wait_for_slot = slot
+    trainer.evaluation.defer = lambda version: pytest.fail("A required version must never enter the latest queue")
+    trainer.evaluation.discard_pending = lambda replaced=False: None
+    trainer.evaluation.submit = submitted.append
+    trainer.evaluation.queue_metrics = lambda: {"evaluation/skipped": 0}
+    metrics = trainer._validate()
+    assert submitted == [40]
+    assert metrics == {"evaluation/policy_version": 20, "evaluation/skipped": 0}
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_evaluation_submission_does_not_wait_for_batch_tails(monkeypatch, continuous):
+    import numpy as np
+
+    from verl.trainer.ppo.v1 import trainer_base
+
+    submitted = []
+    registered = []
+    trainer = SimpleNamespace(
+        global_steps=10,
+        _continuous_evaluation=continuous,
+        val_dataloader=[{"raw_prompt": np.array([f"question-{i}", f"question-{i + 1}"])} for i in range(0, 6, 2)],
+        agent_loop_manager=SimpleNamespace(generate_sequences=lambda batch: submitted.append(batch)),
+    )
+    monkeypatch.setattr(trainer_base.tq, "kv_batch_put", lambda **kwargs: registered.append(kwargs))
+    sizes = PPOTrainer._validation_batch_sizes(trainer, "val-evaluation-10")
+    # Even with every response unfinished, later questions must be queued so
+    # they can fill slots while the first batch has a long-running tail.
+    assert next(sizes) == 2
+    assert len(submitted) == (3 if continuous else 1)
+    assert list(sizes) == [2, 2]
+    assert len(submitted) == len(registered) == 3
+    ids = [uid for entry in registered for uid in entry["keys"]]
+    assert len(ids) == len(set(ids)) == 6
+    assert all(entry["partition_id"] == "val-evaluation-10" for entry in registered)
+    assert all(tag["global_steps"] == 10 for entry in registered for tag in entry["tags"])
+    assert all(len(batch) == 2 for batch in submitted)

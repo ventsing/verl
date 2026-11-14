@@ -277,6 +277,8 @@ def get_npu_versions() -> tuple[AscendHardwareVersion, str, str]:
 
     info_file = os.path.join(cann_path, "ascend_toolkit_install.info")
     if not os.path.exists(info_file):
+        info_file = os.path.join(cann_path, "ascend_all_cann_install.info")
+    if not os.path.exists(info_file):
         raise RuntimeError(f"CANN toolkit info file does not exist: {info_file}")
 
     # Parse version from info file

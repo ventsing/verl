@@ -973,21 +973,14 @@ class PPOTrainer(ABC):
             trainer=self, global_step=self.global_steps, checkpoint_dir=local_global_step_folder, async_save=False
         )
 
-    def _validate(self, partition_id="val") -> dict[str, float]:
-        # Lists to collect samples for the table
-        sample_uids = []
-        sample_inputs = []
-        sample_outputs = []
-        sample_gts = []
-        sample_scores = []
-        sample_turns = []
-        data_sources = []
-        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-        dump_all_inputs: list[str] = []
-        dump_all_outputs: list[str] = []
-        dump_all_keys: list[str] = []
-        session_to_sample_idx: dict[str, int] = {}
+    def _validation_batch_sizes(self, partition_id):
+        """Submit dedicated evaluation ahead of collection to keep replicas fed.
 
+        Only prompt batch sizes are retained here. Completed responses are still
+        fetched and cleared in small batches by ``_validate``.
+        """
+        continuous = getattr(self, "_continuous_evaluation", False)
+        sizes = []
         for batch_dict in self.val_dataloader:
             # 1. put batch to agent loop manager
             batch_dict["uid"] = np.array(
@@ -1006,9 +999,30 @@ class PPOTrainer(ABC):
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id=partition_id, tags=tags)
             self.agent_loop_manager.generate_sequences(batch)
 
-            # 2. sample batch from replay buffer: one prompt (GRPO group) per submitted row.
+            if continuous:
+                sizes.append(len(batch))
+            else:
+                yield len(batch)
+        yield from sizes
+
+    def _validate(self, partition_id="val") -> dict[str, float]:
+        # Lists to collect samples for the table
+        sample_uids = []
+        sample_inputs = []
+        sample_outputs = []
+        sample_gts = []
+        sample_scores = []
+        sample_turns = []
+        data_sources = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        dump_all_inputs: list[str] = []
+        dump_all_outputs: list[str] = []
+        dump_all_keys: list[str] = []
+        session_to_sample_idx: dict[str, int] = {}
+
+        for batch_size in self._validation_batch_sizes(partition_id):
             batch, _ = self.replay_buffer.sample(
-                global_steps=self.global_steps, partition_id=partition_id, batch_size=len(batch)
+                global_steps=self.global_steps, partition_id=partition_id, batch_size=batch_size
             )
 
             # 3. [OPTIONAL] compute reward score with colocated reward model

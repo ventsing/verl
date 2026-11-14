@@ -15,7 +15,8 @@
 
 import copy
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from threading import Event
 from uuid import uuid4
 
@@ -24,6 +25,25 @@ from omegaconf import DictConfig, OmegaConf
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBufferAsync
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+
+
+def prepare_validation_dataset(view):
+    """Select final-only files on the private version view, never the trainer."""
+    files = view.config.trainer.v1.laminar.evaluation.get("final_val_files")
+    if not files or view.global_steps < getattr(view, "total_training_steps", float("inf")):
+        return
+    from verl.trainer.ppo.utils import create_rl_dataset
+
+    view.config = copy.deepcopy(view.config)
+    view.config.data.val_files = files
+    view.val_dataset = create_rl_dataset(
+        view.config.data.val_files,
+        view.config.data,
+        view.tokenizer,
+        view.processor,
+        is_train=False,
+        max_samples=view.config.data.get("val_max_samples", -1),
+    )
 
 
 def evaluation_config(config):
@@ -81,8 +101,8 @@ def evaluation_config(config):
         raise ValueError("Dedicated evaluation max_concurrent_versions must be a positive integer")
     if options.get("repack_interval_s", 5.0) <= 0:
         raise ValueError("Dedicated evaluation repack_interval_s must be positive")
-    if options.get("overflow_policy", "latest") not in {"latest", "skip"}:
-        raise ValueError("Dedicated evaluation overflow_policy must be latest or skip")
+    if options.get("overflow_policy", "latest") not in {"latest", "skip", "block"}:
+        raise ValueError("Dedicated evaluation overflow_policy must be latest, skip or block")
     if options.get("allocation_policy", "finish_first") not in {"finish_first", "fair"}:
         raise ValueError("Dedicated evaluation allocation_policy must be finish_first or fair")
     if options.timeout_s <= 0:
@@ -186,6 +206,8 @@ class LaminarEvaluation:
         """Keep at most one pending exact snapshot, replacing older pending work."""
         if version in self.futures or (self.pending is not None and self.pending[0] == version):
             return
+        if self.overflow_policy == "block":
+            raise RuntimeError("Blocking evaluation must wait for a slot instead of deferring a version")
         if self.overflow_policy == "skip":
             self.skipped += 1
             return
@@ -271,6 +293,8 @@ class LaminarEvaluation:
 
         dump_initialized = False
         try:
+            prepare_validation_dataset(view)
+            view._continuous_evaluation = True
             view.replay_buffer = EvaluationReplayBuffer(self.config, check, partition_id)
             if hasattr(view, "val_dataset"):
                 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -279,7 +303,7 @@ class LaminarEvaluation:
 
                 view.val_dataloader = StatefulDataLoader(
                     dataset=view.val_dataset,
-                    batch_size=self.config.data.val_batch_size or len(view.val_dataset),
+                    batch_size=view.config.data.val_batch_size or len(view.val_dataset),
                     num_workers=0,
                     shuffle=False,
                     drop_last=False,
@@ -337,6 +361,12 @@ class LaminarEvaluation:
         for metrics in results[:-1]:
             self.trainer.logger.log(data=metrics, step=self.trainer.global_steps)
         return results[-1] if results else {}
+
+    def wait_for_slot(self):
+        """Apply bounded backpressure; keep all other version jobs running."""
+        if self.busy:
+            wait_futures(list(self.futures.values()), return_when=FIRST_COMPLETED)
+        return self.collect()
 
     def close(self, cancel=True):
         """Cancel or drain jobs before releasing their managers and weight pins."""
